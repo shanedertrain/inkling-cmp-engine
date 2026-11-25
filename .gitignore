@@ -1,0 +1,19 @@
+# Local user config (copy from scripts/local.sh.example)
+scripts/local.sh
+
+# Build outputs & caches
+build/
+engine/rust/target/
+engine/rust/vendor/
+engine/rust/BUILD_ID.json
+engine/rust/testdata-local/
+
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Local profiling / benchmark outputs
+*.ncu-rep
+gemm-algos.json

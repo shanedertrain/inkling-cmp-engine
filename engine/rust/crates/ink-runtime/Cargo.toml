@@ -1,0 +1,25 @@
+[package]
+name = "ink-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+ink-backend.workspace = true
+ink-cuda.workspace = true
+ink-kernels.workspace = true
+ink-model.workspace = true
+ink-record.workspace = true
+ink-rt-api.workspace = true
+ink-sched.workspace = true
+tracing.workspace = true
+
+
+[features]
+# The served fail-fast test only (review V1, engine/fault.rs): INK_FAULT_AT_FORWARD=N breaks forward call N on the device.
+fault-inject = []

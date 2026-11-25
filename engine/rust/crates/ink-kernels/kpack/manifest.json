@@ -1,0 +1,117 @@
+{
+ "format": "ink-kpack-manifest/1",
+ "kpack_id": "de0e981af145e4b07974e6c85c77340e5221cf8056ce06c858dd116ad7c09842",
+ "nvcc": "Cuda compilation tools, release 13.3, V13.3.73",
+ "flags": "-O3 -lineinfo -Xptxas -warn-spills -O3 -DNDEBUG -std=c++20 -gencode arch=compute_80,code=sm_80",
+ "layout_sha256": "ea93c6d361ce700650f41556c56b41da8a8443493afefdc99b7aa5e6510bc2c5",
+ "inputs": [
+  {
+   "path": "engine/kernels/common/common.hpp",
+   "sha256": "fc2d081d518d865c7f91481fa631a4583e31df119f68bb09586af4627edffa2c"
+  },
+  {
+   "path": "engine/kernels/common/model.hpp",
+   "sha256": "a5e29199b460fd2907883bcab09962648f5715208ba2985369f9ac646b88bc2f"
+  },
+  {
+   "path": "engine/kernels/decode_attn/decode_attn.cuh",
+   "sha256": "a3d06404c2087d49e405602c834f1a3096a5207c243c31564dafa2952e7df634"
+  },
+  {
+   "path": "engine/kernels/dflash2/dflash2_kernels.cuh",
+   "sha256": "564c5c7c23a13459cdee978366b4a7a47d11877aeb95ca345c17dbf3e55483f3"
+  },
+  {
+   "path": "engine/kernels/drafter/draft_conf.cuh",
+   "sha256": "28a36a64c5a6f0ba42699d0c6467220d8c9fdd847e07d6d1209c93ae4b51376a"
+  },
+  {
+   "path": "engine/kernels/drafter/draft_leviathan.cuh",
+   "sha256": "cb75ed99972b3e667200a8f2031e485f23388035f68571fa0e2ef3faa13bbbc6"
+  },
+  {
+   "path": "engine/kernels/drafter/draft_sel.cuh",
+   "sha256": "1722cf8468398ef8439bce9c9d07986aabcffa178d1407896f2b6a26969bd12f"
+  },
+  {
+   "path": "engine/kernels/drafter/drafter_kernels.cuh",
+   "sha256": "a10a6df6ffb716fee1a742319bbc4daa5ae91e11a621afa270c25bce28eb8381"
+  },
+  {
+   "path": "engine/kernels/drafter/drafter_pack.cuh",
+   "sha256": "0ae212c5ed9995cb739a32cba74a0692700da0ccfb638cc76fef173ceff6d192"
+  },
+  {
+   "path": "engine/kernels/glue/engine_kernels.cuh",
+   "sha256": "38d3096bd4be220e772b1ae7098052e2e8152e4c307d6301788aa88fca2afa19"
+  },
+  {
+   "path": "engine/kernels/glue/glue.cuh",
+   "sha256": "38888a5f2cad70c8efcfc4db81d23e007c1cbe85761994a118d76a7da9d7b3a0"
+  },
+  {
+   "path": "engine/kernels/glue/moe_dev.cuh",
+   "sha256": "2539485863ac15b4d393de41e936ee4e2736ed3dc5f6cfd3cba82ecae3203900"
+  },
+  {
+   "path": "engine/kernels/glue/prefill_glue.cuh",
+   "sha256": "caa3c7cb7004ec0d6c323b2a0885d2b259abf99323e7dde6c0c627169b4517a0"
+  },
+  {
+   "path": "engine/kernels/pack/build.sh",
+   "sha256": "791bf85a41f72e3eb28933cec21edc3ddc2d6d5a4fa80ae8ac00e397cdabbad0"
+  },
+  {
+   "path": "engine/kernels/pack/keys.toml",
+   "sha256": "c9b519dc49c3585893b925619af330dc0eae763d534fce5450e7a96f6345fd87"
+  },
+  {
+   "path": "engine/kernels/pack/layout_emit.cpp",
+   "sha256": "4552d63af2f0819dfd0d96b501cac3d22f6c675fb84a93895dbfbc947a61721f"
+  },
+  {
+   "path": "engine/kernels/pack/pack_drafter.cu",
+   "sha256": "12a0c5044ce33e62c9b14a1cfc086f6f8b480cf26fa07233067861b717ce8089"
+  },
+  {
+   "path": "engine/kernels/pack/pack_engine.cu",
+   "sha256": "646b085d26089ba4f1fdab3bb1916f19bff56e91c59dcc9c935769d23df195da"
+  },
+  {
+   "path": "engine/kernels/pack/structs.def",
+   "sha256": "dad7fec3c4803e7f4bb8e3bd7148d2a994c617b9bd09d96a0e1805c5df70769e"
+  },
+  {
+   "path": "engine/kernels/prefill_attn/prefill_attn.cuh",
+   "sha256": "1995d4c5568d56db24b6697e4d954ee87b4f676beeaa2679d90ce581408c1f23"
+  },
+  {
+   "path": "engine/kernels/prefill_moe/prefill_moe.cuh",
+   "sha256": "53946f2a18be0c2a2a533458f8233c52b908a755acd351f697efa62365afcc8b"
+  },
+  {
+   "path": "engine/kernels/sample/sample.hpp",
+   "sha256": "a9acd263f5f02d0245b01c3551b43412265ee2481c71a09fa8b934eea1416ade"
+  },
+  {
+   "path": "engine/kernels/sample/sample_kernels.cuh",
+   "sha256": "29614074e650aabdef13f2d2587b5678ac09068cf6ea047237d3d8bd4848f0f3"
+  }
+ ],
+ "cubins": [
+  {
+   "tu": "engine",
+   "file": "pack_engine.cubin",
+   "bytes": 23513760,
+   "sha256": "c33c347d4db3b128e8cb1743c1b3fce110e71ae26015a3bf3796116226563422",
+   "keys": 162
+  },
+  {
+   "tu": "drafter",
+   "file": "pack_drafter.cubin",
+   "bytes": 16098640,
+   "sha256": "0a369a7ff17b5f611f4c76e7d14a9a8531a9aae5e23aa5b1436d464adc2cf9fc",
+   "keys": 205
+  }
+ ]
+}

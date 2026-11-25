@@ -1,0 +1,17 @@
+[package]
+name = "ink-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+half.workspace = true
+ink-cuda.workspace = true
+memmap2.workspace = true
+safetensors.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,67 @@
+inkling-cmp-engine
+==================
+
+Copyright 2026 Cameron Basham and contributors.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository contains original code except for the adapted/ported components
+listed below, whose upstream notices are preserved under Apache-2.0 Section 4
+and the MIT License.
+
+ingine (Apache License, Version 2.0)
+------------------------------------
+Source: https://github.com/satellitedown/inkling-2-mini-abliterated-ingine
+Copyright 2026 satellitedown.
+
+Adapted/ported files carry a source header naming the upstream file and revision:
+- engine/kernels/prefill_attn/prefill_attn.cuh (adapted from ingine
+  native/src/kernels/prefill/attention.cu and common.cuh @ 306eaa8; common.cuh
+  derived from fngine, Apache-2.0)
+- engine/rust/crates/ink-text/src/{tokenizer,pyjson}.rs (ported from ingine
+  native/src/text/ @ 306eaa8)
+
+ingine's upstream NOTICE (reproduced in part): ingine's C++ engine is adapted
+from fngine (Apache-2.0, https://github.com/satellitedown/fngine), derived in
+part from Cinference (https://github.com/satellitedown/cinference) and NInfer
+by Neroued and contributors (https://github.com/Neroued/ninfer), all Apache-2.0.
+Model: Inkling-2-Mini, Thinking Machines Lab, Apache License 2.0.
+
+vLLM (Apache License, Version 2.0)
+----------------------------------
+Source: https://github.com/vllm-project/vllm and Hiutaky/vllm Ampere port @ 6e9d1cce.
+Copyright contributors to the vLLM project.
+
+Ported files carry a source header naming the upstream file:
+- engine/rust/crates/ink-text/src/{render,pyfmt,detok}.rs
+- engine/rust/crates/ink-parse/src/*
+- engine/rust/crates/ink-api/src/{frontend,chat,completions,logprobs,gen_params}.rs
+
+maya-inkling-mini (MIT License)
+-------------------------------
+Source: https://github.com/alesha-pro/maya-inkling-mini @ e819852.
+Copyright (c) 2026 Peasant Smith and the Project Maya contributors.
+Copyright (c) 2026 Niko1221 and the Strata contributors.
+
+- engine/kernels/decode_attn/decode_attn.cuh (adapted parts carry the MIT notice
+  in the file header)
+
+Humming (Apache License, Version 2.0)
+-------------------------------------
+Source: https://github.com/vllm-project/humming (humming-kernels 0.1.20 @ 0832818a8).
+Copyright the Humming contributors.
+
+- engine/kernels/prefill_moe/humming_launch.hpp (adapted cubin/JSON helper;
+  attribution preserved in file header). engine/kernels/prefill_moe/prefill_moe.cuh
+  is original code written for this project.
+
+Hugging Face tokenizers (Apache License, Version 2.0)
+-----------------------------------------------------
+Used as a Rust crate dependency (`tokenizers`) and referenced in
+engine/rust/crates/ink-text/src/detok.rs.
+
+Benchmark protocol & model checkpoints (not bundled)
+----------------------------------------------------
+- Thinking Machines Lab — Inkling-2-Mini (Apache-2.0)
+- Inco AI — Inkling-2-Mini-DFlash2
+- Mia's AI Lab (@MiaAI_lab) — MiaAI-Lab decode/prefill benchmark protocol,
+  prompts, and recipe presentation

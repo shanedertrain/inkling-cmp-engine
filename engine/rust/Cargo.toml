@@ -1,0 +1,61 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Versions are ranges; Cargo.lock pins them (docs/RUST-PLAN.md 3.1, 3.5).
+anyhow = "1"
+axum = "0.8"
+bytemuck = "1"
+clap = { version = "4", features = ["derive"] }
+cpp_demangle = "0.4"
+futures-core = "0.3"
+cudarc = { version = "0.19", default-features = false, features = ["driver", "cublas", "cublaslt", "dynamic-loading", "cuda-13030"] }
+half = "2"
+libloading = "0.9"
+memmap2 = "0.9"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+nvml-wrapper = "0.11"
+object = { version = "0.37", default-features = false, features = ["read"] }
+proptest = "1"
+# Host sampling of the I1 adapter (already vendored through proptest).
+rand = { version = "0.9", default-features = false, features = ["small_rng"] }
+safetensors = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
+# Newest stable crate; config B runs the Python wheel 0.23.3 (P3b oracle), which has no crates.io release. F1 proves id equality.
+# Parse-only TOML for `xtask gen-kernels` (engine/kernels/pack/keys.toml); already vendored through proc-macro-crate.
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
+tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "net", "io-util", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+
+ink-api = { path = "crates/ink-api" }
+ink-backend = { path = "crates/ink-backend" }
+ink-cuda = { path = "crates/ink-cuda" }
+ink-kernels = { path = "crates/ink-kernels" }
+ink-model = { path = "crates/ink-model" }
+ink-parse = { path = "crates/ink-parse" }
+ink-record = { path = "crates/ink-record" }
+ink-rt-api = { path = "crates/ink-rt-api" }
+ink-runtime = { path = "crates/ink-runtime" }
+ink-sched = { path = "crates/ink-sched" }
+ink-text = { path = "crates/ink-text" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

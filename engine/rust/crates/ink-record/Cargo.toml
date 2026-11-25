@@ -1,0 +1,18 @@
+[package]
+name = "ink-record"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
