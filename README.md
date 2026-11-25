@@ -12,7 +12,7 @@
 
 <img src=".github/banner.jpg" alt="inkling-cmp-engine v1.0.0: Pure-Rust + CUDA sm_80 Inference Engine for CMP 170HX (+25.6% vs vLLM, 324–380 tok/s at 140 W, 516K to 1.03M KV)" width="100%" />
 
-Serve Thinking Machines Lab's **[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (looped MoE: 128 experts, top-8, native NVFP4/MXFP8 weights, GQA + SWA-1024 + 4 global layers, zero weight modification or re-quantization) on **NVIDIA CMP 170HX (GA100, `sm_80`, 64 GB HBM2e)** at a fixed **140 W power cap** through a pure-Rust OpenAI-compatible API: streaming tool calls, reasoning parsing, prefix-checkpoint KV reuse, **DSpark** full-vocab `top_p`-filtered exact Leviathan speculative decoding + lossless verbatim lookup drafts, and opt-in **DFlash2** and **`--kv-fp8`**.
+Serve Thinking Machines Lab's **[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (looped MoE: 128 experts, top-8, native NVFP4/MXFP8 weights, GQA + SWA-1024 + 4 global layers, zero weight modification or re-quantization) on **NVIDIA CMP 170HX (GA100, `sm_80`, 64 GB HBM2e)** through a pure-Rust OpenAI-compatible API: streaming tool calls, reasoning parsing, prefix-checkpoint KV reuse, **DSpark** full-vocab `top_p`-filtered exact Leviathan speculative decoding + lossless verbatim lookup drafts, and opt-in **DFlash2** and **`--kv-fp8`**. *(All benchmarks below were measured under a host-level 140 W/card cap; the engine does not enforce a power limit, so uncapped 250 W CMP 170HX or A100 cards run at their full configured limit.)*
 
 > [!TIP]
 > **100% lossless by default — `+25%` over vLLM Config B on real multi-turn agent workloads.**
