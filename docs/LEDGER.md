@@ -517,3 +517,10 @@ Rust prefill is 0.5-0.9 % slower than C++ at cold 32K (master's Rust already +0.
 ## Open, ranked by (gap × likelihood)
 
 1. **Remaining ~3–6% to hard lossless 140 W ceiling:** `moe_gemm_dec` (`19.2 ms` of `40.1 ms` `4×8`), global `decode_attn` (`6.7 ms`), and dense `proj + wo` (`4.8 ms`) are already at `~91–97%` of the practical lossless `sm_80` ceiling at `N=4`. Further leaps require lossy weight/activation compression or stronger drafters.
+
+## 2026-11-25 — Stock 250 W Profile (`6D` & `67` vBIOS Cards, `[M]`)
+
+- **Setup:** Stock 250 W power limit on one `6D` card (1,728 MHz HBM) and one `67` card (1,458 MHz HBM), running `v1.0.0` (lossless BF16 KV + DSpark `top_p=0.90` + `--lookup 8 --lookup-min 8`).
+- **MiaAI-Lab Decode (`T=0`, 400-tok cap, `6D` / `67`):** 1u `435.1 / 393.4` (structured), `272.2 / 247.3` (code), `170.1 / 154.6` (prose); 4u total `921.8 / 869.6`, `560.7 / 523.4`, `427.2 / 401.8`; 8u total **`1,323.2 / 1,276.1`**, `779.9 / 746.5`, `650.5 / 620.9` (`+32–34%` over 140 W on `6D`, `~10.4K tok/s` across 8 cards).
+- **Cold Prefill (`4K–120K`, `6D` / `67`):** `9,455 / 9,308` at 4K (`0.43 s`), `8,360 / 8,304` at 32K (`3.92 s`), `7,512 / 7,468` at 64K (`8.72 s`), **`6,378 / 6,336 tok/s`** at 120K (`19.27 s`, `+26.2%` over 140 W).
+- **M1 Multi-Turn Agent Replay (`343` reqs, `0` err):** `6D` `self-t1-n4` **`440.2 tok/s`** (`+35.9%` vs 140 W, p99 `2.32 s`, `0.563 J/t`), `self-t0-n4` **`493.0 tok/s`** (`+36.7%`), `self-t1-n8` **`483.7 tok/s`** (`+34.8%`); `67` `rec-t1-n4` **`413.7 tok/s`** (`+24.0%`), `rec-t0-n4` **`435.8 tok/s`** (`+25.4%`), `rec-t1-n8` **`444.4 tok/s`** (`+22.7%`).

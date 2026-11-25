@@ -45,54 +45,54 @@ Serve Thinking Machines Lab's **[Inkling-2-Mini](https://huggingface.co/thinking
 
 ## Performance
 
-Measured on **1× NVIDIA CMP 170HX** (`6D` and `67` vBIOS cards) at a fixed **140 W power cap** (`v1.0.0`, lossless BF16 KV + DSpark `top_p=0.90` Leviathan + Ptok3 `m6` + `--lookup 8 --lookup-min 8`), compared side-by-side against **vLLM Config B** (`Hiutaky/vllm` Ampere port + Humming + DSpark depth-7, see [`docs/BASELINE.md`](docs/BASELINE.md)).
+Measured on **1× NVIDIA CMP 170HX** (`6D` vBIOS: 1,728 MHz HBM, and `67` vBIOS: 1,458 MHz HBM) at both a **140 W host cap** (side-by-side against **vLLM Config B**, `Hiutaky/vllm` Ampere port + Humming + DSpark depth-7, see [`docs/BASELINE.md`](docs/BASELINE.md)) and **stock 250 W** (`v1.0.0`, lossless BF16 KV + DSpark `top_p=0.90` Leviathan + Ptok3 `m6` + `--lookup 8 --lookup-min 8`).
 
-### Decode — MiaAI-Lab protocol (`T = 0`, 400-token cap, 1 card, 140 W)
+### Decode — MiaAI-Lab protocol (`T = 0`, 400-token cap, 1 card)
 
-Uses the MiaAI-Lab structured / code / prose prompt suite (`engine/tools/bench/mia_bench.py`, median of 5 runs for 1 user, median aggregate completion tok/s of 3 runs for 2, 4, and 8 concurrent users, 140 W). One-user rates for `inkling-cmp-engine` include TTFT and client overhead; multi-user rates are total aggregate tok/s across all streams.
+Uses the MiaAI-Lab structured / code / prose prompt suite (`engine/tools/bench/mia_bench.py`, median of 5 runs for 1 user, median aggregate completion tok/s of 3 runs for 2, 4, and 8 concurrent users). One-user rates for `inkling-cmp-engine` include TTFT and client overhead; multi-user rates are total aggregate tok/s across all streams.
 
-| Requests × Category | `inkling-cmp-engine` (`6D` / `67`) | Config B (`6D` / `67`) | vs Config B (`6D` / `67`) | 8× card cluster (`× 8`, derived) |
-|---|---:|---:|---:|---:|
-| **1 user** · structured | **`357.0` / `349.3` tok/s** | `281.5` / `282.3` | **`+26.8%` / `+23.7%`** | — |
-| **1 user** · code | **`225.7` / `220.5` tok/s** | `179.4` / `174.1` | **`+25.8%` / `+26.7%`** | — |
-| **1 user** · prose | **`146.5` / `142.5` tok/s** | `110.8` / `110.2` | **`+32.2%` / `+29.3%`** | — |
-| **2 users, total** · structured | **`541.2` / `536.0` tok/s** | `425.4` / `416.8` | **`+27.2%` / `+28.6%`** | `~4,310 tok/s` |
-| **2 users, total** · code | **`329.8` / `327.2` tok/s** | `299.9` / `307.3` | **`+10.0%` / `+6.5%`** | `~2,630 tok/s` |
-| **2 users, total** · prose | **`231.3` / `228.2` tok/s** | `170.8` / `172.8` | **`+35.4%` / `+32.1%`** | `~1,840 tok/s` |
-| **4 users, total** · structured | **`728.2` / `737.3` tok/s** | `653.3` / `666.7` | **`+11.5%` / `+10.6%`** | `~5,860 tok/s` |
-| **4 users, total** · code | **`435.1` / `442.0` tok/s** | `363.2` / `375.8` | **`+19.8%` / `+17.6%`** | `~3,510 tok/s` |
-| **4 users, total** · prose | **`341.1` / `341.4` tok/s** | `265.0` / `279.7` | **`+28.7%` / `+22.1%`** | `~2,730 tok/s` |
-| **8 users, total** · structured | **`1,003.8` / `1,026.9` tok/s** | `978.1` / `991.2` | **`+2.6%` / `+3.6%`** | `~8,120 tok/s` |
-| **8 users, total** · code | **`582.2` / `604.3` tok/s** | `549.7` / `569.5` | **`+5.9%` / `+6.1%`** | `~4,750 tok/s` |
-| **8 users, total** · prose | **`485.1` / `497.9` tok/s** | `396.2` / `419.1` | **`+22.4%` / `+18.8%`** | `~3,930 tok/s` |
-| **KV pool** (BF16 default / `--kv-fp8`) | **`516,096` / `1,032,192+` tok** | `~516,096` tok | `1.0×` / **`2.0×`** | **`4.13M` / `8.26M+` tok** |
-
-### Prefill — cold prompt reading, one request (1 card, 140 W)
-
-Measured with `ink-bench --mode prefill --prof 0` (chunk 2,048, 0 prefix cache hits) on `6D` and `67` cards, versus Config B (0 prefix cache hits) on `6D`.
-
-| Context | Prompt tokens | `inkling-cmp-engine` TTFT (`6D` / `67`) | `inkling-cmp-engine` tok/s (`6D` / `67`) | Config B TTFT / tok/s (`6D`) | vs Config B |
-|---:|---:|---:|---:|---:|---:|
-| **4k** | 4,096 | **`0.53 s` / `0.54 s`** | **`7,665` / `7,576 tok/s`** | `0.71 s` / `5,745 tok/s` | **`+33.4%`** (`1.33×`) |
-| **8k** | 8,192 | **`1.12 s` / `1.12 s`** | **`7,309` / `7,295 tok/s`** | `1.50 s` / `5,480 tok/s` | **`+33.4%`** (`1.33×`) |
-| **16k** | 16,384 | **`2.32 s` / `2.33 s`** | **`7,053` / `7,043 tok/s`** | `3.11 s` / `5,277 tok/s` | **`+33.7%`** (`1.34×`) |
-| **32k** | 32,768 | **`4.93 s` / `4.93 s`** | **`6,649` / `6,643 tok/s`** | `6.72 s` / `4,880 tok/s` | **`+36.3%`** (`1.36×`) |
-| **64k** | 65,536 | **`10.96 s` / `10.98 s`** | **`5,981` / `5,970 tok/s`** | `15.65 s` / `4,187 tok/s` | **`+42.8%`** (`1.43×`) |
-| **120k** | 122,880 | **`24.32 s` / `24.29 s`** | **`5,052` / `5,060 tok/s`** | `37.16 s` / `3,307 tok/s` | **`+52.8%`** (`1.53×`) |
-
-### Realistic multi-turn agent workload (M1 replay, `~45K` median context, 140 W)
-
-343 multi-turn agent requests (`118,056` output tokens, `~12.6M` prompt tokens, `~96%` prefix-cached, `0` errors) on same-card benchmark GPUs (`6D` self-fed history, `67` recorded history). Full hill-climb ledger in [`docs/LEDGER.md`](docs/LEDGER.md).
-
-| Card / Workload | `inkling-cmp-engine` M1 | Config B M1 | vs Config B | TTFT p99 (Engine vs Config B) | Energy (`J/tok`) |
+| Requests × Category | **250 W (`6D` / `67`)** | **140 W (`6D` / `67`)** | Config B @ 140 W (`6D` / `67`) | 140 W vs Config B (`6D` / `67`) | 8× cluster @ 250 W (`× 8`, derived) |
 |---|---:|---:|---:|---:|---:|
-| **`6D` card · `N=4, T=1.0`** (self-fed) | **`323.8 tok/s`** | `257.9 tok/s` | **`+25.6%`** | **`3.56 s`** vs `5.35 s` | `0.432` |
-| **`6D` card · `N=4, T=0`** (self-fed) | **`360.6 tok/s`** | `303.1 tok/s` | **`+19.0%`** | **`3.07 s`** vs `6.61 s` | `0.388` |
-| **`67` card · `N=4, T=1.0`** (recorded) | **`333.7 tok/s`** | `266.6 tok/s` | **`+25.2%`** | **`2.94 s`** vs `6.06 s` | `0.418` |
-| **`67` card · `N=4, T=0`** (recorded) | **`347.6 tok/s`** | `293.8 tok/s` | **`+18.3%`** | **`2.77 s`** vs `4.98 s` | `0.402` |
-| **`6D` card · `N=8, T=1.0`** (`--slots 8`, `--lookup 8`) | **`358.9 tok/s`** | `287.8 tok/s` | **`+24.7%`** | **`7.65 s`** (`0` evictions) | `0.388` |
-| **`6D` card · `N=8, T=1.0`** (`--lookup 0`) | **`380.2 tok/s`** | `287.8 tok/s` | **`+32.1%`** | **`7.02 s`** (`0` evictions) | `0.368` |
-| **`67` card · `N=8, T=1.0`** (`--slots 8`, `--lookup 8`) | **`362.3 tok/s`** | `301.2 tok/s` | **`+20.3%`** | **`7.44 s`** (`cached 0.957`) | `0.384` |
+| **1 user** · structured | **`435.1` / `393.4` tok/s** | `357.0` / `349.3` tok/s | `281.5` / `282.3` | **`+26.8%` / `+23.7%`** | — |
+| **1 user** · code | **`272.2` / `247.3` tok/s** | `225.7` / `220.5` tok/s | `179.4` / `174.1` | **`+25.8%` / `+26.7%`** | — |
+| **1 user** · prose | **`170.1` / `154.6` tok/s** | `146.5` / `142.5` tok/s | `110.8` / `110.2` | **`+32.2%` / `+29.3%`** | — |
+| **2 users, total** · structured | **`658.5` / `601.4` tok/s** | `541.2` / `536.0` tok/s | `425.4` / `416.8` | **`+27.2%` / `+28.6%`** | `~5,040 tok/s` |
+| **2 users, total** · code | **`402.5` / `369.4` tok/s** | `329.8` / `327.2` tok/s | `299.9` / `307.3` | **`+10.0%` / `+6.5%`** | `~3,090 tok/s` |
+| **2 users, total** · prose | **`278.1` / `253.7` tok/s** | `231.3` / `228.2` tok/s | `170.8` / `172.8` | **`+35.4%` / `+32.1%`** | `~2,130 tok/s` |
+| **4 users, total** · structured | **`921.8` / `869.6` tok/s** | `728.2` / `737.3` tok/s | `653.3` / `666.7` | **`+11.5%` / `+10.6%`** | `~7,170 tok/s` |
+| **4 users, total** · code | **`560.7` / `523.4` tok/s** | `435.1` / `442.0` tok/s | `363.2` / `375.8` | **`+19.8%` / `+17.6%`** | `~4,340 tok/s` |
+| **4 users, total** · prose | **`427.2` / `401.8` tok/s** | `341.1` / `341.4` tok/s | `265.0` / `279.7` | **`+28.7%` / `+22.1%`** | `~3,320 tok/s` |
+| **8 users, total** · structured | **`1,323.2` / `1,276.1` tok/s** | `1,003.8` / `1,026.9` tok/s | `978.1` / `991.2` | **`+2.6%` / `+3.6%`** | **`~10,400 tok/s`** |
+| **8 users, total** · code | **`779.9` / `746.5` tok/s** | `582.2` / `604.3` tok/s | `549.7` / `569.5` | **`+5.9%` / `+6.1%`** | `~6,110 tok/s` |
+| **8 users, total** · prose | **`650.5` / `620.9` tok/s** | `485.1` / `497.9` tok/s | `396.2` / `419.1` | **`+22.4%` / `+18.8%`** | `~5,090 tok/s` |
+| **KV pool** (BF16 default / `--kv-fp8`) | **`516,096` / `1,032,192+` tok** | `516,096` / `1,032,192+` tok | `~516,096` tok | `1.0×` / **`2.0×`** | **`4.13M` / `8.26M+` tok** |
+
+### Prefill — cold prompt reading, one request (1 card)
+
+Measured with `ink-bench --mode prefill --prof 0` (chunk 2,048, 0 prefix cache hits) on `6D` and `67` cards at 250 W and 140 W, versus Config B (0 prefix cache hits) on `6D` at 140 W.
+
+| Context | Prompt tokens | **250 W TTFT & tok/s (`6D` / `67`)** | **140 W TTFT & tok/s (`6D` / `67`)** | Config B @ 140 W (`6D`) | 140 W vs Config B (`6D`) |
+|---:|---:|---:|---:|---:|---:|
+| **4k** | 4,096 | **`0.43 s` (`9,455`) / `0.44 s` (`9,308`)** | `0.53 s` (`7,665`) / `0.54 s` (`7,576`) | `0.71 s` (`5,745`) | **`+33.4%`** (`1.33×`) |
+| **8k** | 8,192 | **`0.89 s` (`9,196`) / `0.90 s` (`9,102`)** | `1.12 s` (`7,309`) / `1.12 s` (`7,295`) | `1.50 s` (`5,480`) | **`+33.4%`** (`1.33×`) |
+| **16k** | 16,384 | **`1.85 s` (`8,863`) / `1.86 s` (`8,789`)** | `2.32 s` (`7,053`) / `2.33 s` (`7,043`) | `3.11 s` (`5,277`) | **`+33.7%`** (`1.34×`) |
+| **32k** | 32,768 | **`3.92 s` (`8,360`) / `3.95 s` (`8,304`)** | `4.93 s` (`6,649`) / `4.93 s` (`6,643`) | `6.72 s` (`4,880`) | **`+36.3%`** (`1.36×`) |
+| **64k** | 65,536 | **`8.72 s` (`7,512`) / `8.78 s` (`7,468`)** | `10.96 s` (`5,981`) / `10.98 s` (`5,970`) | `15.65 s` (`4,187`) | **`+42.8%`** (`1.43×`) |
+| **120k** | 122,880 | **`19.27 s` (`6,378`) / `19.40 s` (`6,336`)** | `24.32 s` (`5,052`) / `24.29 s` (`5,060`) | `37.16 s` (`3,307`) | **`+52.8%`** (`1.53×`) |
+
+### Realistic multi-turn agent workload (M1 replay, `~45K` median context)
+
+343 multi-turn agent requests (`118,056` output tokens, `~12.6M` prompt tokens, `~96%` prefix-cached, `0` errors) on the same benchmark GPUs (`6D` self-fed history, `67` recorded history). At 250 W, SM clocks uncap from `~1,050 MHz` to `~1,390 MHz`, lifting `6D` cards (1,728 MHz HBM) by `+35–37%` and `67` cards (1,458 MHz HBM) by `+23–25%`, while 140 W remains ~23% more energy-efficient (`0.38–0.43` vs `0.50–0.59 J/tok`). Full hill-climb ledger in [`docs/LEDGER.md`](docs/LEDGER.md).
+
+| Card / Workload | **250 W M1** (TTFT p99, `J/tok`) | **140 W M1** (TTFT p99, `J/tok`) | Config B @ 140 W | 140 W vs Config B |
+|---|---:|---:|---:|---:|
+| **`6D` card · `N=4, T=1.0`** (self-fed) | **`440.2 tok/s`** (`2.32 s`, `0.563`) | **`323.8 tok/s`** (`3.56 s`, `0.432`) | `257.9 tok/s` (`5.35 s`) | **`+25.6%`** |
+| **`6D` card · `N=4, T=0`** (self-fed) | **`493.0 tok/s`** (`2.15 s`, `0.504`) | **`360.6 tok/s`** (`3.07 s`, `0.388`) | `303.1 tok/s` (`6.61 s`) | **`+19.0%`** |
+| **`67` card · `N=4, T=1.0`** (recorded) | **`413.7 tok/s`** (`2.42 s`, `0.594`) | **`333.7 tok/s`** (`2.94 s`, `0.418`) | `266.6 tok/s` (`6.06 s`) | **`+25.2%`** |
+| **`67` card · `N=4, T=0`** (recorded) | **`435.8 tok/s`** (`2.70 s`, `0.563`) | **`347.6 tok/s`** (`2.77 s`, `0.402`) | `293.8 tok/s` (`4.98 s`) | **`+18.3%`** |
+| **`6D` card · `N=8, T=1.0`** (`--slots 8, --lookup 8`) | **`483.7 tok/s`** (`5.60 s`, `0.510`) | **`358.9 tok/s`** (`7.65 s`, `0.388`) | `287.8 tok/s` | **`+24.7%`** |
+| **`6D` card · `N=8, T=1.0`** (`--lookup 0`) | — | **`380.2 tok/s`** (`7.02 s`, `0.368`) | `287.8 tok/s` | **`+32.1%`** |
+| **`67` card · `N=8, T=1.0`** (`--slots 8, --lookup 8`) | **`444.4 tok/s`** (`5.34 s`, `0.542`) | **`362.3 tok/s`** (`7.44 s`, `0.384`) | `301.2 tok/s` | **`+20.3%`** |
 
 ## Lossless verification
 
