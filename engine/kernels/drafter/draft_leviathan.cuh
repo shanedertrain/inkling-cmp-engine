@@ -37,6 +37,8 @@ struct LevBuf {
   float* conf_c;                       // [k][7]
   int full_verify;                     // 1: conf_c=0 for sampled sessions (w8); 0: use conf_mode
   int conf_mode;                       // 0: log p_max (default), 1: log p(c*), 2: log q(c*)
+  unsigned int* active_mask;           // [1] per-session active bitmask for lossless early-exit (null = disabled)
+  float early_tau_ln;                  // log threshold for early-exit on steps i <= 3 (-INFINITY = disabled)
 };
 
 // Philox4x32-10 returning the first 32-bit word (matches df2::philox4x32_10 & ink::samp_philox).
@@ -80,14 +82,20 @@ __device__ __forceinline__ float lev_ord_to_f32(unsigned int o) {
 
 // grid 32, block 256: fused markov_recur + rank-16 projection p = lrV @ lat + per-step lb init.
 __global__ void __launch_bounds__(256) markov_recur_proj(Markov mk, int i, LevBuf lb) {
+  const int n = mk.n;
+  const unsigned int full_mask = (1u << n) - 1u;
+  const unsigned int amask = (i == 0 || !lb.active_mask) ? full_mask : *lb.active_mask;
+  if (amask == 0u) return;
+  if (i == 0 && blockIdx.x == 0 && threadIdx.x == 0 && lb.active_mask) *lb.active_mask = full_mask;
+
   __shared__ float inp[8][2 * RANK];
   __shared__ float sm_lat[8][8];
   __shared__ float sm_v[LRK][8];
-  const int n = mk.n;
   const __nv_bfloat16* st_in = mk.state + (size_t)(i & 1) * n * RANK;
   __nv_bfloat16* st_out = mk.state + (size_t)((i + 1) & 1) * n * RANK;
   for (int e = threadIdx.x; e < n * 2 * RANK; e += blockDim.x) {
     int r = e / (2 * RANK), k = e % (2 * RANK);
+    if (!(amask & (1u << r))) continue;
     float v;
     if (k < RANK) v = i == 0 ? 0.f : bf2f(st_in[r * RANK + k]);
     else {
@@ -117,7 +125,7 @@ __global__ void __launch_bounds__(256) markov_recur_proj(Markov mk, int i, LevBu
     }
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
-      if (r < n) {
+      if (r < n && (amask & (1u << r))) {
         float s = 0.f;
 #pragma unroll
         for (int u = 0; u < 8; ++u) {
@@ -128,7 +136,7 @@ __global__ void __launch_bounds__(256) markov_recur_proj(Markov mk, int i, LevBu
       }
     }
   }
-  if (lane < n) {
+  if (lane < n && (amask & (1u << lane))) {
     int r = lane;
     float rr[3];
 #pragma unroll
@@ -158,18 +166,24 @@ __global__ void __launch_bounds__(256) markov_recur_proj(Markov mk, int i, LevBu
   __syncthreads();
   if (threadIdx.x < n * LRK) {
     const int r = threadIdx.x >> 4;
-    const int j = threadIdx.x & 15;
-    float acc = 0.f;
+    if (amask & (1u << r)) {
+      const int j = threadIdx.x & 15;
+      float acc = 0.f;
 #pragma unroll
-    for (int o = 0; o < 8; ++o) acc += sm_v[j][o] * sm_lat[r][o];
-    atomicAdd(&mk.proj[r * (LRK + 4) + j], acc);
+      for (int o = 0; o < 8; ++o) acc += sm_v[j][o] * sm_lat[r][o];
+      atomicAdd(&mk.proj[r * (LRK + 4) + j], acc);
+    }
   }
 }
 
-// grid (LEV_NCH=391, 1), block 256: reads lrU & fold_b ONCE for all N sessions;
-// only 3 __syncthreads() across all N sessions combined, and warps 0..N-1 extract top-16 in parallel!
+// grid (LEV_NCH=391, 1), block 256: reads lrU & fold_b ONCE for all active sessions;
+// early-exits immediately if active_mask == 0 and skips Bq/expf/compaction for inactive sessions!
 template <int N>
 __global__ void __launch_bounds__(256) markov_lev_scan_fused(Markov mk, int i, LevBuf lb) {
+  const unsigned int full_mask = (1u << N) - 1u;
+  const unsigned int amask = (i == 0 || !lb.active_mask) ? full_mask : *lb.active_mask;
+  if (amask == 0u) return;
+
   constexpr int CAP = 64;
   __shared__ float pr[N][LRK];
   __shared__ float w1s[N][8];
@@ -186,9 +200,10 @@ __global__ void __launch_bounds__(256) markov_lev_scan_fused(Markov mk, int i, L
 
   const int chunk = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   for (int e = tid; e < N * LRK; e += 256) {
-    pr[e >> 4][e & 15] = mk.proj[(e >> 4) * (LRK + 4) + (e & 15)];
+    const int r = e >> 4;
+    if (amask & (1u << r)) pr[r][e & 15] = mk.proj[r * (LRK + 4) + (e & 15)];
   }
-  if (tid < N) {
+  if (tid < N && (amask & (1u << tid))) {
     const float t = lb.samp_temp[lb.sel[tid]];
     invt_s[tid] = (t >= 1e-5f) ? (1.0f / t) : 1.0f;
   }
@@ -215,15 +230,21 @@ __global__ void __launch_bounds__(256) markov_lev_scan_fused(Markov mk, int i, L
           const float2 w = __bfloat1622float2(q2[e]);
 #pragma unroll
           for (int r = 0; r < N; ++r) {
-            dot[r] += pr[r][c * 8 + 2 * e] * w.x + pr[r][c * 8 + 2 * e + 1] * w.y;
+            if (amask & (1u << r)) {
+              dot[r] += pr[r][c * 8 + 2 * e] * w.x + pr[r][c * 8 + 2 * e + 1] * w.y;
+            }
           }
         }
       }
       const float fb = bf2f(mk.fold_b[v]);
 #pragma unroll
       for (int r = 0; r < N; ++r) {
-        const float s = rb(mk.Bq[(size_t)(r * 7 + i) * VP + v] + rb(fb + dot[r]));
-        sc[r][j] = SOFTCAP * tanh_fast(s * (1.0f / SOFTCAP));
+        if (amask & (1u << r)) {
+          const float s = rb(mk.Bq[(size_t)(r * 7 + i) * VP + v] + rb(fb + dot[r]));
+          sc[r][j] = SOFTCAP * tanh_fast(s * (1.0f / SOFTCAP));
+        } else {
+          sc[r][j] = -INFINITY;
+        }
       }
     } else {
 #pragma unroll
@@ -231,9 +252,10 @@ __global__ void __launch_bounds__(256) markov_lev_scan_fused(Markov mk, int i, L
     }
   }
 
-  // Phase 1: warp top-2 for ALL N sessions before sync #1
+  // Phase 1: warp top-2 for all active sessions before sync #1
 #pragma unroll
   for (int r = 0; r < N; ++r) {
+    if (!(amask & (1u << r))) continue;
     const float s0 = sc[r][0], s1 = sc[r][1];
     const float hi = s0 >= s1 ? s0 : s1;
     const float lo = s0 >= s1 ? s1 : s0;
@@ -254,7 +276,7 @@ __global__ void __launch_bounds__(256) markov_lev_scan_fused(Markov mk, int i, L
   __syncthreads();  // Sync #1
 
   // Threads 0..N-1 compute cmax, vlo, atomicMax(g_lb), thresh, skip in parallel!
-  if (tid < N) {
+  if (tid < N && (amask & (1u << tid))) {
     float cm = w1s[tid][0], vlo = w2s[tid][0];
 #pragma unroll
     for (int w = 1; w < 8; ++w) {
@@ -272,9 +294,10 @@ __global__ void __launch_bounds__(256) markov_lev_scan_fused(Markov mk, int i, L
   }
   __syncthreads();  // Sync #2
 
-  // Phase 2: compute Z and compact >= thresh for ALL N sessions before sync #3
+  // Phase 2: compute Z and compact >= thresh for all active sessions before sync #3
 #pragma unroll
   for (int r = 0; r < N; ++r) {
+    if (!(amask & (1u << r))) continue;
     const float s0 = sc[r][0], s1 = sc[r][1];
     const float cmax = cmax_s[r];
     const float it = invt_s[r];
@@ -298,8 +321,8 @@ __global__ void __launch_bounds__(256) markov_lev_scan_fused(Markov mk, int i, L
   }
   __syncthreads();  // Sync #3
 
-  // Phase 3: Warps 0..N-1 run IN PARALLEL — each warp writes chunk_z/cmax and extracts top-16 for session r = warp!
-  if (warp < N) {
+  // Phase 3: Warps 0..N-1 run IN PARALLEL — each active warp writes chunk_z/cmax and extracts top-16 for session r = warp!
+  if (warp < N && (amask & (1u << warp))) {
     const int r = warp;
     if (lane == 0) {
       float zt = 0.f;
@@ -362,7 +385,7 @@ __global__ void __launch_bounds__(256) markov_lev_scan_fused(Markov mk, int i, L
   __shared__ int fb_base;
 #pragma unroll
   for (int r = 0; r < N; ++r) {
-    if (!skip_s[r] && cnt_s[r] > CAP) {
+    if ((amask & (1u << r)) && !skip_s[r] && cnt_s[r] > CAP) {
       if (tid == 0) fb_base = atomicAdd(&lb.cand_cnt[r], LEV_K);
       __syncthreads();
       const int base = fb_base;
@@ -415,6 +438,10 @@ __global__ void __launch_bounds__(256) markov_lev_scan_fused(Markov mk, int i, L
 // grid k, block 512 (16 warps): 2-sync v16_lo global top-16 -> 16-warp parallel exact_fold_z_warp ->
 // exact 2^22 weights -> Philox4x32-10 draw -> mk.keys, mk.drafts, prop_ids, prop_w, conf_c, reset mk.proj.
 __global__ void __launch_bounds__(512) markov_lev_finish(Markov mk, int i, LevBuf lb) {
+  const int r = blockIdx.x, k = mk.n;
+  const unsigned int amask = (i == 0 || !lb.active_mask) ? ((1u << k) - 1u) : *lb.active_mask;
+  if (!(amask & (1u << r))) return;
+
   constexpr int FIN_CAP = 128;
   __shared__ float lat[RANK];
   __shared__ int top_id[LEV_K];
@@ -432,7 +459,6 @@ __global__ void __launch_bounds__(512) markov_lev_finish(Markov mk, int i, LevBu
   __shared__ float approx_max;
   __shared__ float z_tot;
 
-  const int r = blockIdx.x, k = mk.n;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int slot = lb.sel[r];
   const float temp = lb.samp_temp[slot];
@@ -748,7 +774,19 @@ __global__ void __launch_bounds__(512) markov_lev_finish(Markov mk, int i, LevBu
     mk.keys[i * k + r] = argkey(z_d, d);
     mk.drafts[r * 7 + i] = d;
     const float prev_conf = i == 0 ? 0.f : lb.conf_c[r * 7 + i - 1];
-    lb.conf_c[r * 7 + i] = prev_conf + log_p;
+    const float cum_conf = prev_conf + log_p;
+    lb.conf_c[r * 7 + i] = cum_conf;
+    // Lossless early-exit: if cumulative confidence drops below early_tau_ln at step i <= 3,
+    // verify_width_kernel cannot reach width=8 (or trigger lookup). Clear bit r in active_mask
+    // and mark drafts i+1..6 as -1 (which verify_ids clamps to 0, sample_leviathan treats as
+    // plain exact target draws, and accept stops at < 0).
+    if (lb.active_mask && !lb.full_verify && i <= 3 && cum_conf < lb.early_tau_ln) {
+      atomicAnd(lb.active_mask, ~(1u << r));
+      for (int j = i + 1; j < 7; ++j) {
+        mk.drafts[r * 7 + j] = -1;
+        lb.conf_c[r * 7 + j] = -INFINITY;
+      }
+    }
   }
 }
 

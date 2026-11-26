@@ -65,10 +65,10 @@ fn page_bytes(kv_fp8: bool) -> u64 {
 }
 
 /// Sets the decode-attention nodes of a held graph to key chunks `chunks` (global, sliding window) and row bound `r`
-/// of a call of `n` decode segments, as `Fwd::attention` launches them: `max_chunks` and `R` in every attention and
-/// combine node, on the attention kernels the workers per session and head (grid x), on the combine kernels the
-/// `3 R` row blocks (grid x). `r` is of the graph's kernel variant (its key), so function and block stay. The graph
-/// then replays what the eager call launches.
+/// of a call of `n` decode segments, using cached driver parameter structs (`update_cached_kernel_node`).
+/// SWA chunks and `r` within the graph's `da_variant` use high-water marks (when `da_opart` fits) so SWA never
+/// thrashes across 128-token chunk boundaries (`9 <-> 10`) and `r` never thrashes within a variant; global nodes
+/// (only 16 of 96) update independently when `chunks.0` changes. Bit-identical to eager launches.
 fn retarget(
     e: &mut graphs::Entry,
     chunks: (usize, usize),
@@ -77,45 +77,60 @@ fn retarget(
     ring_slots: &[usize; 17],
     opart: usize,
 ) -> Res<()> {
-    for &i in &e.da_nodes {
-        let mut p: ink_kernels::da::Params = e.graph.kernel_param(i).rt()?;
-        let full = p.window >= 1 << 30;
-        let gx = if full { chunks.0 } else { chunks.1 };
-        if n * 8 * gx * ops::DA_G * r * 128 > opart {
+    let swa_chunks = e.chunks.1.max(chunks.1);
+    let r_try = e.r.max(r);
+    let r_eff = if n * 8 * chunks.0.max(swa_chunks) * ops::DA_G * r_try * 128 <= opart {
+        r_try
+    } else {
+        r
+    };
+    let upd_global = chunks.0 != e.chunks.0 || r_eff != e.r;
+    let upd_swa = swa_chunks != e.chunks.1 || r_eff != e.r;
+    if !upd_global && !upd_swa {
+        return Ok(());
+    }
+    let r_i32 = i32::try_from(r_eff).rt()?;
+    let combine_gx = u32::try_from(ops::DA_G * r_eff).rt()?;
+    if upd_global {
+        let gx = chunks.0;
+        if n * 8 * gx * ops::DA_G * r_eff * 128 > opart {
             return Err(RuntimeError::request("decode partials"));
         }
-        if meta::da_variant(usize::try_from(p.R).rt()?) != meta::da_variant(r) {
-            return Err(RuntimeError::request(format!(
-                "graph node {i}: R {} and {r} are of different kernel variants",
-                p.R
-            )));
+        let gx_i32 = i32::try_from(gx).rt()?;
+        let w = u32::try_from(meta::pick_workers_warp_n(
+            n,
+            gx,
+            meta::SMS,
+            if r_eff > 8 { 2.0 } else { 4.0 },
+        ))
+        .rt()?;
+        for dn in &mut e.da_global {
+            dn.params.max_chunks = gx_i32;
+            dn.params.R = r_i32;
+            dn.grid[0] = if dn.is_combine { combine_gx } else { w };
+            e.graph
+                .update_cached_kernel_node(&mut dn.cached, dn.grid, &dn.params)
+                .rt()?;
         }
-        p.max_chunks = i32::try_from(gx).rt()?;
-        p.R = i32::try_from(r).rt()?;
-        let node = &e.graph.nodes()[i];
-        let Some((mut grid, _, _)) = node.dims else {
-            return Err(RuntimeError::request(format!(
-                "graph node {i} has no launch dimensions"
-            )));
-        };
-        if node
-            .kernel
-            .as_deref()
-            .is_some_and(|k| k.starts_with("_ZN2da14combine_kernel"))
-        {
-            grid[0] = u32::try_from(ops::DA_G * r).rt()?;
-        } else {
-            let w = if full {
-                meta::pick_workers_warp_n(n, gx, meta::SMS, if r > 8 { 2.0 } else { 4.0 })
-            } else {
-                meta::pick_workers(n, gx, ring_slots[r])
-            };
-            grid[0] = u32::try_from(w).rt()?;
-        }
-        e.graph.set_kernel_param(i, grid, &p).rt()?;
     }
-    e.chunks = chunks;
-    e.r = r;
+    if upd_swa {
+        let gx = swa_chunks;
+        if n * 8 * gx * ops::DA_G * r_eff * 128 > opart {
+            return Err(RuntimeError::request("decode partials"));
+        }
+        let gx_i32 = i32::try_from(gx).rt()?;
+        let w = u32::try_from(meta::pick_workers(n, gx, ring_slots[r_eff])).rt()?;
+        for dn in &mut e.da_swa {
+            dn.params.max_chunks = gx_i32;
+            dn.params.R = r_i32;
+            dn.grid[0] = if dn.is_combine { combine_gx } else { w };
+            e.graph
+                .update_cached_kernel_node(&mut dn.cached, dn.grid, &dn.params)
+                .rt()?;
+        }
+    }
+    e.chunks = (chunks.0, swa_chunks);
+    e.r = r_eff;
     Ok(())
 }
 
@@ -194,6 +209,9 @@ pub struct Engine {
     profile_fine: bool,
     marks: Vec<(String, Event)>,
     graphs_on: bool,
+    /// Cached `(call_slot_order, page_gen)` for `pt_g` and `call_slot_order` for `pt_r`, to skip unchanged 32 KB H2D uploads.
+    pt_g_sig: Option<(Vec<(usize, bool)>, u64)>,
+    pt_r_sig: Option<Vec<(usize, bool)>>,
     /// The served fail-fast test's device fault (`fault.rs`).
     #[cfg(feature = "fault-inject")]
     fault: fault::Fault,
@@ -477,6 +495,8 @@ impl Engine {
             profile_fine: false,
             marks: Vec::new(),
             graphs_on: config.graphs == Graphs::On,
+            pt_g_sig: None,
+            pt_r_sig: None,
             #[cfg(feature = "fault-inject")]
             fault: fault::Fault::from_env(),
         })
@@ -507,10 +527,12 @@ impl Engine {
     }
 
     /// The host-to-device copies of `Engine::forward`.
-    fn upload(&self, m: &CallMeta) -> Res<()> {
+    fn upload(&mut self, m: &CallMeta) -> Res<()> {
         let (a, st) = (&self.a, &self.st);
         let (t, s) = (m.t, m.call.len());
-        st.htod(&a.ids.slice(0..t).rt()?, &m.ids).rt()?;
+        if !self.spec.all_dev_ids(s) {
+            st.htod(&a.ids.slice(0..t).rt()?, &m.ids).rt()?;
+        }
         self.spec.copy_dev_ids(st, &a.ids, m)?;
         st.htod(&a.pos.slice(0..t).rt()?, &m.pos).rt()?;
         st.htod(&a.seg.slice(0..t).rt()?, &m.seg).rt()?;
@@ -520,8 +542,20 @@ impl Engine {
         if !m.lrows.is_empty() {
             st.htod(&a.logit_rows.slice(0..m.lrows.len()).rt()?, &m.lrows).rt()?;
         }
-        st.htod(&a.pt_g, &m.pt_g).rt()?;
-        st.htod(&a.pt_r, &m.pt_r).rt()?;
+        let slot_sig: Vec<(usize, bool)> = m.call.iter().map(|c| (c.slot, c.dec())).collect();
+        let page_gen = self.slots.page_gen();
+        if self
+            .pt_g_sig
+            .as_ref()
+            .is_none_or(|(sig, g)| *g != page_gen || *sig != slot_sig)
+        {
+            st.htod(&a.pt_g, &m.pt_g).rt()?;
+            self.pt_g_sig = Some((slot_sig.clone(), page_gen));
+        }
+        if self.pt_r_sig.as_ref().is_none_or(|sig| *sig != slot_sig) {
+            st.htod(&a.pt_r, &m.pt_r).rt()?;
+            self.pt_r_sig = Some(slot_sig);
+        }
         let nd = m.dctx.len();
         if nd > 0 {
             let ms = self.mem.max_slots;
@@ -531,18 +565,21 @@ impl Engine {
             st.htod(&a.da_cs.slice(ms..ms + nd).rt()?, &m.dcs_r).rt()?;
             st.htod(&a.da_nrows.slice(0..nd).rt()?, &m.dnr).rt()?;
         }
-        let segs = a.pa_segs.cast::<[i32; 4]>().rt()?;
-        st.htod(&segs.slice(0..s).rt()?, &m.pa_segs).rt()?;
-        let (i1, i2) = (
-            a.pa_items.cast::<[i32; 4]>().rt()?,
-            a.pa_items2.cast::<[i32; 4]>().rt()?,
-        );
-        for kind in 0..2 {
-            let n = m.pa_items[kind].len();
-            if n > 0 {
-                let off = kind * a.pa_items_cap;
-                st.htod(&i1.slice(off..off + n).rt()?, &m.pa_items[kind]).rt()?;
-                st.htod(&i2.slice(off..off + n).rt()?, &m.pa_items2[kind]).rt()?;
+        let has_pa = !m.pa_items[0].is_empty() || !m.pa_items[1].is_empty();
+        if has_pa {
+            let segs = a.pa_segs.cast::<[i32; 4]>().rt()?;
+            st.htod(&segs.slice(0..s).rt()?, &m.pa_segs).rt()?;
+            let (i1, i2) = (
+                a.pa_items.cast::<[i32; 4]>().rt()?,
+                a.pa_items2.cast::<[i32; 4]>().rt()?,
+            );
+            for kind in 0..2 {
+                let n = m.pa_items[kind].len();
+                if n > 0 {
+                    let off = kind * a.pa_items_cap;
+                    st.htod(&i1.slice(off..off + n).rt()?, &m.pa_items[kind]).rt()?;
+                    st.htod(&i2.slice(off..off + n).rt()?, &m.pa_items2[kind]).rt()?;
+                }
             }
         }
         Ok(())
@@ -666,9 +703,7 @@ impl Runtime for Engine {
         let r = meta::decode_r(&m.call);
         if graphed {
             if let Some(e) = self.graphs.entry_mut(&key) {
-                if (e.chunks, e.r) != (chunks, r) {
-                    retarget(e, chunks, r, m.call.len(), &self.da_ring_slots, self.a.da_opart_floats)?;
-                }
+                retarget(e, chunks, r, m.call.len(), &self.da_ring_slots, self.a.da_opart_floats)?;
                 e.graph.launch().rt()?;
             } else {
                 // capture at first use; a failure inside drops the capture, which ends it. Sticky CUDA device errors
@@ -692,7 +727,7 @@ impl Runtime for Engine {
                         let free1 = self.ctx.mem_info().rt()?.0;
                         let bytes = free0.saturating_sub(free1);
                         let nodes = graph.nodes().len();
-                        self.graphs.insert(key.clone(), graph, bytes, chunks, r);
+                        self.graphs.insert(key.clone(), graph, bytes, chunks, r)?;
                         tracing::debug!(
                             target: "ink_step",
                             phase = "graph",

@@ -8,7 +8,7 @@ use ink_cuda::{Bf16, DevPtr, KernelArgs, LaunchCfg, Result, Stream};
 use crate::{CubinInfo, F16, KernelInfo, Kernels, Ptr, push_ptr};
 
 /// Id of the kernel pack this file was generated from (`manifest.json` `kpack_id`).
-pub const KPACK_ID: &str = "de0e981af145e4b07974e6c85c77340e5221cf8056ce06c858dd116ad7c09842";
+pub const KPACK_ID: &str = "9af3241f6232e8cf24bae61bae11efeeb563c14f5185deef501db3154145a713";
 
 /// FNV-1a 64 of the generator's sources (`xtask/src/kernels/`), checked by `check_fresh.py`: a gen.rs written
 /// by another generator version is stale even when the pack is not.
@@ -19,16 +19,16 @@ pub const CUBINS: [CubinInfo; 2] = [
     CubinInfo {
         tu: "engine",
         file: "pack_engine.cubin",
-        bytes: 23513760,
-        sha256: "c33c347d4db3b128e8cb1743c1b3fce110e71ae26015a3bf3796116226563422",
-        fnv1a64: 0xf20fb0066772b372,
+        bytes: 25172768,
+        sha256: "9528aa194273151a49f266f5a2f72f1aa94d263980305459598f1977a747544f",
+        fnv1a64: 0x057b7f263473fb07,
     },
     CubinInfo {
         tu: "drafter",
         file: "pack_drafter.cubin",
-        bytes: 16098640,
-        sha256: "0a369a7ff17b5f611f4c76e7d14a9a8531a9aae5e23aa5b1436d464adc2cf9fc",
-        fnv1a64: 0x620112fee474ca74,
+        bytes: 16218704,
+        sha256: "a467ae74705c4f867e0ed67238c98150323f71d2f6fb71e57598a8d4f9f88a6b",
+        fnv1a64: 0xb94689be4352b670,
     },
 ];
 
@@ -251,6 +251,8 @@ pub enum KernelId {
     InkVerifyIdsKernel,
     /// `ink::(anonymous namespace)::verify_width_kernel(float const*, float, int, int*)`
     InkVerifyWidthKernel,
+    /// `ink::(anonymous namespace)::verify_width_pack_kernel(float const*, int const*, float, int, int*)`
+    InkVerifyWidthPackKernel,
     /// `moedev::moe_build_dec_kernel(int const*, float const*, int, int*, int*, int*, float*, pmoe::Item*, int*)`
     MoedevMoeBuildDecKernel,
     /// `moedev::moe_build_kernel(int const*, float const*, int, int*, int*, int*, float*, pmoe::Item*, int*)`
@@ -259,12 +261,24 @@ pub enum KernelId {
     PfaPrefillAttnFp8Kernel42112False,
     /// `void pfa::prefill_attn_kernel<4, 2, 1, 1, 2, false>(pfa::Params)`
     PfaPrefillAttnKernel42112False,
+    /// `pglue::ar288_g3_shared_rows_kernel(glue::ResSrc, float const*, float*, float, glue::GateIn, int)`
+    PglueAr288G3SharedRowsKernel,
+    /// `pglue::ar288_g3_vmsg_kernel(glue::ResSrc, float const*, float*, float, __nv_bfloat16 const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, long long, int)`
+    PglueAr288G3VmsgKernel,
     /// `void pglue::ar288_kernel<0>(glue::ResSrc, float const*, float*, float, glue::GateIn)`
     PglueAr288Kernel0,
     /// `void pglue::ar288_kernel<1>(glue::ResSrc, float const*, float*, float, glue::GateIn)`
     PglueAr288Kernel1,
+    /// `pglue::ar288_msgs_rows_kernel(glue::ResSrc, float const*, float*, float, int)`
+    PglueAr288MsgsRowsKernel,
+    /// `pglue::ar288_q3g3_rows_kernel(glue::ResSrc, float const*, float*, float, glue::GateIn, int)`
+    PglueAr288Q3g3RowsKernel,
+    /// `pglue::ar288_q3g3_vmsg_kernel(glue::ResSrc, float const*, float*, float, __nv_bfloat16 const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, long long, int)`
+    PglueAr288Q3g3VmsgKernel,
     /// `pglue::ar_norm288_kernel(glue::ResSrc, float const*, float const*, float const*, float const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float)`
     PglueArNorm288Kernel,
+    /// `void pglue::ar_norm288_rows_kernel<3>(glue::ResSrc, float const*, float const*, float const*, float const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float, int)`
+    PglueArNorm288RowsKernel3,
     /// `void pglue::ar_norm_rows_kernel<1>(glue::ResSrc, float const*, float const*, float const*, float const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float, int)`
     PglueArNormRowsKernel1,
     /// `void pglue::ar_norm_rows_kernel<3>(glue::ResSrc, float const*, float const*, float const*, float const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float, int)`
@@ -283,8 +297,14 @@ pub enum KernelId {
     PglueArRowsKernel40,
     /// `pglue::conv_ar_gate288_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float*, float, glue::GateIn)`
     PglueConvArGate288Kernel,
+    /// `pglue::conv_ar_gate288_rows_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float*, float, glue::GateIn, int)`
+    PglueConvArGate288RowsKernel,
+    /// `pglue::conv_ar_gate288_vmsg_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float*, float, __nv_bfloat16 const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, int)`
+    PglueConvArGate288VmsgKernel,
     /// `pglue::conv_ar_norm288_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float const*, __nv_bfloat16*, float)`
     PglueConvArNorm288Kernel,
+    /// `pglue::conv_ar_norm288_rows_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float const*, __nv_bfloat16*, float, int)`
+    PglueConvArNorm288RowsKernel,
     /// `void pglue::conv_rows_kernel<0>(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, int, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, __nv_bfloat16*)`
     PglueConvRowsKernel0,
     /// `void pglue::conv_rows_kernel<1>(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, int, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, __nv_bfloat16*)`
@@ -305,16 +325,32 @@ pub enum KernelId {
     PglueMgTailTcDecKernel4,
     /// `pglue::mg_tail_tc_kernel(pglue::MgTc, int, int, int, int)`
     PglueMgTailTcKernel,
+    /// `pglue::mg_tail_tc_vmsg_kernel(pglue::MgTcVmsg, int, int, int, int)`
+    PglueMgTailTcVmsgKernel,
     /// `pglue::mg_tc_weights_kernel(float const*, float const*, __nv_bfloat16*)`
     PglueMgTcWeightsKernel,
+    /// `pglue::moe_combine_conv_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, int const*, int, float const*, __nv_bfloat16*, __nv_bfloat16*)`
+    PglueMoeCombineConvKernel,
+    /// `pglue::moe_count_fast_kernel(int const*, int, int*)`
+    PglueMoeCountFastKernel,
     /// `pglue::moe_count_kernel(int const*, int, int*)`
     PglueMoeCountKernel,
+    /// `pglue::moe_plan_fast_kernel(int const*, int, int*, pmoe::Item*, int*)`
+    PglueMoePlanFastKernel,
     /// `pglue::moe_plan_kernel(int const*, int, int*, pmoe::Item*, int*)`
     PglueMoePlanKernel,
+    /// `pglue::moe_scatter_fast_kernel(int const*, float const*, int, int const*, int*, int*, int*, float*)`
+    PglueMoeScatterFastKernel,
     /// `pglue::moe_scatter_kernel(int const*, float const*, int, int const*, int*, int*, int*, float*)`
     PglueMoeScatterKernel,
     /// `pglue::norm_rows_kernel(glue::NormG, int, int, float, int)`
     PglueNormRowsKernel,
+    /// `pglue::vmsg_weights_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, float const*, float*, float, int)`
+    PglueVmsgWeightsKernel,
+    /// `pglue::qkv_post_fused_rows_fp8_kernel(__nv_bfloat16 const*, int, float const*, float const*, int const*, int, int, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, long long, glue::Rows, int const*, float const*, float const*, float, unsigned char*, unsigned char*, int const*, int)`
+    PglueQkvPostFusedRowsFp8Kernel,
+    /// `pglue::qkv_post_fused_rows_kernel(__nv_bfloat16 const*, int, float const*, float const*, int const*, int, int, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, long long, glue::Rows, int const*, float const*, float const*, float, __nv_bfloat16*, __nv_bfloat16*, int const*, int)`
+    PglueQkvPostFusedRowsKernel,
     /// `pglue::qkv_post_rows_fp8_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, float const*, int const*, int, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, long long, glue::Rows, float const*, float const*, __nv_bfloat16 const*, __nv_bfloat16 const*, float, unsigned char*, unsigned char*, int const*, int)`
     PglueQkvPostRowsFp8Kernel,
     /// `pglue::qkv_post_rows_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, float const*, int const*, int, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, long long, glue::Rows, float const*, float const*, __nv_bfloat16 const*, __nv_bfloat16 const*, float, __nv_bfloat16*, __nv_bfloat16*, int const*, int)`
@@ -327,6 +363,8 @@ pub enum KernelId {
     PglueRelkDirectKernel,
     /// `pglue::route_select9_kernel(float const*, int, float const*, int*, float*)`
     PglueRouteSelect9Kernel,
+    /// `pglue::route_select_rows_kernel(float const*, int, float const*, int*, float*)`
+    PglueRouteSelectRowsKernel,
     /// `void pglue::router_decode_kernel<1>(__nv_bfloat16 const*, __nv_bfloat16 const*, float const*, float*, int*, int, int*, float*)`
     PglueRouterDecodeKernel1,
     /// `void pglue::router_gemm_dec_kernel<1>(__nv_bfloat16 const*, __nv_bfloat16 const*, float*, int)`
@@ -772,7 +810,7 @@ pub enum KernelId {
 }
 
 /// Kernel table, in [`KernelId`] order.
-pub static KERNELS: [KernelInfo; 367] = [
+pub static KERNELS: [KernelInfo; 386] = [
     KernelInfo {
         key: "da_combine_kernel",
         tu: 0,
@@ -1857,6 +1895,14 @@ pub static KERNELS: [KernelInfo; 367] = [
         coop: false,
     },
     KernelInfo {
+        key: "ink_verify_width_pack_kernel",
+        tu: 0,
+        symbol: "_ZN3ink47_GLOBAL__N__0f761cec_14_pack_engine_cu_58abf99824verify_width_pack_kernelEPKfPKifiPi",
+        params: &["float const*", "int const*", "float", "int", "int*"],
+        param_bytes: 32,
+        coop: false,
+    },
+    KernelInfo {
         key: "moedev_moe_build_dec_kernel",
         tu: 0,
         symbol: "_ZN6moedev20moe_build_dec_kernelEPKiPKfiPiS4_S4_PfPN4pmoe4ItemES4_",
@@ -1909,6 +1955,33 @@ pub static KERNELS: [KernelInfo; 367] = [
         coop: false,
     },
     KernelInfo {
+        key: "pglue_ar288_g3_shared_rows_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue27ar288_g3_shared_rows_kernelEN4glue6ResSrcEPKfPffNS0_6GateInEi",
+        params: &["glue::ResSrc", "float const*", "float*", "float", "glue::GateIn", "int"],
+        param_bytes: 132,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_ar288_g3_vmsg_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue20ar288_g3_vmsg_kernelEN4glue6ResSrcEPKfPffPK13__nv_bfloat16S7_S3_PS5_xi",
+        params: &[
+            "glue::ResSrc",
+            "float const*",
+            "float*",
+            "float",
+            "__nv_bfloat16 const*",
+            "__nv_bfloat16 const*",
+            "float const*",
+            "__nv_bfloat16*",
+            "long long",
+            "int",
+        ],
+        param_bytes: 132,
+        coop: false,
+    },
+    KernelInfo {
         key: "pglue_ar288_kernel_0",
         tu: 0,
         symbol: "_ZN5pglue12ar288_kernelILi0EEEvN4glue6ResSrcEPKfPffNS1_6GateInE",
@@ -1922,6 +1995,41 @@ pub static KERNELS: [KernelInfo; 367] = [
         symbol: "_ZN5pglue12ar288_kernelILi1EEEvN4glue6ResSrcEPKfPffNS1_6GateInE",
         params: &["glue::ResSrc", "float const*", "float*", "float", "glue::GateIn"],
         param_bytes: 128,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_ar288_msgs_rows_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue22ar288_msgs_rows_kernelEN4glue6ResSrcEPKfPffi",
+        params: &["glue::ResSrc", "float const*", "float*", "float", "int"],
+        param_bytes: 88,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_ar288_q3g3_rows_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue22ar288_q3g3_rows_kernelEN4glue6ResSrcEPKfPffNS0_6GateInEi",
+        params: &["glue::ResSrc", "float const*", "float*", "float", "glue::GateIn", "int"],
+        param_bytes: 132,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_ar288_q3g3_vmsg_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue22ar288_q3g3_vmsg_kernelEN4glue6ResSrcEPKfPffPK13__nv_bfloat16S7_S3_PS5_xi",
+        params: &[
+            "glue::ResSrc",
+            "float const*",
+            "float*",
+            "float",
+            "__nv_bfloat16 const*",
+            "__nv_bfloat16 const*",
+            "float const*",
+            "__nv_bfloat16*",
+            "long long",
+            "int",
+        ],
+        param_bytes: 132,
         coop: false,
     },
     KernelInfo {
@@ -1940,6 +2048,25 @@ pub static KERNELS: [KernelInfo; 367] = [
             "float",
         ],
         param_bytes: 124,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_ar_norm288_rows_kernel_3",
+        tu: 0,
+        symbol: "_ZN5pglue22ar_norm288_rows_kernelILi3EEEvN4glue6ResSrcEPKfS4_S4_S4_P13__nv_bfloat16S6_S6_fi",
+        params: &[
+            "glue::ResSrc",
+            "float const*",
+            "float const*",
+            "float const*",
+            "float const*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "float",
+            "int",
+        ],
+        param_bytes: 128,
         coop: false,
     },
     KernelInfo {
@@ -2052,6 +2179,57 @@ pub static KERNELS: [KernelInfo; 367] = [
         coop: false,
     },
     KernelInfo {
+        key: "pglue_conv_ar_gate288_rows_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue27conv_ar_gate288_rows_kernelEPK13__nv_bfloat16PKfS2_xN4glue4RowsES2_iPS0_PfNS5_6ResSrcES4_S8_fNS5_6GateInEi",
+        params: &[
+            "__nv_bfloat16 const*",
+            "float const*",
+            "__nv_bfloat16 const*",
+            "long long",
+            "glue::Rows",
+            "__nv_bfloat16 const*",
+            "int",
+            "__nv_bfloat16*",
+            "float*",
+            "glue::ResSrc",
+            "float const*",
+            "float*",
+            "float",
+            "glue::GateIn",
+            "int",
+        ],
+        param_bytes: 228,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_conv_ar_gate288_vmsg_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue27conv_ar_gate288_vmsg_kernelEPK13__nv_bfloat16PKfS2_xN4glue4RowsES2_iPS0_PfNS5_6ResSrcES4_S8_fS2_S2_S4_S7_i",
+        params: &[
+            "__nv_bfloat16 const*",
+            "float const*",
+            "__nv_bfloat16 const*",
+            "long long",
+            "glue::Rows",
+            "__nv_bfloat16 const*",
+            "int",
+            "__nv_bfloat16*",
+            "float*",
+            "glue::ResSrc",
+            "float const*",
+            "float*",
+            "float",
+            "__nv_bfloat16 const*",
+            "__nv_bfloat16 const*",
+            "float const*",
+            "__nv_bfloat16*",
+            "int",
+        ],
+        param_bytes: 220,
+        coop: false,
+    },
+    KernelInfo {
         key: "pglue_conv_ar_norm288_kernel",
         tu: 0,
         symbol: "_ZN5pglue22conv_ar_norm288_kernelEPK13__nv_bfloat16PKfS2_xN4glue4RowsES2_iPS0_PfNS5_6ResSrcES4_S4_S7_f",
@@ -2072,6 +2250,30 @@ pub static KERNELS: [KernelInfo; 367] = [
             "float",
         ],
         param_bytes: 188,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_conv_ar_norm288_rows_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue27conv_ar_norm288_rows_kernelEPK13__nv_bfloat16PKfS2_xN4glue4RowsES2_iPS0_PfNS5_6ResSrcES4_S4_S7_fi",
+        params: &[
+            "__nv_bfloat16 const*",
+            "float const*",
+            "__nv_bfloat16 const*",
+            "long long",
+            "glue::Rows",
+            "__nv_bfloat16 const*",
+            "int",
+            "__nv_bfloat16*",
+            "float*",
+            "glue::ResSrc",
+            "float const*",
+            "float const*",
+            "__nv_bfloat16*",
+            "float",
+            "int",
+        ],
+        param_bytes: 192,
         coop: false,
     },
     KernelInfo {
@@ -2179,10 +2381,45 @@ pub static KERNELS: [KernelInfo; 367] = [
         coop: false,
     },
     KernelInfo {
+        key: "pglue_mg_tail_tc_vmsg_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue22mg_tail_tc_vmsg_kernelENS_8MgTcVmsgEiiii",
+        params: &["pglue::MgTcVmsg", "int", "int", "int", "int"],
+        param_bytes: 168,
+        coop: false,
+    },
+    KernelInfo {
         key: "pglue_mg_tc_weights_kernel",
         tu: 0,
         symbol: "_ZN5pglue20mg_tc_weights_kernelEPKfS1_P13__nv_bfloat16",
         params: &["float const*", "float const*", "__nv_bfloat16*"],
+        param_bytes: 24,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_moe_combine_conv_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue23moe_combine_conv_kernelEPK13__nv_bfloat16PKfS2_xN4glue4RowsEPKiiS4_PS0_S9_",
+        params: &[
+            "__nv_bfloat16 const*",
+            "float const*",
+            "__nv_bfloat16 const*",
+            "long long",
+            "glue::Rows",
+            "int const*",
+            "int",
+            "float const*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+        ],
+        param_bytes: 104,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_moe_count_fast_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue21moe_count_fast_kernelEPKiiPi",
+        params: &["int const*", "int", "int*"],
         param_bytes: 24,
         coop: false,
     },
@@ -2195,11 +2432,36 @@ pub static KERNELS: [KernelInfo; 367] = [
         coop: false,
     },
     KernelInfo {
+        key: "pglue_moe_plan_fast_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue20moe_plan_fast_kernelEPKiiPiPN4pmoe4ItemES2_",
+        params: &["int const*", "int", "int*", "pmoe::Item*", "int*"],
+        param_bytes: 40,
+        coop: false,
+    },
+    KernelInfo {
         key: "pglue_moe_plan_kernel",
         tu: 0,
         symbol: "_ZN5pglue15moe_plan_kernelEPKiiPiPN4pmoe4ItemES2_",
         params: &["int const*", "int", "int*", "pmoe::Item*", "int*"],
         param_bytes: 40,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_moe_scatter_fast_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue23moe_scatter_fast_kernelEPKiPKfiS1_PiS4_S4_Pf",
+        params: &[
+            "int const*",
+            "float const*",
+            "int",
+            "int const*",
+            "int*",
+            "int*",
+            "int*",
+            "float*",
+        ],
+        param_bytes: 64,
         coop: false,
     },
     KernelInfo {
@@ -2225,6 +2487,89 @@ pub static KERNELS: [KernelInfo; 367] = [
         symbol: "_ZN5pglue16norm_rows_kernelEN4glue5NormGEiifi",
         params: &["glue::NormG", "int", "int", "float", "int"],
         param_bytes: 112,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_vmsg_weights_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue19vmsg_weights_kernelEPK13__nv_bfloat16S2_PKfPffi",
+        params: &[
+            "__nv_bfloat16 const*",
+            "__nv_bfloat16 const*",
+            "float const*",
+            "float*",
+            "float",
+            "int",
+        ],
+        param_bytes: 40,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_qkv_post_fused_rows_fp8_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue30qkv_post_fused_rows_fp8_kernelEPK13__nv_bfloat16iPKfS4_PKiiiPS0_S7_S7_S7_S7_S7_S2_S2_xN4glue4RowsES6_S4_S4_fPhSA_S6_i",
+        params: &[
+            "__nv_bfloat16 const*",
+            "int",
+            "float const*",
+            "float const*",
+            "int const*",
+            "int",
+            "int",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16 const*",
+            "__nv_bfloat16 const*",
+            "long long",
+            "glue::Rows",
+            "int const*",
+            "float const*",
+            "float const*",
+            "float",
+            "unsigned char*",
+            "unsigned char*",
+            "int const*",
+            "int",
+        ],
+        param_bytes: 212,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_qkv_post_fused_rows_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue26qkv_post_fused_rows_kernelEPK13__nv_bfloat16iPKfS4_PKiiiPS0_S7_S7_S7_S7_S7_S2_S2_xN4glue4RowsES6_S4_S4_fS7_S7_S6_i",
+        params: &[
+            "__nv_bfloat16 const*",
+            "int",
+            "float const*",
+            "float const*",
+            "int const*",
+            "int",
+            "int",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "__nv_bfloat16 const*",
+            "__nv_bfloat16 const*",
+            "long long",
+            "glue::Rows",
+            "int const*",
+            "float const*",
+            "float const*",
+            "float",
+            "__nv_bfloat16*",
+            "__nv_bfloat16*",
+            "int const*",
+            "int",
+        ],
+        param_bytes: 212,
         coop: false,
     },
     KernelInfo {
@@ -2326,6 +2671,14 @@ pub static KERNELS: [KernelInfo; 367] = [
         key: "pglue_route_select9_kernel",
         tu: 0,
         symbol: "_ZN5pglue20route_select9_kernelEPKfiS1_PiPf",
+        params: &["float const*", "int", "float const*", "int*", "float*"],
+        param_bytes: 40,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_route_select_rows_kernel",
+        tu: 0,
+        symbol: "_ZN5pglue24route_select_rows_kernelEPKfiS1_PiPf",
         params: &["float const*", "int", "float const*", "int*", "float*"],
         param_bytes: 40,
         coop: false,
@@ -3958,7 +4311,7 @@ pub static KERNELS: [KernelInfo; 367] = [
         tu: 1,
         symbol: "_ZN3s2f17markov_lev_finishENS_6MarkovEiNS_6LevBufE",
         params: &["s2f::Markov", "int", "s2f::LevBuf"],
-        param_bytes: 432,
+        param_bytes: 448,
         coop: false,
     },
     KernelInfo {
@@ -3966,7 +4319,7 @@ pub static KERNELS: [KernelInfo; 367] = [
         tu: 1,
         symbol: "_ZN3s2f21markov_lev_scan_fusedILi1EEEvNS_6MarkovEiNS_6LevBufE",
         params: &["s2f::Markov", "int", "s2f::LevBuf"],
-        param_bytes: 432,
+        param_bytes: 448,
         coop: false,
     },
     KernelInfo {
@@ -3974,7 +4327,7 @@ pub static KERNELS: [KernelInfo; 367] = [
         tu: 1,
         symbol: "_ZN3s2f21markov_lev_scan_fusedILi2EEEvNS_6MarkovEiNS_6LevBufE",
         params: &["s2f::Markov", "int", "s2f::LevBuf"],
-        param_bytes: 432,
+        param_bytes: 448,
         coop: false,
     },
     KernelInfo {
@@ -3982,7 +4335,7 @@ pub static KERNELS: [KernelInfo; 367] = [
         tu: 1,
         symbol: "_ZN3s2f21markov_lev_scan_fusedILi3EEEvNS_6MarkovEiNS_6LevBufE",
         params: &["s2f::Markov", "int", "s2f::LevBuf"],
-        param_bytes: 432,
+        param_bytes: 448,
         coop: false,
     },
     KernelInfo {
@@ -3990,7 +4343,7 @@ pub static KERNELS: [KernelInfo; 367] = [
         tu: 1,
         symbol: "_ZN3s2f21markov_lev_scan_fusedILi4EEEvNS_6MarkovEiNS_6LevBufE",
         params: &["s2f::Markov", "int", "s2f::LevBuf"],
-        param_bytes: 432,
+        param_bytes: 448,
         coop: false,
     },
     KernelInfo {
@@ -3998,7 +4351,7 @@ pub static KERNELS: [KernelInfo; 367] = [
         tu: 1,
         symbol: "_ZN3s2f21markov_lev_scan_fusedILi5EEEvNS_6MarkovEiNS_6LevBufE",
         params: &["s2f::Markov", "int", "s2f::LevBuf"],
-        param_bytes: 432,
+        param_bytes: 448,
         coop: false,
     },
     KernelInfo {
@@ -4006,7 +4359,7 @@ pub static KERNELS: [KernelInfo; 367] = [
         tu: 1,
         symbol: "_ZN3s2f21markov_lev_scan_fusedILi6EEEvNS_6MarkovEiNS_6LevBufE",
         params: &["s2f::Markov", "int", "s2f::LevBuf"],
-        param_bytes: 432,
+        param_bytes: 448,
         coop: false,
     },
     KernelInfo {
@@ -4014,7 +4367,7 @@ pub static KERNELS: [KernelInfo; 367] = [
         tu: 1,
         symbol: "_ZN3s2f21markov_lev_scan_fusedILi7EEEvNS_6MarkovEiNS_6LevBufE",
         params: &["s2f::Markov", "int", "s2f::LevBuf"],
-        param_bytes: 432,
+        param_bytes: 448,
         coop: false,
     },
     KernelInfo {
@@ -4022,7 +4375,7 @@ pub static KERNELS: [KernelInfo; 367] = [
         tu: 1,
         symbol: "_ZN3s2f21markov_lev_scan_fusedILi8EEEvNS_6MarkovEiNS_6LevBufE",
         params: &["s2f::Markov", "int", "s2f::LevBuf"],
-        param_bytes: 432,
+        param_bytes: 448,
         coop: false,
     },
     KernelInfo {
@@ -4038,7 +4391,7 @@ pub static KERNELS: [KernelInfo; 367] = [
         tu: 1,
         symbol: "_ZN3s2f17markov_recur_projENS_6MarkovEiNS_6LevBufE",
         params: &["s2f::Markov", "int", "s2f::LevBuf"],
-        param_bytes: 432,
+        param_bytes: 448,
         coop: false,
     },
     KernelInfo {
@@ -4776,6 +5129,30 @@ pub mod pglue {
     unsafe impl bytemuck::Zeroable for MgTc {}
     // SAFETY: as above; every field is Pod, so every bit pattern is valid; Copy and 'static.
     unsafe impl bytemuck::Pod for MgTc {}
+    /// `pglue::MgTcVmsg`: 152 bytes, align 8 (C++ definition: engine/kernels/pack/structs.def).
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct MgTcVmsg {
+        /// `__nv_bfloat16 const* [4]`, offset 0.
+        pub gd: [DevPtr<Bf16>; 4],
+        /// `__nv_bfloat16 const* [4]`, offset 32.
+        pub W: [DevPtr<Bf16>; 4],
+        /// `float const* [4]`, offset 64.
+        pub hid: [DevPtr<f32>; 4],
+        /// `__nv_bfloat16 const*`, offset 96.
+        pub msrc0: DevPtr<Bf16>,
+        /// `__nv_bfloat16 const*`, offset 104.
+        pub msrc1: DevPtr<Bf16>,
+        /// `float const*`, offset 112.
+        pub mw: DevPtr<f32>,
+        /// `float* [4]`, offset 120.
+        pub out: [DevPtr<f32>; 4],
+    }
+    // SAFETY: repr(C) with explicit padding fields, so no padding bytes (checked by the layout assertions:
+    // fields tile the size); every field is Zeroable (integers, floats, DevPtr, arrays, other mirrors).
+    unsafe impl bytemuck::Zeroable for MgTcVmsg {}
+    // SAFETY: as above; every field is Pod, so every bit pattern is valid; Copy and 'static.
+    unsafe impl bytemuck::Pod for MgTcVmsg {}
     /// `pglue::MgDown`: 112 bytes, align 8 (C++ definition: engine/kernels/pack/structs.def).
     #[repr(C)]
     #[derive(Debug, Clone, Copy)]
@@ -5090,7 +5467,7 @@ pub mod s2f {
     unsafe impl bytemuck::Zeroable for ConfBuf {}
     // SAFETY: as above; every field is Pod, so every bit pattern is valid; Copy and 'static.
     unsafe impl bytemuck::Pod for ConfBuf {}
-    /// `s2f::LevBuf`: 120 bytes, align 8 (C++ definition: engine/kernels/pack/structs.def).
+    /// `s2f::LevBuf`: 136 bytes, align 8 (C++ definition: engine/kernels/pack/structs.def).
     #[repr(C)]
     #[derive(Debug, Clone, Copy)]
     pub struct LevBuf {
@@ -5126,6 +5503,12 @@ pub mod s2f {
         pub full_verify: i32,
         /// `int`, offset 116.
         pub conf_mode: i32,
+        /// `unsigned int*`, offset 120.
+        pub active_mask: DevPtr<u32>,
+        /// `float`, offset 128.
+        pub early_tau_ln: f32,
+        /// Padding the C++ compiler inserts (explicit, so the mirror has no padding bytes).
+        pub _pad0: [u8; 4],
     }
     // SAFETY: repr(C) with explicit padding fields, so no padding bytes (checked by the layout assertions:
     // fields tile the size); every field is Zeroable (integers, floats, DevPtr, arrays, other mirrors).
@@ -5308,6 +5691,15 @@ const _: () = {
     assert!(std::mem::offset_of!(pglue::MgTc, hid) == 64);
     assert!(std::mem::offset_of!(pglue::MgTc, msg) == 96);
     assert!(std::mem::offset_of!(pglue::MgTc, out) == 128);
+    assert!(std::mem::size_of::<pglue::MgTcVmsg>() == 152);
+    assert!(std::mem::align_of::<pglue::MgTcVmsg>() == 8);
+    assert!(std::mem::offset_of!(pglue::MgTcVmsg, gd) == 0);
+    assert!(std::mem::offset_of!(pglue::MgTcVmsg, W) == 32);
+    assert!(std::mem::offset_of!(pglue::MgTcVmsg, hid) == 64);
+    assert!(std::mem::offset_of!(pglue::MgTcVmsg, msrc0) == 96);
+    assert!(std::mem::offset_of!(pglue::MgTcVmsg, msrc1) == 104);
+    assert!(std::mem::offset_of!(pglue::MgTcVmsg, mw) == 112);
+    assert!(std::mem::offset_of!(pglue::MgTcVmsg, out) == 120);
     assert!(std::mem::size_of::<pglue::MgDown>() == 112);
     assert!(std::mem::align_of::<pglue::MgDown>() == 8);
     assert!(std::mem::offset_of!(pglue::MgDown, x) == 0);
@@ -5405,7 +5797,7 @@ const _: () = {
     assert!(std::mem::offset_of!(s2f::ConfBuf, zd) == 8);
     assert!(std::mem::offset_of!(s2f::ConfBuf, vd) == 16);
     assert!(std::mem::offset_of!(s2f::ConfBuf, part) == 24);
-    assert!(std::mem::size_of::<s2f::LevBuf>() == 120);
+    assert!(std::mem::size_of::<s2f::LevBuf>() == 136);
     assert!(std::mem::align_of::<s2f::LevBuf>() == 8);
     assert!(std::mem::offset_of!(s2f::LevBuf, chunk_val) == 0);
     assert!(std::mem::offset_of!(s2f::LevBuf, chunk_id) == 8);
@@ -5423,6 +5815,8 @@ const _: () = {
     assert!(std::mem::offset_of!(s2f::LevBuf, conf_c) == 104);
     assert!(std::mem::offset_of!(s2f::LevBuf, full_verify) == 112);
     assert!(std::mem::offset_of!(s2f::LevBuf, conf_mode) == 116);
+    assert!(std::mem::offset_of!(s2f::LevBuf, active_mask) == 120);
+    assert!(std::mem::offset_of!(s2f::LevBuf, early_tau_ln) == 128);
     assert!(std::mem::size_of::<RealHead>() == 40);
     assert!(std::mem::align_of::<RealHead>() == 8);
     assert!(std::mem::offset_of!(RealHead, nrec) == 0);
@@ -6203,6 +6597,48 @@ pub(crate) const RUST_LAYOUTS: &[crate::RustLayout] = &[
         ],
     },
     crate::RustLayout {
+        name: "pglue::MgTcVmsg",
+        size: std::mem::size_of::<pglue::MgTcVmsg>(),
+        align: std::mem::align_of::<pglue::MgTcVmsg>(),
+        fields: &[
+            (
+                "gd",
+                std::mem::offset_of!(pglue::MgTcVmsg, gd),
+                std::mem::size_of::<[DevPtr<Bf16>; 4]>(),
+            ),
+            (
+                "W",
+                std::mem::offset_of!(pglue::MgTcVmsg, W),
+                std::mem::size_of::<[DevPtr<Bf16>; 4]>(),
+            ),
+            (
+                "hid",
+                std::mem::offset_of!(pglue::MgTcVmsg, hid),
+                std::mem::size_of::<[DevPtr<f32>; 4]>(),
+            ),
+            (
+                "msrc0",
+                std::mem::offset_of!(pglue::MgTcVmsg, msrc0),
+                std::mem::size_of::<DevPtr<Bf16>>(),
+            ),
+            (
+                "msrc1",
+                std::mem::offset_of!(pglue::MgTcVmsg, msrc1),
+                std::mem::size_of::<DevPtr<Bf16>>(),
+            ),
+            (
+                "mw",
+                std::mem::offset_of!(pglue::MgTcVmsg, mw),
+                std::mem::size_of::<DevPtr<f32>>(),
+            ),
+            (
+                "out",
+                std::mem::offset_of!(pglue::MgTcVmsg, out),
+                std::mem::size_of::<[DevPtr<f32>; 4]>(),
+            ),
+        ],
+    },
+    crate::RustLayout {
         name: "pglue::MgDown",
         size: std::mem::size_of::<pglue::MgDown>(),
         align: std::mem::align_of::<pglue::MgDown>(),
@@ -6725,6 +7161,16 @@ pub(crate) const RUST_LAYOUTS: &[crate::RustLayout] = &[
                 "conf_mode",
                 std::mem::offset_of!(s2f::LevBuf, conf_mode),
                 std::mem::size_of::<i32>(),
+            ),
+            (
+                "active_mask",
+                std::mem::offset_of!(s2f::LevBuf, active_mask),
+                std::mem::size_of::<DevPtr<u32>>(),
+            ),
+            (
+                "early_tau_ln",
+                std::mem::offset_of!(s2f::LevBuf, early_tau_ln),
+                std::mem::size_of::<f32>(),
             ),
         ],
     },
@@ -7478,6 +7924,20 @@ pub struct InkVerifyWidthKernelArgs<'a> {
     pub width: Ptr<'a, i32>,
 }
 
+/// Arguments of [`Kernels::ink_verify_width_pack_kernel`] by C++ parameter name (`ink::(anonymous namespace)::verify_width_pack_kernel(float const*, int const*, float, int, int*)`).
+pub struct InkVerifyWidthPackKernelArgs<'a> {
+    /// `float const*`
+    pub margin: Ptr<'a, f32>,
+    /// `int const*`
+    pub drafts: Ptr<'a, i32>,
+    /// `float`
+    pub tau: f32,
+    /// `int`
+    pub n: i32,
+    /// `int*`
+    pub out: Ptr<'a, i32>,
+}
+
 /// Arguments of [`Kernels::moedev_moe_build_dec_kernel`] by C++ parameter name (`moedev::moe_build_dec_kernel(int const*, float const*, int, int*, int*, int*, float*, pmoe::Item*, int*)`).
 pub struct MoedevMoeBuildDecKernelArgs<'a> {
     /// `int const*`
@@ -7522,6 +7982,46 @@ pub struct MoedevMoeBuildKernelArgs<'a> {
     pub n_items: Ptr<'a, i32>,
 }
 
+/// Arguments of [`Kernels::pglue_ar288_g3_shared_rows_kernel`] by C++ parameter name (`pglue::ar288_g3_shared_rows_kernel(glue::ResSrc, float const*, float*, float, glue::GateIn, int)`).
+pub struct PglueAr288G3SharedRowsKernelArgs<'a> {
+    /// `glue::ResSrc`
+    pub s: glue::ResSrc,
+    /// `float const*`
+    pub queries: Ptr<'a, f32>,
+    /// `float*`
+    pub out: Ptr<'a, f32>,
+    /// `float`
+    pub eps: f32,
+    /// `glue::GateIn`
+    pub gi: glue::GateIn,
+    /// `int`
+    pub T: i32,
+}
+
+/// Arguments of [`Kernels::pglue_ar288_g3_vmsg_kernel`] by C++ parameter name (`pglue::ar288_g3_vmsg_kernel(glue::ResSrc, float const*, float*, float, __nv_bfloat16 const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, long long, int)`).
+pub struct PglueAr288G3VmsgKernelArgs<'a> {
+    /// `glue::ResSrc`
+    pub s: glue::ResSrc,
+    /// `float const*`
+    pub queries: Ptr<'a, f32>,
+    /// `float*`
+    pub out: Ptr<'a, f32>,
+    /// `float`
+    pub eps: f32,
+    /// `__nv_bfloat16 const*`
+    pub msrc0: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub msrc1: Ptr<'a, Bf16>,
+    /// `float const*`
+    pub mw: Ptr<'a, f32>,
+    /// `__nv_bfloat16*`
+    pub gin: Ptr<'a, Bf16>,
+    /// `long long`
+    pub gs: i64,
+    /// `int`
+    pub T: i32,
+}
+
 /// Arguments of [`Kernels::pglue_ar288_kernel_0`] by C++ parameter name (`void pglue::ar288_kernel<0>(glue::ResSrc, float const*, float*, float, glue::GateIn)`).
 pub struct PglueAr288Kernel0Args<'a> {
     /// `glue::ResSrc`
@@ -7550,6 +8050,60 @@ pub struct PglueAr288Kernel1Args<'a> {
     pub gi: glue::GateIn,
 }
 
+/// Arguments of [`Kernels::pglue_ar288_msgs_rows_kernel`] by C++ parameter name (`pglue::ar288_msgs_rows_kernel(glue::ResSrc, float const*, float*, float, int)`).
+pub struct PglueAr288MsgsRowsKernelArgs<'a> {
+    /// `glue::ResSrc`
+    pub s: glue::ResSrc,
+    /// `float const*`
+    pub queries: Ptr<'a, f32>,
+    /// `float*`
+    pub out: Ptr<'a, f32>,
+    /// `float`
+    pub eps: f32,
+    /// `int`
+    pub T: i32,
+}
+
+/// Arguments of [`Kernels::pglue_ar288_q3g3_rows_kernel`] by C++ parameter name (`pglue::ar288_q3g3_rows_kernel(glue::ResSrc, float const*, float*, float, glue::GateIn, int)`).
+pub struct PglueAr288Q3g3RowsKernelArgs<'a> {
+    /// `glue::ResSrc`
+    pub s: glue::ResSrc,
+    /// `float const*`
+    pub queries: Ptr<'a, f32>,
+    /// `float*`
+    pub out: Ptr<'a, f32>,
+    /// `float`
+    pub eps: f32,
+    /// `glue::GateIn`
+    pub gi: glue::GateIn,
+    /// `int`
+    pub T: i32,
+}
+
+/// Arguments of [`Kernels::pglue_ar288_q3g3_vmsg_kernel`] by C++ parameter name (`pglue::ar288_q3g3_vmsg_kernel(glue::ResSrc, float const*, float*, float, __nv_bfloat16 const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, long long, int)`).
+pub struct PglueAr288Q3g3VmsgKernelArgs<'a> {
+    /// `glue::ResSrc`
+    pub s: glue::ResSrc,
+    /// `float const*`
+    pub queries: Ptr<'a, f32>,
+    /// `float*`
+    pub out: Ptr<'a, f32>,
+    /// `float`
+    pub eps: f32,
+    /// `__nv_bfloat16 const*`
+    pub msrc0: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub msrc1: Ptr<'a, Bf16>,
+    /// `float const*`
+    pub mw: Ptr<'a, f32>,
+    /// `__nv_bfloat16*`
+    pub gin: Ptr<'a, Bf16>,
+    /// `long long`
+    pub gs: i64,
+    /// `int`
+    pub T: i32,
+}
+
 /// Arguments of [`Kernels::pglue_ar_norm288_kernel`] by C++ parameter name (`pglue::ar_norm288_kernel(glue::ResSrc, float const*, float const*, float const*, float const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float)`).
 pub struct PglueArNorm288KernelArgs<'a> {
     /// `glue::ResSrc`
@@ -7570,6 +8124,30 @@ pub struct PglueArNorm288KernelArgs<'a> {
     pub o2: Ptr<'a, Bf16>,
     /// `float`
     pub eps: f32,
+}
+
+/// Arguments of [`Kernels::pglue_ar_norm288_rows_kernel_3`] by C++ parameter name (`void pglue::ar_norm288_rows_kernel<3>(glue::ResSrc, float const*, float const*, float const*, float const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float, int)`).
+pub struct PglueArNorm288RowsKernel3Args<'a> {
+    /// `glue::ResSrc`
+    pub s: glue::ResSrc,
+    /// `float const*`
+    pub queries: Ptr<'a, f32>,
+    /// `float const*`
+    pub w0: Ptr<'a, f32>,
+    /// `float const*`
+    pub w1: Ptr<'a, f32>,
+    /// `float const*`
+    pub w2: Ptr<'a, f32>,
+    /// `__nv_bfloat16*`
+    pub o0: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub o1: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub o2: Ptr<'a, Bf16>,
+    /// `float`
+    pub eps: f32,
+    /// `int`
+    pub T: i32,
 }
 
 /// Arguments of [`Kernels::pglue_ar_norm_rows_kernel_1`] by C++ parameter name (`void pglue::ar_norm_rows_kernel<1>(glue::ResSrc, float const*, float const*, float const*, float const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float, int)`).
@@ -7748,6 +8326,80 @@ pub struct PglueConvArGate288KernelArgs<'a> {
     pub gi: glue::GateIn,
 }
 
+/// Arguments of [`Kernels::pglue_conv_ar_gate288_rows_kernel`] by C++ parameter name (`pglue::conv_ar_gate288_rows_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float*, float, glue::GateIn, int)`).
+pub struct PglueConvArGate288RowsKernelArgs<'a> {
+    /// `__nv_bfloat16 const*`
+    pub ax: Ptr<'a, Bf16>,
+    /// `float const*`
+    pub cw: Ptr<'a, f32>,
+    /// `__nv_bfloat16 const*`
+    pub state: Ptr<'a, Bf16>,
+    /// `long long`
+    pub st_slot_stride: i64,
+    /// `glue::Rows`
+    pub R: glue::Rows,
+    /// `__nv_bfloat16 const*`
+    pub hin: Ptr<'a, Bf16>,
+    /// `int`
+    pub block_start: i32,
+    /// `__nv_bfloat16*`
+    pub blk_out: Ptr<'a, Bf16>,
+    /// `float*`
+    pub partial32: Ptr<'a, f32>,
+    /// `glue::ResSrc`
+    pub s: glue::ResSrc,
+    /// `float const*`
+    pub query: Ptr<'a, f32>,
+    /// `float*`
+    pub ar_out: Ptr<'a, f32>,
+    /// `float`
+    pub eps: f32,
+    /// `glue::GateIn`
+    pub gi: glue::GateIn,
+    /// `int`
+    pub T: i32,
+}
+
+/// Arguments of [`Kernels::pglue_conv_ar_gate288_vmsg_kernel`] by C++ parameter name (`pglue::conv_ar_gate288_vmsg_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float*, float, __nv_bfloat16 const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, int)`).
+pub struct PglueConvArGate288VmsgKernelArgs<'a> {
+    /// `__nv_bfloat16 const*`
+    pub ax: Ptr<'a, Bf16>,
+    /// `float const*`
+    pub cw: Ptr<'a, f32>,
+    /// `__nv_bfloat16 const*`
+    pub state: Ptr<'a, Bf16>,
+    /// `long long`
+    pub st_slot_stride: i64,
+    /// `glue::Rows`
+    pub R: glue::Rows,
+    /// `__nv_bfloat16 const*`
+    pub hin: Ptr<'a, Bf16>,
+    /// `int`
+    pub block_start: i32,
+    /// `__nv_bfloat16*`
+    pub blk_out: Ptr<'a, Bf16>,
+    /// `float*`
+    pub partial32: Ptr<'a, f32>,
+    /// `glue::ResSrc`
+    pub s: glue::ResSrc,
+    /// `float const*`
+    pub query: Ptr<'a, f32>,
+    /// `float*`
+    pub ar_out: Ptr<'a, f32>,
+    /// `float`
+    pub eps: f32,
+    /// `__nv_bfloat16 const*`
+    pub msrc0: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub msrc1: Ptr<'a, Bf16>,
+    /// `float const*`
+    pub mw: Ptr<'a, f32>,
+    /// `__nv_bfloat16*`
+    pub gin: Ptr<'a, Bf16>,
+    /// `int`
+    pub T: i32,
+}
+
 /// Arguments of [`Kernels::pglue_conv_ar_norm288_kernel`] by C++ parameter name (`pglue::conv_ar_norm288_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float const*, __nv_bfloat16*, float)`).
 pub struct PglueConvArNorm288KernelArgs<'a> {
     /// `__nv_bfloat16 const*`
@@ -7778,6 +8430,40 @@ pub struct PglueConvArNorm288KernelArgs<'a> {
     pub xm_out: Ptr<'a, Bf16>,
     /// `float`
     pub eps: f32,
+}
+
+/// Arguments of [`Kernels::pglue_conv_ar_norm288_rows_kernel`] by C++ parameter name (`pglue::conv_ar_norm288_rows_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float const*, __nv_bfloat16*, float, int)`).
+pub struct PglueConvArNorm288RowsKernelArgs<'a> {
+    /// `__nv_bfloat16 const*`
+    pub ax: Ptr<'a, Bf16>,
+    /// `float const*`
+    pub cw: Ptr<'a, f32>,
+    /// `__nv_bfloat16 const*`
+    pub state: Ptr<'a, Bf16>,
+    /// `long long`
+    pub st_slot_stride: i64,
+    /// `glue::Rows`
+    pub R: glue::Rows,
+    /// `__nv_bfloat16 const*`
+    pub hin: Ptr<'a, Bf16>,
+    /// `int`
+    pub block_start: i32,
+    /// `__nv_bfloat16*`
+    pub blk_out: Ptr<'a, Bf16>,
+    /// `float*`
+    pub partial32: Ptr<'a, f32>,
+    /// `glue::ResSrc`
+    pub s: glue::ResSrc,
+    /// `float const*`
+    pub query: Ptr<'a, f32>,
+    /// `float const*`
+    pub norm_w: Ptr<'a, f32>,
+    /// `__nv_bfloat16*`
+    pub xm_out: Ptr<'a, Bf16>,
+    /// `float`
+    pub eps: f32,
+    /// `int`
+    pub T: i32,
 }
 
 /// Arguments of [`Kernels::pglue_conv_rows_kernel_0`] by C++ parameter name (`void pglue::conv_rows_kernel<0>(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, int, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, __nv_bfloat16*)`).
@@ -7926,6 +8612,20 @@ pub struct PglueMgTailTcKernelArgs {
     pub ldo: i32,
 }
 
+/// Arguments of [`Kernels::pglue_mg_tail_tc_vmsg_kernel`] by C++ parameter name (`pglue::mg_tail_tc_vmsg_kernel(pglue::MgTcVmsg, int, int, int, int)`).
+pub struct PglueMgTailTcVmsgKernelArgs {
+    /// `pglue::MgTcVmsg`
+    pub m: pglue::MgTcVmsg,
+    /// `int`
+    pub T: i32,
+    /// `int`
+    pub ldh: i32,
+    /// `int`
+    pub ldo: i32,
+    /// `int`
+    pub q_off: i32,
+}
+
 /// Arguments of [`Kernels::pglue_mg_tc_weights_kernel`] by C++ parameter name (`pglue::mg_tc_weights_kernel(float const*, float const*, __nv_bfloat16*)`).
 pub struct PglueMgTcWeightsKernelArgs<'a> {
     /// `float const*`
@@ -7936,6 +8636,40 @@ pub struct PglueMgTcWeightsKernelArgs<'a> {
     pub W: Ptr<'a, Bf16>,
 }
 
+/// Arguments of [`Kernels::pglue_moe_combine_conv_kernel`] by C++ parameter name (`pglue::moe_combine_conv_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, int const*, int, float const*, __nv_bfloat16*, __nv_bfloat16*)`).
+pub struct PglueMoeCombineConvKernelArgs<'a> {
+    /// `__nv_bfloat16 const*`
+    pub my: Ptr<'a, Bf16>,
+    /// `float const*`
+    pub w: Ptr<'a, f32>,
+    /// `__nv_bfloat16 const*`
+    pub state: Ptr<'a, Bf16>,
+    /// `long long`
+    pub st_slot_stride: i64,
+    /// `glue::Rows`
+    pub R: glue::Rows,
+    /// `int const*`
+    pub seg_len: Ptr<'a, i32>,
+    /// `int`
+    pub T: i32,
+    /// `float const*`
+    pub partial32: Ptr<'a, f32>,
+    /// `__nv_bfloat16*`
+    pub mx: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub out: Ptr<'a, Bf16>,
+}
+
+/// Arguments of [`Kernels::pglue_moe_count_fast_kernel`] by C++ parameter name (`pglue::moe_count_fast_kernel(int const*, int, int*)`).
+pub struct PglueMoeCountFastKernelArgs<'a> {
+    /// `int const*`
+    pub idx: Ptr<'a, i32>,
+    /// `int`
+    pub R: i32,
+    /// `int*`
+    pub cntb: Ptr<'a, i32>,
+}
+
 /// Arguments of [`Kernels::pglue_moe_count_kernel`] by C++ parameter name (`pglue::moe_count_kernel(int const*, int, int*)`).
 pub struct PglueMoeCountKernelArgs<'a> {
     /// `int const*`
@@ -7944,6 +8678,20 @@ pub struct PglueMoeCountKernelArgs<'a> {
     pub R: i32,
     /// `int*`
     pub cntb: Ptr<'a, i32>,
+}
+
+/// Arguments of [`Kernels::pglue_moe_plan_fast_kernel`] by C++ parameter name (`pglue::moe_plan_fast_kernel(int const*, int, int*, pmoe::Item*, int*)`).
+pub struct PglueMoePlanFastKernelArgs<'a> {
+    /// `int const*`
+    pub cntb: Ptr<'a, i32>,
+    /// `int`
+    pub nb: i32,
+    /// `int*`
+    pub baseb: Ptr<'a, i32>,
+    /// `pmoe::Item*`
+    pub items: Ptr<'a, pmoe::Item>,
+    /// `int*`
+    pub n_items: Ptr<'a, i32>,
 }
 
 /// Arguments of [`Kernels::pglue_moe_plan_kernel`] by C++ parameter name (`pglue::moe_plan_kernel(int const*, int, int*, pmoe::Item*, int*)`).
@@ -7958,6 +8706,26 @@ pub struct PglueMoePlanKernelArgs<'a> {
     pub items: Ptr<'a, pmoe::Item>,
     /// `int*`
     pub n_items: Ptr<'a, i32>,
+}
+
+/// Arguments of [`Kernels::pglue_moe_scatter_fast_kernel`] by C++ parameter name (`pglue::moe_scatter_fast_kernel(int const*, float const*, int, int const*, int*, int*, int*, float*)`).
+pub struct PglueMoeScatterFastKernelArgs<'a> {
+    /// `int const*`
+    pub idx: Ptr<'a, i32>,
+    /// `float const*`
+    pub wts: Ptr<'a, f32>,
+    /// `int`
+    pub R: i32,
+    /// `int const*`
+    pub baseb: Ptr<'a, i32>,
+    /// `int*`
+    pub a13: Ptr<'a, i32>,
+    /// `int*`
+    pub a2: Ptr<'a, i32>,
+    /// `int*`
+    pub orow: Ptr<'a, i32>,
+    /// `float*`
+    pub gamma: Ptr<'a, f32>,
 }
 
 /// Arguments of [`Kernels::pglue_moe_scatter_kernel`] by C++ parameter name (`pglue::moe_scatter_kernel(int const*, float const*, int, int const*, int*, int*, int*, float*)`).
@@ -7992,6 +8760,130 @@ pub struct PglueNormRowsKernelArgs {
     pub eps: f32,
     /// `int`
     pub T: i32,
+}
+
+/// Arguments of [`Kernels::pglue_vmsg_weights_kernel`] by C++ parameter name (`pglue::vmsg_weights_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, float const*, float*, float, int)`).
+pub struct PglueVmsgWeightsKernelArgs<'a> {
+    /// `__nv_bfloat16 const*`
+    pub msrc0: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub msrc1: Ptr<'a, Bf16>,
+    /// `float const*`
+    pub msg_queries: Ptr<'a, f32>,
+    /// `float*`
+    pub mw: Ptr<'a, f32>,
+    /// `float`
+    pub eps: f32,
+    /// `int`
+    pub T: i32,
+}
+
+/// Arguments of [`Kernels::pglue_qkv_post_fused_rows_fp8_kernel`] by C++ parameter name (`pglue::qkv_post_fused_rows_fp8_kernel(__nv_bfloat16 const*, int, float const*, float const*, int const*, int, int, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, long long, glue::Rows, int const*, float const*, float const*, float, unsigned char*, unsigned char*, int const*, int)`).
+pub struct PglueQkvPostFusedRowsFp8KernelArgs<'a> {
+    /// `__nv_bfloat16 const*`
+    pub qkvf: Ptr<'a, Bf16>,
+    /// `int`
+    pub nt: i32,
+    /// `float const*`
+    pub q_scale: Ptr<'a, f32>,
+    /// `float const*`
+    pub r_scale: Ptr<'a, f32>,
+    /// `int const*`
+    pub row_pos: Ptr<'a, i32>,
+    /// `int`
+    pub full: i32,
+    /// `int`
+    pub T: i32,
+    /// `__nv_bfloat16*`
+    pub q: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub rel: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub gate: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub sink: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub kx: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub vx: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub kst: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub vst: Ptr<'a, Bf16>,
+    /// `long long`
+    pub st_slot_stride: i64,
+    /// `glue::Rows`
+    pub R: glue::Rows,
+    /// `int const*`
+    pub seg_len: Ptr<'a, i32>,
+    /// `float const*`
+    pub kw: Ptr<'a, f32>,
+    /// `float const*`
+    pub vw: Ptr<'a, f32>,
+    /// `float`
+    pub eps: f32,
+    /// `unsigned char*`
+    pub kpool: Ptr<'a, u8>,
+    /// `unsigned char*`
+    pub vpool: Ptr<'a, u8>,
+    /// `int const*`
+    pub pt: Ptr<'a, i32>,
+    /// `int`
+    pub pt_stride: i32,
+}
+
+/// Arguments of [`Kernels::pglue_qkv_post_fused_rows_kernel`] by C++ parameter name (`pglue::qkv_post_fused_rows_kernel(__nv_bfloat16 const*, int, float const*, float const*, int const*, int, int, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, long long, glue::Rows, int const*, float const*, float const*, float, __nv_bfloat16*, __nv_bfloat16*, int const*, int)`).
+pub struct PglueQkvPostFusedRowsKernelArgs<'a> {
+    /// `__nv_bfloat16 const*`
+    pub qkvf: Ptr<'a, Bf16>,
+    /// `int`
+    pub nt: i32,
+    /// `float const*`
+    pub q_scale: Ptr<'a, f32>,
+    /// `float const*`
+    pub r_scale: Ptr<'a, f32>,
+    /// `int const*`
+    pub row_pos: Ptr<'a, i32>,
+    /// `int`
+    pub full: i32,
+    /// `int`
+    pub T: i32,
+    /// `__nv_bfloat16*`
+    pub q: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub rel: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub gate: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub sink: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub kx: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub vx: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub kst: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub vst: Ptr<'a, Bf16>,
+    /// `long long`
+    pub st_slot_stride: i64,
+    /// `glue::Rows`
+    pub R: glue::Rows,
+    /// `int const*`
+    pub seg_len: Ptr<'a, i32>,
+    /// `float const*`
+    pub kw: Ptr<'a, f32>,
+    /// `float const*`
+    pub vw: Ptr<'a, f32>,
+    /// `float`
+    pub eps: f32,
+    /// `__nv_bfloat16*`
+    pub kpool: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16*`
+    pub vpool: Ptr<'a, Bf16>,
+    /// `int const*`
+    pub pt: Ptr<'a, i32>,
+    /// `int`
+    pub pt_stride: i32,
 }
 
 /// Arguments of [`Kernels::pglue_qkv_post_rows_fp8_kernel`] by C++ parameter name (`pglue::qkv_post_rows_fp8_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, float const*, int const*, int, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, long long, glue::Rows, float const*, float const*, __nv_bfloat16 const*, __nv_bfloat16 const*, float, unsigned char*, unsigned char*, int const*, int)`).
@@ -8136,6 +9028,20 @@ pub struct PglueRouteSelect9KernelArgs<'a> {
     pub rlog: Ptr<'a, f32>,
     /// `int`
     pub M: i32,
+    /// `float const*`
+    pub bias: Ptr<'a, f32>,
+    /// `int*`
+    pub idx: Ptr<'a, i32>,
+    /// `float*`
+    pub wts: Ptr<'a, f32>,
+}
+
+/// Arguments of [`Kernels::pglue_route_select_rows_kernel`] by C++ parameter name (`pglue::route_select_rows_kernel(float const*, int, float const*, int*, float*)`).
+pub struct PglueRouteSelectRowsKernelArgs<'a> {
+    /// `float const*`
+    pub g: Ptr<'a, f32>,
+    /// `int`
+    pub T: i32,
     /// `float const*`
     pub bias: Ptr<'a, f32>,
     /// `int*`
@@ -11864,6 +12770,33 @@ impl Kernels {
         unsafe { stream.launch(self.function(KernelId::InkVerifyWidthKernel), cfg, &mut args) }
     }
 
+    /// `ink::(anonymous namespace)::verify_width_pack_kernel(float const*, int const*, float, int, int*)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn ink_verify_width_pack_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: InkVerifyWidthPackKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.margin);
+        push_ptr(&mut args, a.drafts);
+        args.value(&a.tau);
+        args.value(&a.n);
+        push_ptr(&mut args, a.out);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::InkVerifyWidthPackKernel), cfg, &mut args) }
+    }
+
     /// `moedev::moe_build_dec_kernel(int const*, float const*, int, int*, int*, int*, float*, pmoe::Item*, int*)` in `pack_engine.cubin`.
     ///
     /// # Safety
@@ -11978,6 +12911,66 @@ impl Kernels {
         unsafe { stream.launch(self.function(KernelId::PfaPrefillAttnKernel42112False), cfg, &mut args) }
     }
 
+    /// `pglue::ar288_g3_shared_rows_kernel(glue::ResSrc, float const*, float*, float, glue::GateIn, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_ar288_g3_shared_rows_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueAr288G3SharedRowsKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        args.value(&a.s);
+        push_ptr(&mut args, a.queries);
+        push_ptr(&mut args, a.out);
+        args.value(&a.eps);
+        args.value(&a.gi);
+        args.value(&a.T);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueAr288G3SharedRowsKernel), cfg, &mut args) }
+    }
+
+    /// `pglue::ar288_g3_vmsg_kernel(glue::ResSrc, float const*, float*, float, __nv_bfloat16 const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, long long, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_ar288_g3_vmsg_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueAr288G3VmsgKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        args.value(&a.s);
+        push_ptr(&mut args, a.queries);
+        push_ptr(&mut args, a.out);
+        args.value(&a.eps);
+        push_ptr(&mut args, a.msrc0);
+        push_ptr(&mut args, a.msrc1);
+        push_ptr(&mut args, a.mw);
+        push_ptr(&mut args, a.gin);
+        args.value(&a.gs);
+        args.value(&a.T);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueAr288G3VmsgKernel), cfg, &mut args) }
+    }
+
     /// `void pglue::ar288_kernel<0>(glue::ResSrc, float const*, float*, float, glue::GateIn)` in `pack_engine.cubin`.
     ///
     /// # Safety
@@ -12032,6 +13025,93 @@ impl Kernels {
         unsafe { stream.launch(self.function(KernelId::PglueAr288Kernel1), cfg, &mut args) }
     }
 
+    /// `pglue::ar288_msgs_rows_kernel(glue::ResSrc, float const*, float*, float, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_ar288_msgs_rows_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueAr288MsgsRowsKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        args.value(&a.s);
+        push_ptr(&mut args, a.queries);
+        push_ptr(&mut args, a.out);
+        args.value(&a.eps);
+        args.value(&a.T);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueAr288MsgsRowsKernel), cfg, &mut args) }
+    }
+
+    /// `pglue::ar288_q3g3_rows_kernel(glue::ResSrc, float const*, float*, float, glue::GateIn, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_ar288_q3g3_rows_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueAr288Q3g3RowsKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        args.value(&a.s);
+        push_ptr(&mut args, a.queries);
+        push_ptr(&mut args, a.out);
+        args.value(&a.eps);
+        args.value(&a.gi);
+        args.value(&a.T);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueAr288Q3g3RowsKernel), cfg, &mut args) }
+    }
+
+    /// `pglue::ar288_q3g3_vmsg_kernel(glue::ResSrc, float const*, float*, float, __nv_bfloat16 const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, long long, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_ar288_q3g3_vmsg_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueAr288Q3g3VmsgKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        args.value(&a.s);
+        push_ptr(&mut args, a.queries);
+        push_ptr(&mut args, a.out);
+        args.value(&a.eps);
+        push_ptr(&mut args, a.msrc0);
+        push_ptr(&mut args, a.msrc1);
+        push_ptr(&mut args, a.mw);
+        push_ptr(&mut args, a.gin);
+        args.value(&a.gs);
+        args.value(&a.T);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueAr288Q3g3VmsgKernel), cfg, &mut args) }
+    }
+
     /// `pglue::ar_norm288_kernel(glue::ResSrc, float const*, float const*, float const*, float const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float)` in `pack_engine.cubin`.
     ///
     /// # Safety
@@ -12061,6 +13141,38 @@ impl Kernels {
         // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
         // the kernel's memory contract is the caller's (# Safety).
         unsafe { stream.launch(self.function(KernelId::PglueArNorm288Kernel), cfg, &mut args) }
+    }
+
+    /// `void pglue::ar_norm288_rows_kernel<3>(glue::ResSrc, float const*, float const*, float const*, float const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_ar_norm288_rows_kernel_3(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueArNorm288RowsKernel3Args<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        args.value(&a.s);
+        push_ptr(&mut args, a.queries);
+        push_ptr(&mut args, a.w0);
+        push_ptr(&mut args, a.w1);
+        push_ptr(&mut args, a.w2);
+        push_ptr(&mut args, a.o0);
+        push_ptr(&mut args, a.o1);
+        push_ptr(&mut args, a.o2);
+        args.value(&a.eps);
+        args.value(&a.T);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueArNorm288RowsKernel3), cfg, &mut args) }
     }
 
     /// `void pglue::ar_norm_rows_kernel<1>(glue::ResSrc, float const*, float const*, float const*, float const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float, int)` in `pack_engine.cubin`.
@@ -12331,6 +13443,83 @@ impl Kernels {
         unsafe { stream.launch(self.function(KernelId::PglueConvArGate288Kernel), cfg, &mut args) }
     }
 
+    /// `pglue::conv_ar_gate288_rows_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float*, float, glue::GateIn, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_conv_ar_gate288_rows_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueConvArGate288RowsKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.ax);
+        push_ptr(&mut args, a.cw);
+        push_ptr(&mut args, a.state);
+        args.value(&a.st_slot_stride);
+        args.value(&a.R);
+        push_ptr(&mut args, a.hin);
+        args.value(&a.block_start);
+        push_ptr(&mut args, a.blk_out);
+        push_ptr(&mut args, a.partial32);
+        args.value(&a.s);
+        push_ptr(&mut args, a.query);
+        push_ptr(&mut args, a.ar_out);
+        args.value(&a.eps);
+        args.value(&a.gi);
+        args.value(&a.T);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueConvArGate288RowsKernel), cfg, &mut args) }
+    }
+
+    /// `pglue::conv_ar_gate288_vmsg_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float*, float, __nv_bfloat16 const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_conv_ar_gate288_vmsg_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueConvArGate288VmsgKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.ax);
+        push_ptr(&mut args, a.cw);
+        push_ptr(&mut args, a.state);
+        args.value(&a.st_slot_stride);
+        args.value(&a.R);
+        push_ptr(&mut args, a.hin);
+        args.value(&a.block_start);
+        push_ptr(&mut args, a.blk_out);
+        push_ptr(&mut args, a.partial32);
+        args.value(&a.s);
+        push_ptr(&mut args, a.query);
+        push_ptr(&mut args, a.ar_out);
+        args.value(&a.eps);
+        push_ptr(&mut args, a.msrc0);
+        push_ptr(&mut args, a.msrc1);
+        push_ptr(&mut args, a.mw);
+        push_ptr(&mut args, a.gin);
+        args.value(&a.T);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueConvArGate288VmsgKernel), cfg, &mut args) }
+    }
+
     /// `pglue::conv_ar_norm288_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float const*, __nv_bfloat16*, float)` in `pack_engine.cubin`.
     ///
     /// # Safety
@@ -12365,6 +13554,43 @@ impl Kernels {
         // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
         // the kernel's memory contract is the caller's (# Safety).
         unsafe { stream.launch(self.function(KernelId::PglueConvArNorm288Kernel), cfg, &mut args) }
+    }
+
+    /// `pglue::conv_ar_norm288_rows_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, glue::ResSrc, float const*, float const*, __nv_bfloat16*, float, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_conv_ar_norm288_rows_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueConvArNorm288RowsKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.ax);
+        push_ptr(&mut args, a.cw);
+        push_ptr(&mut args, a.state);
+        args.value(&a.st_slot_stride);
+        args.value(&a.R);
+        push_ptr(&mut args, a.hin);
+        args.value(&a.block_start);
+        push_ptr(&mut args, a.blk_out);
+        push_ptr(&mut args, a.partial32);
+        args.value(&a.s);
+        push_ptr(&mut args, a.query);
+        push_ptr(&mut args, a.norm_w);
+        push_ptr(&mut args, a.xm_out);
+        args.value(&a.eps);
+        args.value(&a.T);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueConvArNorm288RowsKernel), cfg, &mut args) }
     }
 
     /// `void pglue::conv_rows_kernel<0>(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, int, __nv_bfloat16 const*, int, __nv_bfloat16*, float*, __nv_bfloat16*)` in `pack_engine.cubin`.
@@ -12640,6 +13866,33 @@ impl Kernels {
         unsafe { stream.launch(self.function(KernelId::PglueMgTailTcKernel), cfg, &mut args) }
     }
 
+    /// `pglue::mg_tail_tc_vmsg_kernel(pglue::MgTcVmsg, int, int, int, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_mg_tail_tc_vmsg_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueMgTailTcVmsgKernelArgs,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        args.value(&a.m);
+        args.value(&a.T);
+        args.value(&a.ldh);
+        args.value(&a.ldo);
+        args.value(&a.q_off);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueMgTailTcVmsgKernel), cfg, &mut args) }
+    }
+
     /// `pglue::mg_tc_weights_kernel(float const*, float const*, __nv_bfloat16*)` in `pack_engine.cubin`.
     ///
     /// # Safety
@@ -12663,6 +13916,63 @@ impl Kernels {
         // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
         // the kernel's memory contract is the caller's (# Safety).
         unsafe { stream.launch(self.function(KernelId::PglueMgTcWeightsKernel), cfg, &mut args) }
+    }
+
+    /// `pglue::moe_combine_conv_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, long long, glue::Rows, int const*, int, float const*, __nv_bfloat16*, __nv_bfloat16*)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_moe_combine_conv_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueMoeCombineConvKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.my);
+        push_ptr(&mut args, a.w);
+        push_ptr(&mut args, a.state);
+        args.value(&a.st_slot_stride);
+        args.value(&a.R);
+        push_ptr(&mut args, a.seg_len);
+        args.value(&a.T);
+        push_ptr(&mut args, a.partial32);
+        push_ptr(&mut args, a.mx);
+        push_ptr(&mut args, a.out);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueMoeCombineConvKernel), cfg, &mut args) }
+    }
+
+    /// `pglue::moe_count_fast_kernel(int const*, int, int*)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_moe_count_fast_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueMoeCountFastKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.idx);
+        args.value(&a.R);
+        push_ptr(&mut args, a.cntb);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueMoeCountFastKernel), cfg, &mut args) }
     }
 
     /// `pglue::moe_count_kernel(int const*, int, int*)` in `pack_engine.cubin`.
@@ -12690,6 +14000,33 @@ impl Kernels {
         unsafe { stream.launch(self.function(KernelId::PglueMoeCountKernel), cfg, &mut args) }
     }
 
+    /// `pglue::moe_plan_fast_kernel(int const*, int, int*, pmoe::Item*, int*)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_moe_plan_fast_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueMoePlanFastKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.cntb);
+        args.value(&a.nb);
+        push_ptr(&mut args, a.baseb);
+        push_ptr(&mut args, a.items);
+        push_ptr(&mut args, a.n_items);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueMoePlanFastKernel), cfg, &mut args) }
+    }
+
     /// `pglue::moe_plan_kernel(int const*, int, int*, pmoe::Item*, int*)` in `pack_engine.cubin`.
     ///
     /// # Safety
@@ -12715,6 +14052,36 @@ impl Kernels {
         // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
         // the kernel's memory contract is the caller's (# Safety).
         unsafe { stream.launch(self.function(KernelId::PglueMoePlanKernel), cfg, &mut args) }
+    }
+
+    /// `pglue::moe_scatter_fast_kernel(int const*, float const*, int, int const*, int*, int*, int*, float*)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_moe_scatter_fast_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueMoeScatterFastKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.idx);
+        push_ptr(&mut args, a.wts);
+        args.value(&a.R);
+        push_ptr(&mut args, a.baseb);
+        push_ptr(&mut args, a.a13);
+        push_ptr(&mut args, a.a2);
+        push_ptr(&mut args, a.orow);
+        push_ptr(&mut args, a.gamma);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueMoeScatterFastKernel), cfg, &mut args) }
     }
 
     /// `pglue::moe_scatter_kernel(int const*, float const*, int, int const*, int*, int*, int*, float*)` in `pack_engine.cubin`.
@@ -12772,6 +14139,128 @@ impl Kernels {
         // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
         // the kernel's memory contract is the caller's (# Safety).
         unsafe { stream.launch(self.function(KernelId::PglueNormRowsKernel), cfg, &mut args) }
+    }
+
+    /// `pglue::vmsg_weights_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, float const*, float*, float, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_vmsg_weights_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueVmsgWeightsKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.msrc0);
+        push_ptr(&mut args, a.msrc1);
+        push_ptr(&mut args, a.msg_queries);
+        push_ptr(&mut args, a.mw);
+        args.value(&a.eps);
+        args.value(&a.T);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueVmsgWeightsKernel), cfg, &mut args) }
+    }
+
+    /// `pglue::qkv_post_fused_rows_fp8_kernel(__nv_bfloat16 const*, int, float const*, float const*, int const*, int, int, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, long long, glue::Rows, int const*, float const*, float const*, float, unsigned char*, unsigned char*, int const*, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_qkv_post_fused_rows_fp8_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueQkvPostFusedRowsFp8KernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.qkvf);
+        args.value(&a.nt);
+        push_ptr(&mut args, a.q_scale);
+        push_ptr(&mut args, a.r_scale);
+        push_ptr(&mut args, a.row_pos);
+        args.value(&a.full);
+        args.value(&a.T);
+        push_ptr(&mut args, a.q);
+        push_ptr(&mut args, a.rel);
+        push_ptr(&mut args, a.gate);
+        push_ptr(&mut args, a.sink);
+        push_ptr(&mut args, a.kx);
+        push_ptr(&mut args, a.vx);
+        push_ptr(&mut args, a.kst);
+        push_ptr(&mut args, a.vst);
+        args.value(&a.st_slot_stride);
+        args.value(&a.R);
+        push_ptr(&mut args, a.seg_len);
+        push_ptr(&mut args, a.kw);
+        push_ptr(&mut args, a.vw);
+        args.value(&a.eps);
+        push_ptr(&mut args, a.kpool);
+        push_ptr(&mut args, a.vpool);
+        push_ptr(&mut args, a.pt);
+        args.value(&a.pt_stride);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueQkvPostFusedRowsFp8Kernel), cfg, &mut args) }
+    }
+
+    /// `pglue::qkv_post_fused_rows_kernel(__nv_bfloat16 const*, int, float const*, float const*, int const*, int, int, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, long long, glue::Rows, int const*, float const*, float const*, float, __nv_bfloat16*, __nv_bfloat16*, int const*, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_qkv_post_fused_rows_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueQkvPostFusedRowsKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.qkvf);
+        args.value(&a.nt);
+        push_ptr(&mut args, a.q_scale);
+        push_ptr(&mut args, a.r_scale);
+        push_ptr(&mut args, a.row_pos);
+        args.value(&a.full);
+        args.value(&a.T);
+        push_ptr(&mut args, a.q);
+        push_ptr(&mut args, a.rel);
+        push_ptr(&mut args, a.gate);
+        push_ptr(&mut args, a.sink);
+        push_ptr(&mut args, a.kx);
+        push_ptr(&mut args, a.vx);
+        push_ptr(&mut args, a.kst);
+        push_ptr(&mut args, a.vst);
+        args.value(&a.st_slot_stride);
+        args.value(&a.R);
+        push_ptr(&mut args, a.seg_len);
+        push_ptr(&mut args, a.kw);
+        push_ptr(&mut args, a.vw);
+        args.value(&a.eps);
+        push_ptr(&mut args, a.kpool);
+        push_ptr(&mut args, a.vpool);
+        push_ptr(&mut args, a.pt);
+        args.value(&a.pt_stride);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueQkvPostFusedRowsKernel), cfg, &mut args) }
     }
 
     /// `pglue::qkv_post_rows_fp8_kernel(__nv_bfloat16 const*, float const*, __nv_bfloat16 const*, float const*, int const*, int, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, long long, glue::Rows, float const*, float const*, __nv_bfloat16 const*, __nv_bfloat16 const*, float, unsigned char*, unsigned char*, int const*, int)` in `pack_engine.cubin`.
@@ -12967,6 +14456,33 @@ impl Kernels {
         // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
         // the kernel's memory contract is the caller's (# Safety).
         unsafe { stream.launch(self.function(KernelId::PglueRouteSelect9Kernel), cfg, &mut args) }
+    }
+
+    /// `pglue::route_select_rows_kernel(float const*, int, float const*, int*, float*)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_route_select_rows_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueRouteSelectRowsKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.g);
+        args.value(&a.T);
+        push_ptr(&mut args, a.bias);
+        push_ptr(&mut args, a.idx);
+        push_ptr(&mut args, a.wts);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueRouteSelectRowsKernel), cfg, &mut args) }
     }
 
     /// `void pglue::router_decode_kernel<1>(__nv_bfloat16 const*, __nv_bfloat16 const*, float const*, float*, int*, int, int*, float*)` in `pack_engine.cubin`.

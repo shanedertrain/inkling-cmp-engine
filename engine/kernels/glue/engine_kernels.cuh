@@ -96,6 +96,24 @@ __global__ void verify_width_kernel(const float* margin, float tau, int n, int* 
   width[q] = lead == 0 ? 1 : lead == 1 ? 2 : lead <= 3 ? 4 : 8;
 }
 
+// Coalesced verify widths + drafter drafts into one contiguous [n + 7*n] int buffer for a single D2H sync.
+// When margin == nullptr, widths are set to 8 (full verify).
+__global__ void verify_width_pack_kernel(const float* margin, const int* drafts, float tau, int n, int* out) {
+  const int tid = threadIdx.x;
+  if (tid < n) {
+    if (margin) {
+      int lead = 0;
+      while (lead < 7 && margin[tid * 7 + lead] >= tau) ++lead;
+      out[tid] = lead == 0 ? 1 : lead == 1 ? 2 : lead <= 3 ? 4 : 8;
+    } else {
+      out[tid] = 8;
+    }
+  }
+  if (drafts) {
+    for (int i = tid; i < n * 7; i += blockDim.x) out[n + i] = drafts[i];
+  }
+}
+
 // vids[q][0..K] = anchor[q], drafts[q][0..K-1] (K drafts per slot; a missing draft < 0 becomes token 0)
 __global__ void verify_ids_kernel(const int* anchor, const int* drafts, int* vids, int n, int K) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;

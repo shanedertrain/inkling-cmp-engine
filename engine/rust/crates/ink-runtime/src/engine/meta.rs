@@ -46,6 +46,8 @@ pub struct Slots {
     pages: Vec<Vec<i32>>,
     /// Free pages; taken from the back (`num_pages - 1` pushed first, so page 0 is taken first).
     free: Vec<i32>,
+    /// Monotonic generation incremented whenever any slot's global page list changes (`reserve`, `reset`, `truncate`).
+    page_gen: u64,
 }
 
 impl Slots {
@@ -55,7 +57,13 @@ impl Slots {
             length: vec![0; max_slots],
             pages: vec![Vec::new(); max_slots],
             free: (0..num_pages as i32).rev().collect(),
+            page_gen: 0,
         }
+    }
+
+    /// Monotonic generation of the global page lists (unchanged while no page is added or removed).
+    pub fn page_gen(&self) -> u64 {
+        self.page_gen
     }
 
     /// Number of slots.
@@ -81,6 +89,9 @@ impl Slots {
     /// Empties `slot`: its pages go back to the free list in their order, length 0.
     pub fn reset(&mut self, slot: usize) {
         let pages = std::mem::take(&mut self.pages[slot]);
+        if !pages.is_empty() {
+            self.page_gen += 1;
+        }
         self.free.extend(pages);
         self.length[slot] = 0;
     }
@@ -91,6 +102,9 @@ impl Slots {
         require(len <= self.length[slot], "truncate past the slot's length")?;
         let keep = len.div_ceil(PAGE).min(self.pages[slot].len());
         let extra = self.pages[slot].split_off(keep);
+        if !extra.is_empty() {
+            self.page_gen += 1;
+        }
         self.free.extend(extra);
         self.length[slot] = len;
         Ok(())
@@ -109,6 +123,7 @@ impl Slots {
                 .pop()
                 .ok_or_else(|| MetaError("KV page pool exhausted".into()))?;
             self.pages[slot].push(p);
+            self.page_gen += 1;
         }
         Ok(())
     }

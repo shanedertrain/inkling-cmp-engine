@@ -295,6 +295,7 @@ pub(crate) struct DraftS<A: Alloc> {
     lev_chunk_cmax: A::Buf<f32>,
     lev_cand_cnt: A::Buf<i32>,
     lev_g_lb: A::Buf<u32>,
+    lev_active_mask: A::Buf<u32>,
     samp_temp: A::Buf<f32>,
     samp_top_p: A::Buf<f32>,
     samp_seed: A::Buf<u64>,
@@ -371,6 +372,7 @@ impl<A: Alloc> DraftS<A> {
             lev_chunk_cmax: ar.take(LEV_NCH * n, "lev_chunk_cmax")?,
             lev_cand_cnt: ar.take(n, "lev_cand_cnt")?,
             lev_g_lb: ar.take(n, "lev_g_lb")?,
+            lev_active_mask: ar.take(1, "lev_active_mask")?,
             samp_temp: ar.take(n, "samp_temp")?,
             samp_top_p: ar.take(n, "samp_top_p")?,
             samp_seed: ar.take(n, "samp_seed")?,
@@ -423,6 +425,15 @@ pub struct RustDrafter {
     draft_top_p: Option<f32>,
     /// Confidence signal mode for sampled sessions (`INK_DRAFT_CONF_MODE`: 0=p_max, 1=p(c*), 2=q(c*)).
     conf_mode: i32,
+    /// Log cumulative confidence threshold for lossless Markov early-exit on steps `0..=3`
+    /// (`INK_DSPARK_EARLY_TAU`, default disabled `-INFINITY` because `CallRows::fill` widening gets free accepted
+    /// tokens from drafts past `verify_tau` at N>=4; set e.g. `INK_DSPARK_EARLY_TAU=0.70` to enable for N=1/ragged).
+    early_tau_ln: f32,
+    /// Cached host copies of `sel`, `samp_temp`, `samp_top_p`, `samp_seed` to skip unchanged H2D uploads.
+    last_sel: Vec<i32>,
+    last_eff_temps: Vec<u32>,
+    last_eff_top_ps: Vec<u32>,
+    last_seeds: Vec<u64>,
     st: Rc<Stream>,
     ctx: Rc<Context>,
     shape: Shape,
@@ -550,6 +561,17 @@ impl RustDrafter {
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|&v| (0..=2).contains(&v))
             .unwrap_or(0);
+        let early_tau_ln = if !shape.conf || lev_full_verify {
+            f32::NEG_INFINITY
+        } else {
+            match std::env::var("INK_DSPARK_EARLY_TAU")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+            {
+                Some(v) if v > 0.0 && v.is_finite() => v.min(1.0).ln(),
+                _ => f32::NEG_INFINITY,
+            }
+        };
         let fast_commit = !std::env::var("INK_DSPARK_FAST_COMMIT").is_ok_and(|v| v == "0");
         let mut selector = rt(LtGemm::new(&st, AlgoPins::new(0)))?;
         let mut pins = AlgoPins::new(ctx.startup().cublaslt_version);
@@ -572,6 +594,11 @@ impl RustDrafter {
             draft_temp_scale,
             draft_top_p,
             conf_mode,
+            early_tau_ln,
+            last_sel: Vec::new(),
+            last_eff_temps: Vec::new(),
+            last_eff_top_ps: Vec::new(),
+            last_seeds: Vec::new(),
             s,
             w,
             k,
@@ -1233,6 +1260,9 @@ impl RustDrafter {
             conf_c: s.conf_c.ptr(),
             full_verify: i32::from(self.lev_full_verify),
             conf_mode: self.conf_mode,
+            active_mask: s.lev_active_mask.ptr(),
+            early_tau_ln: self.early_tau_ln,
+            _pad0: [0; 4],
         };
         for i in 0..DRAFTS {
             dev.markov_recur_proj(&mk, i, &lb)?;
@@ -1550,7 +1580,10 @@ impl Drafter for RustDrafter {
             }
         }
         let list: Vec<i32> = sessions.iter().map(|&r| i32_of(r)).collect();
-        rt(self.st.htod(&rt(self.s.sel.slice(0..k))?, &list))?;
+        if self.last_sel != list {
+            rt(self.st.htod(&rt(self.s.sel.slice(0..k))?, &list))?;
+            self.last_sel = list;
+        }
         let sampled = self.any_sampled && self.proposal.is_some();
         let slot_missing = if sampled {
             self.graphs_sampled[k - 1].is_none()
@@ -1629,9 +1662,22 @@ impl Drafter for RustDrafter {
                 }
             })
             .collect();
-        rt(self.st.htod(&self.s.samp_temp, &eff_temps))?;
-        rt(self.st.htod(&self.s.samp_top_p, &eff_top_ps))?;
-        rt(self.st.htod(&self.s.samp_seed, seeds))
+        let temp_bits: Vec<u32> = eff_temps.iter().map(|&x| x.to_bits()).collect();
+        if self.last_eff_temps != temp_bits {
+            rt(self.st.htod(&self.s.samp_temp, &eff_temps))?;
+            self.last_eff_temps = temp_bits;
+        }
+        let topp_bits: Vec<u32> = eff_top_ps.iter().map(|&x| x.to_bits()).collect();
+        if self.last_eff_top_ps != topp_bits {
+            rt(self.st.htod(&self.s.samp_top_p, &eff_top_ps))?;
+            self.last_eff_top_ps = topp_bits;
+        }
+        if self.last_seeds != seeds {
+            rt(self.st.htod(&self.s.samp_seed, seeds))?;
+            self.last_seeds.clear();
+            self.last_seeds.extend_from_slice(seeds);
+        }
+        Ok(())
     }
 
     fn proposal(&self) -> Option<ProposalBufs> {

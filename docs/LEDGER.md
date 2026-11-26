@@ -518,9 +518,27 @@ Rust prefill is 0.5-0.9 % slower than C++ at cold 32K (master's Rust already +0.
 
 1. **Remaining ~3–6% to hard lossless 140 W ceiling:** `moe_gemm_dec` (`19.2 ms` of `40.1 ms` `4×8`), global `decode_attn` (`6.7 ms`), and dense `proj + wo` (`4.8 ms`) are already at `~91–97%` of the practical lossless `sm_80` ceiling at `N=4`. Further leaps require lossy weight/activation compression or stronger drafters.
 
-## 2026-11-25 — Stock 250 W Profile (`6D` & `67` vBIOS Cards, `[M]`)
+## 2026-11-25 — Stock 250 W Profile (`6D` GPU 5 & `67` GPU 7, `[M]`)
 
-- **Setup:** Stock 250 W power limit on one `6D` card (1,728 MHz HBM) and one `67` card (1,458 MHz HBM), running `v1.0.0` (lossless BF16 KV + DSpark `top_p=0.90` + `--lookup 8 --lookup-min 8`).
+- **Setup:** Temporary runtime `-pl 250` on GPU 5 (`6D`, 1,728 MHz HBM) and GPU 7 (`67`, 1,458 MHz HBM) under `default` BMC fans (`0` thermal-guard trips; peak core `71 °C`, HBM `73 °C`), running `master @ eaa20598` (`v1.0.0`, lossless BF16 KV + DSpark `top_p=0.90` + `--lookup 8 --lookup-min 8`). Restored to `140 W` + `cmp-quiet3` immediately after.
 - **MiaAI-Lab Decode (`T=0`, 400-tok cap, `6D` / `67`):** 1u `435.1 / 393.4` (structured), `272.2 / 247.3` (code), `170.1 / 154.6` (prose); 4u total `921.8 / 869.6`, `560.7 / 523.4`, `427.2 / 401.8`; 8u total **`1,323.2 / 1,276.1`**, `779.9 / 746.5`, `650.5 / 620.9` (`+32–34%` over 140 W on `6D`, `~10.4K tok/s` across 8 cards).
 - **Cold Prefill (`4K–120K`, `6D` / `67`):** `9,455 / 9,308` at 4K (`0.43 s`), `8,360 / 8,304` at 32K (`3.92 s`), `7,512 / 7,468` at 64K (`8.72 s`), **`6,378 / 6,336 tok/s`** at 120K (`19.27 s`, `+26.2%` over 140 W).
 - **M1 Multi-Turn Agent Replay (`343` reqs, `0` err):** `6D` `self-t1-n4` **`440.2 tok/s`** (`+35.9%` vs 140 W, p99 `2.32 s`, `0.563 J/t`), `self-t0-n4` **`493.0 tok/s`** (`+36.7%`), `self-t1-n8` **`483.7 tok/s`** (`+34.8%`); `67` `rec-t1-n4` **`413.7 tok/s`** (`+24.0%`), `rec-t0-n4` **`435.8 tok/s`** (`+25.4%`), `rec-t1-n8` **`444.4 tok/s`** (`+22.7%`).
+
+## 2026-11-26 — 4-Track Lossless 140 W Push & Stacked Tracks 3 + 4 (`f6164f51`, `kpack 9af3241f6232`, `[M]`)
+
+Full record: `bench/raw/2026-11-26-stacked-t34/README.md` (with per-track records in `2026-11-26-{tree-spec,prefill-opt,drafter-async}/`).
+
+- **Rejected / Killed (do not rerun without a new drafter):**
+  - **R13 — Dynamic Speculative Tree Verification (`2026-11-26-tree-spec`):** Exact closed-loop GPU sim (`>150k` live draws, `0` zero-prob) proved trees lose `−0.15%` to `−13.1%` vs `L7-full+lkp8` (`~−2.3%` vs `Ptok3 m6`) due to the `R=8 → 9+` attention cliff (`+4.45 ms`) and single-child `top_p=0.90` Leviathan already capturing ~90% of DSpark's `T=1.0` acceptance.
+  - **R14 — Anchor-Triggered Global Lookup Override on DSpark (`feat/wt-hybrid-lookup @ bd8c12c0`):** Same-card `B1/N/B2` on GPU 2 (`6D`): DSpark `+0.37%` (`t0-n4`), `−0.37%` (`t1-n4`), `−2.6%` (`t1-n8`). Helped DFlash2 (`+2.2–2.3%`), but DFlash2 still trails DSpark by `−4–5.5%` on 45K M1.
+  - **R15 — Cross-Session Prefix Sharing on M1 (`2026-11-26-prefill-opt` 3B):** Only `16,384` reusable tokens after `1,024`-token SWA recompute (`~1.0%` M1, below threshold).
+- **Merged & Verified (`f6164f51`, `dirty=0`, `kpack 9af3241f6232`, `386` launchers, `0` new spills):**
+  - **Track 3 (Prefill):** Virtual messages (`vmsg_weights_kernel`, `msgs 7.50×`, eliminates ~87 GB HBM traffic/32K), fused multi-query AttnRes (`−25.2%`), fast `__match_any_sync` prefill `moe_build`, fixed silent `--prefill-chunk` clamping + default `chunk=3072` (recalibrated prefill cost model).
+  - **Track 4 (Decode/Runtime):** Single-pass `__match_any_sync` decode `moe_build` (`−41.9%` `4×8`, `−50.1%` `4×16`), cached `CUgraphExec` retargeting (`verify_us >= 200 µs`: `36.0% → 3.5%`, p90 `−70%`), coalesced 1-sync `verify_widths_and_drafts` + lazy lookup H2D + vectorized `softcap` (early-exit Markov loop opt-in via `INK_DSPARK_EARLY_TAU=0.70`).
+- **Unified Lossless Gates (`GPU 1 6D`, 140 W):** `ink-inv` BF16 & `--kv-fp8` **`0` diff bits** (`0` fallbacks, `0` reply-reuse fails); `ink-spec` greedy `--lookup 8` **`0/8,000`** (`3.137 tok/rd`); sampled `--lookup 8` **`20/20`** (`8,000/8,000`, `3.003 tok/rd`); `sdist` **`4/4` PASS (`65,536` draws, `0` zero-prob)**.
+- **Stacked Microbenchmarks (`GPU 1 6D`, `B1/B2 @ eaa20598 → N @ f6164f51`, 140 W):** Cold 32K `6,447 → 6,965 tok/s` (**`7,008.6 tok/s`** rep 0, **`+8.0%`**); Warm +6000 `5,665 → 6,075` (**`+7.2%`**); Warm +1600 `5,508 → 5,674` (**`+3.0%`**); Cold 120K **`5,248.3 tok/s`** (`23.41 s`); Decode `1×8` `18.73 → 18.56 ms`, `4×16` `52.46 → 52.15 ms`, `4×8` `39.01 → 38.99 ms`.
+- **Canonical Same-Card `B1 → N → B2` M1 Replay (`140 W`, `343` reqs, `0` err):**
+  - **GPU 5 (`6D`, self-fed):** `self-t0-n4` `366.6 → 373.3 tok/s` (**`+1.83%`**, **`+23.2%`** vs Config B, p99 `2.64 s`, `0.374 J/t`); `self-t1-n4` `321.8 → 328.0` (**`+1.94%`**, **`+27.2%`** vs Config B, p99 `3.95 → 3.34 s` `−15.3%`, `0.426 J/t`); `self-t1-n8` `360.9` (p99 `7.22 → 5.51 s` **`−23.7%`**, **`+25.4%`** vs Config B).
+  - **GPU 7 (`67`, recorded):** `rec-t0-n4` `348.1 → 355.4 tok/s` (**`+2.11%`**, **`+21.0%`** vs Config B, p99 `3.15 → 2.50 s` `−20.5%`, `0.393 J/t`); `rec-t1-n4` `325.4 → 338.1` (**`+3.90%`**, **`+26.8%`** vs Config B, p99 `3.89 → 2.91 s` `−25.1%`, `0.413 J/t`); `rec-t1-n8` `352.5 → 366.9` (**`+4.10%`**, **`+21.8%`** vs Config B, p99 `7.98 → 5.84 s` **`−26.8%`**, `0.378 J/t`).
+- **Conclusion:** Stock-weights lossless 140 W engine is now empirically at the practical ceiling (~96–98%). Next >10% lossless 140 W leap requires Track 5 (custom distilled/trained lossless drafter, e.g., `DFlash2-Global`).

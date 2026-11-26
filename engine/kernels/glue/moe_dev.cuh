@@ -142,70 +142,106 @@ __global__ void __launch_bounds__(256) moe_build_kernel(const int* __restrict__ 
   }
 }
 
-// Decode routing build (R <= 512, i.e., T <= 64): 512 threads (16 warps), parallel 4-thread-per-expert rank sort,
-// caches idx/wts in shared memory, loops only over active experts in descending count order, and emits FT_DEC=18
-// feature tiles x BN_DEC=16 row tiles.
-__global__ void __launch_bounds__(512) moe_build_dec_kernel(const int* idx, const float* wts, int R, int* a13, int* a2,
-                                                            int* orow, float* gamma, pmoe::Item* items, int* n_items) {
-  __shared__ int s_idx[512];
-  __shared__ float s_wts[512];
+// Decode routing build (R <= 512, i.e., T <= 64): 512 threads (16 warps), single-pass __match_any_sync
+// per 32-row chunk (zero atomicAdd, zero shared idx/wts buffer), overlapped scan128 + 2-thread-per-expert
+// rank sort, parallel scatter, and 4-thread-per-expert FT_DEC=18 x BN_DEC=16 item emission.
+// Bit-identical outputs to the previous moe_build_dec_kernel.
+__global__ void __launch_bounds__(512) moe_build_dec_kernel(const int* __restrict__ idx, const float* __restrict__ wts,
+                                                            int R, int* __restrict__ a13, int* __restrict__ a2,
+                                                            int* __restrict__ orow, float* __restrict__ gamma,
+                                                            pmoe::Item* __restrict__ items, int* __restrict__ n_items) {
+  static_assert(pmoe::E == 128 && pmoe::TOPK == 8 && pmoe::BN_DEC == 16, "moe_build_dec assumptions");
+  __shared__ uint16_t wcnt[16][pmoe::E];
   __shared__ int cnt[pmoe::E], eoff[pmoe::E + 1], order[pmoe::E], ioff[pmoe::E + 1], tiles[pmoe::E];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   if (R > 512) __trap();
-  if (tid < pmoe::E) cnt[tid] = 0;
-  if (tid < R) {
-    s_idx[tid] = idx[tid];
-    s_wts[tid] = wts[tid];
+  const int nw = (R + 31) >> 5;  // 0..16
+
+  uint32_t* wcnt32 = reinterpret_cast<uint32_t*>(wcnt);
+  for (int i = tid; i < nw * (pmoe::E / 2); i += 512) wcnt32[i] = 0u;
+  __syncthreads();
+
+  int e_reg = -1;
+  float w_reg = 0.f;
+  int rnk_reg = 0;
+  if (warp < nw) {
+    const bool ok = tid < R;
+    const int e = ok ? idx[tid] : -1;
+    if (ok) {
+      e_reg = e;
+      w_reg = wts[tid];
+    }
+    const unsigned active = __ballot_sync(0xffffffffu, ok);
+    if (ok) {
+      const unsigned m = __match_any_sync(active, e);
+      const unsigned lower = m & ((1u << lane) - 1u);
+      rnk_reg = __popc(lower);
+      if (lower == 0u) wcnt[warp][e] = static_cast<uint16_t>(__popc(m));
+    }
   }
   __syncthreads();
-  if (tid < R) atomicAdd(&cnt[s_idx[tid]], 1);
+
+  if (tid < pmoe::E) {
+    int s = 0;
+    for (int w = 0; w < nw; ++w) {
+      const int c = wcnt[w][tid];
+      wcnt[w][tid] = static_cast<uint16_t>(s);
+      s += c;
+    }
+    cnt[tid] = s;
+  }
   __syncthreads();
-  scan128(cnt, eoff);
-  // Parallel rank sort: 4 threads per expert (tid = 4*e + q) -> 32 iterations each instead of 128!
-  {
-    const int e = tid >> 2, q = tid & 3;
+
+  // Overlap eoff prefix sum (warp 0) with 2-thread-per-expert stable descending rank sort (warps 8..15)
+  if (tid < 32) {
+    scan128(cnt, eoff);
+  } else if (tid >= 256) {
+    const int e = (tid - 256) >> 1;
+    const int half = tid & 1;
     const int ce = cnt[e];
     int rk = 0;
-    const int f0 = q * 32;
-#pragma unroll
-    for (int j = 0; j < 32; ++j) {
+    const int f0 = half * 64;
+#pragma unroll 8
+    for (int j = 0; j < 64; ++j) {
       const int f = f0 + j;
-      rk += cnt[f] > ce || (cnt[f] == ce && f < e);
+      const int cf = cnt[f];
+      rk += (cf > ce) || (cf == ce && f < e);
     }
     rk += __shfl_xor_sync(0xffffffffu, rk, 1);
-    rk += __shfl_xor_sync(0xffffffffu, rk, 2);
-    if (q == 0) order[rk] = e;
+    if (half == 0) order[rk] = e;
   }
   __syncthreads();
-  // Active experts only: order[] is sorted descending by count, so stop as soon as cnt == 0!
-  for (int idx_o = warp; idx_o < pmoe::E; idx_o += 16) {
-    const int e = order[idx_o];
-    if (cnt[e] == 0) break;
-    int base = eoff[e];
-    for (int r0 = 0; r0 < R; r0 += 32) {
-      const int r = r0 + lane;
-      const bool hit = r < R && s_idx[r] == e;
-      const unsigned m = __ballot_sync(0xffffffffu, hit);
-      if (hit) {
-        const int p = base + __popc(m & ((1u << lane) - 1u));
-        a13[p] = r / pmoe::TOPK;
-        a2[p] = p;
-        orow[p] = r;
-        gamma[p] = s_wts[r];
-      }
-      base += __popc(m);
-    }
+
+  // Parallel scatter of all R rows in exact ascending order per expert
+  if (e_reg >= 0) {
+    const int p = eoff[e_reg] + static_cast<int>(wcnt[warp][e_reg]) + rnk_reg;
+    a13[p] = tid >> 3;
+    a2[p] = p;
+    orow[p] = tid;
+    gamma[p] = w_reg;
   }
-  if (tid < pmoe::E) tiles[tid] = FT_DEC * ((cnt[order[tid]] + pmoe::BN_DEC - 1) / pmoe::BN_DEC);
+  if (tid < pmoe::E) tiles[tid] = FT_DEC * ((cnt[order[tid]] + pmoe::BN_DEC - 1) >> 4);
   __syncthreads();
+
   scan128(tiles, ioff);
   __syncthreads();
+
   if (tid == 0) *n_items = ioff[pmoe::E];
-  if (tid < pmoe::E) {
-    const int e = order[tid], c = cnt[e], nt = (c + pmoe::BN_DEC - 1) / pmoe::BN_DEC;
-    int o = ioff[tid];
-    for (int ft = 0; ft < FT_DEC; ++ft)
-      for (int t = 0; t < nt; ++t) items[o++] = {e, ft, eoff[e] + t * pmoe::BN_DEC, min(pmoe::BN_DEC, c - t * pmoe::BN_DEC)};
+  // 4 threads per expert emit FT_DEC = 18 feature tiles x nt row tiles in exact order
+  {
+    const int e_idx = tid >> 2, q = tid & 3;
+    const int e = order[e_idx], c = cnt[e];
+    if (c > 0) {
+      const int nt = (c + pmoe::BN_DEC - 1) >> 4;
+      const int base_o = ioff[e_idx];
+      const int base_p = eoff[e];
+      for (int ft = q; ft < FT_DEC; ft += 4) {
+        int o = base_o + ft * nt;
+        for (int t = 0; t < nt; ++t) {
+          items[o++] = {e, ft, base_p + (t << 4), min(pmoe::BN_DEC, c - (t << 4))};
+        }
+      }
+    }
   }
 }
 

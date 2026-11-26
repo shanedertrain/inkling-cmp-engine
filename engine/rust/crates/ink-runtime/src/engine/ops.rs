@@ -45,8 +45,10 @@ pub const MOE_DEC_SMEM_N1S1: u32 = 5 * (2048 + 4096 + 512) + 128;
 pub const MOE_DEC_SMEM_MXFP8: u32 = 5 * (2048 + 8192 + 256) + 128;
 /// moe_gemm_dec threads (4 warps).
 const MOE_DEC_THREADS: u32 = 128;
-/// `pglue::kBuildRows`, `kMgRows`, `kRelRows`.
+/// `pglue::kBuildRows`, `kBuildRowsFast`, `kMgRows`, `kRelRows`.
+#[allow(dead_code)]
 pub const BUILD_ROWS: usize = 128;
+const BUILD_ROWS_FAST: usize = 512;
 const MG_ROWS: usize = 32;
 /// Rank of a message gate's down projection (`[T][64]`).
 const MG_RANK: usize = ink_model::dims::GATE_RANK;
@@ -56,6 +58,8 @@ const WARP_ROWS: usize = 4;
 const CONV_ROWS: usize = 8;
 const CONV_THREADS: usize = 96;
 const TC_ROWS: usize = 32;
+const CONV_AR_ROWS: usize = 4;
+const COMBINE_CONV_ROWS: usize = 32;
 /// decode_attn: `kG` query heads per KV head, `kD`.
 pub(super) const DA_G: usize = 3;
 
@@ -502,6 +506,8 @@ impl Dev<'_> {
     }
 
     /// `pglue::ar288_kernel<0 | 1><<<(T, Q or NG), 288>>>`: 288-thread (9 warps x 8 elems) vectorized AttnRes.
+    /// For prefill row counts (`t > 64`), launches single-CTA multi-query/multi-gate row-coarsened variants so sources
+    /// are read ONCE instead of Q/G times (100% bit-identical).
     #[expect(clippy::too_many_arguments, reason = "the kernel's parameters")]
     pub fn ar288(
         &self,
@@ -513,11 +519,51 @@ impl Dev<'_> {
         out: &DevBuf<f32>,
         gates: Option<GateInputs<'_>>,
     ) -> Result<()> {
+        let qsel = gates.as_ref().is_some_and(|x| x.qsel);
         let gi = gate_in(q, g, t, queries, out, gates)?;
         let (s, queries, out) = (*s, b(queries), b(out));
-        // SAFETY: block (t, y) runs 288 threads (8 consecutive elems/thread) over row t with 16-byte ld8/st8; extents checked by gate_in.
+        // SAFETY: block (t, y) runs 288 threads (8 consecutive elems/thread) over row(s) with 16-byte ld8/st8; extents checked by gate_in.
         unsafe {
-            if g == 0 {
+            let has_last16 = bytemuck::bytes_of(&s.last16).iter().any(|&x| x != 0);
+            if t > 64 && q == 4 && g == 0 && s.nb == 1 && has_last16 {
+                self.k.pglue_ar288_msgs_rows_kernel(
+                    self.st,
+                    cfg([t, 1, 1], 288, 0),
+                    PglueAr288MsgsRowsKernelArgs {
+                        s,
+                        queries,
+                        out,
+                        eps: EPS,
+                        T: i(t),
+                    },
+                )
+            } else if t > 64 && q == 1 && g == 3 && !qsel {
+                self.k.pglue_ar288_g3_shared_rows_kernel(
+                    self.st,
+                    cfg([t, 1, 1], 288, 0),
+                    PglueAr288G3SharedRowsKernelArgs {
+                        s,
+                        queries,
+                        out,
+                        eps: EPS,
+                        gi,
+                        T: i(t),
+                    },
+                )
+            } else if t > 64 && q == 3 && g == 3 && qsel {
+                self.k.pglue_ar288_q3g3_rows_kernel(
+                    self.st,
+                    cfg([t, 1, 1], 288, 0),
+                    PglueAr288Q3g3RowsKernelArgs {
+                        s,
+                        queries,
+                        out,
+                        eps: EPS,
+                        gi,
+                        T: i(t),
+                    },
+                )
+            } else if g == 0 {
                 self.k.pglue_ar288_kernel_0(
                     self.st,
                     cfg([t, q, 1], 288, 0),
@@ -545,7 +591,101 @@ impl Dev<'_> {
         }
     }
 
-    /// `pglue::ar_norm288_kernel<<<(T, Q), 288>>>`: 288-thread vectorized AttnRes + RMSNorm.
+    /// Track 3A-7: compute virtual-message weights `[12][T][4]` `float4(p0, p1, inv, 0)` ONCE per pass into `mw`
+    /// (`a.msgs`), replacing 12 materializing `msgs` launches (~75.5 MB/visit HBM traffic -> 1.6 MB/pass).
+    pub fn vmsg_weights(
+        &self,
+        t: usize,
+        msrc0: &DevBuf<Bf16>,
+        msrc1: &DevBuf<Bf16>,
+        msg_queries: &DevBuf<f32>,
+        mw: &DevBuf<f32>,
+    ) -> Result<()> {
+        need(msrc0, t * H, "vmsg msrc0")?;
+        need(msrc1, t * H, "vmsg msrc1")?;
+        need(msg_queries, 12 * 4 * H, "vmsg msg_queries")?;
+        need(mw, 12 * t * 16, "vmsg mw")?;
+        // SAFETY: block (t0/16, i) reads msrc0/1[t0..t0+16], msg_queries[i*4..], writes float4 weights into mw (all checked).
+        unsafe {
+            self.k.pglue_vmsg_weights_kernel(
+                self.st,
+                cfg([t.div_ceil(16), 12, 1], 288, 0),
+                PglueVmsgWeightsKernelArgs {
+                    msrc0: b(msrc0),
+                    msrc1: b(msrc1),
+                    msg_queries: b(msg_queries),
+                    mw: b(mw),
+                    eps: EPS,
+                    T: i(t),
+                },
+            )
+        }
+    }
+
+    /// Track 3A-7: `ar288_g3_vmsg_kernel` (`q == 1`, local) or `ar288_q3g3_vmsg_kernel` (`q == 3`, global) reading
+    /// L2-hot bf16 `msrc0/1` + `mw` instead of fp32 `a.msgs` (100% bit-identical).
+    #[expect(clippy::too_many_arguments, reason = "the kernel's parameters")]
+    pub fn ar288_vmsg(
+        &self,
+        q: usize,
+        t: usize,
+        s: &glue::ResSrc,
+        queries: &DevBuf<f32>,
+        out: &DevBuf<f32>,
+        msrc0: &DevBuf<Bf16>,
+        msrc1: &DevBuf<Bf16>,
+        mw: &DevBuf<f32>,
+        gin: &DevBuf<Bf16>,
+    ) -> Result<()> {
+        need(queries, q * H, "ar288_vmsg queries")?;
+        need(out, t * q * H, "ar288_vmsg out")?;
+        need(msrc0, t * H, "ar288_vmsg msrc0")?;
+        need(msrc1, t * H, "ar288_vmsg msrc1")?;
+        need(mw, t * 16, "ar288_vmsg mw")?;
+        need(gin, 3 * t * 2 * H, "ar288_vmsg gin")?;
+        let gs = (t * 2 * H) as i64;
+        // SAFETY: block t < T reads s, queries, msrc0/1[t], mw[t*16..], writes out and 3 gates of gin (all checked).
+        unsafe {
+            if q == 1 {
+                self.k.pglue_ar288_g3_vmsg_kernel(
+                    self.st,
+                    cfg([t, 1, 1], 288, 0),
+                    PglueAr288G3VmsgKernelArgs {
+                        s: *s,
+                        queries: b(queries),
+                        out: b(out),
+                        eps: EPS,
+                        msrc0: b(msrc0),
+                        msrc1: b(msrc1),
+                        mw: b(mw),
+                        gin: b(gin),
+                        gs,
+                        T: i(t),
+                    },
+                )
+            } else {
+                self.k.pglue_ar288_q3g3_vmsg_kernel(
+                    self.st,
+                    cfg([t, 1, 1], 288, 0),
+                    PglueAr288Q3g3VmsgKernelArgs {
+                        s: *s,
+                        queries: b(queries),
+                        out: b(out),
+                        eps: EPS,
+                        msrc0: b(msrc0),
+                        msrc1: b(msrc1),
+                        mw: b(mw),
+                        gin: b(gin),
+                        gs,
+                        T: i(t),
+                    },
+                )
+            }
+        }
+    }
+
+    /// `pglue::ar_norm288_kernel<<<(T, Q), 288>>>`: 288-thread vectorized AttnRes + RMSNorm (for `t > 64`, single-CTA
+    /// multi-query row-coarsened `ar_norm288_rows_kernel<Q>`, 100% bit-identical).
     pub fn ar_norm288(
         &self,
         q: usize,
@@ -566,27 +706,47 @@ impl Dev<'_> {
             need(wk, H, "norm w")?;
             need(ok, t * H, "norm out")?;
         }
-        // SAFETY: block (t, q0) runs 288 threads over row t, writes RMSNorm output o[q0][t] (all extents checked).
+        // SAFETY: block runs 288 threads over row(s), writes RMSNorm output o[q][t] (all extents checked).
         unsafe {
-            self.k.pglue_ar_norm288_kernel(
-                self.st,
-                cfg([t, q, 1], 288, 0),
-                PglueArNorm288KernelArgs {
-                    s: *s,
-                    queries: b(queries),
-                    w0: opt(w[0]),
-                    w1: opt(w[1]),
-                    w2: opt(w[2]),
-                    o0: opt(o[0]),
-                    o1: opt(o[1]),
-                    o2: opt(o[2]),
-                    eps: EPS,
-                },
-            )
+            if t > 64 && q == 3 {
+                self.k.pglue_ar_norm288_rows_kernel_3(
+                    self.st,
+                    cfg([t, 1, 1], 288, 0),
+                    PglueArNorm288RowsKernel3Args {
+                        s: *s,
+                        queries: b(queries),
+                        w0: opt(w[0]),
+                        w1: opt(w[1]),
+                        w2: opt(w[2]),
+                        o0: opt(o[0]),
+                        o1: opt(o[1]),
+                        o2: opt(o[2]),
+                        eps: EPS,
+                        T: i(t),
+                    },
+                )
+            } else {
+                self.k.pglue_ar_norm288_kernel(
+                    self.st,
+                    cfg([t, q, 1], 288, 0),
+                    PglueArNorm288KernelArgs {
+                        s: *s,
+                        queries: b(queries),
+                        w0: opt(w[0]),
+                        w1: opt(w[1]),
+                        w2: opt(w[2]),
+                        o0: opt(o[0]),
+                        o1: opt(o[1]),
+                        o2: opt(o[2]),
+                        eps: EPS,
+                    },
+                )
+            }
         }
     }
 
-    /// `pglue::conv_ar_norm288_kernel<<<T, 288>>>`: fused conv_partial + ar_mlp + mlp_norm (plain visits).
+    /// `pglue::conv_ar_norm288_kernel<<<T, 288>>>` (or row-coarsened `conv_ar_norm288_rows_kernel` for `t > 64`):
+    /// fused conv_partial + ar_mlp + mlp_norm (plain visits).
     #[expect(clippy::too_many_arguments, reason = "the kernel's parameters")]
     pub fn conv_ar_norm288(
         &self,
@@ -613,33 +773,58 @@ impl Dev<'_> {
         if let Some(bk) = blk_out {
             need(bk, t * H, "conv_ar blk_out")?;
         }
-        // SAFETY: block t runs 288 threads (8 channels/thread), computes conv(ax) + partial (+ blk_out if bstart),
+        // SAFETY: block runs 288 threads (8 channels/thread), computes conv(ax) + partial (+ blk_out if bstart),
         // runs AttnRes over s.blk[0..nb_prev] + hin(if bstart) + partial, and writes RMSNorm to xm_out[t] (all checked).
         unsafe {
-            self.k.pglue_conv_ar_norm288_kernel(
-                self.st,
-                cfg([t, 1, 1], 288, 0),
-                PglueConvArNorm288KernelArgs {
-                    ax: b(ax),
-                    cw: b(cw),
-                    state: b(state),
-                    st_slot_stride: (NVISITS * 3 * SLD) as i64,
-                    R: r,
-                    hin: b(hin),
-                    block_start: i32::from(blk_out.is_some()),
-                    blk_out: opt(blk_out),
-                    partial32: b(partial),
-                    s: *s,
-                    query: b(query),
-                    norm_w: b(norm_w),
-                    xm_out: b(xm_out),
-                    eps: EPS,
-                },
-            )
+            if t > 64 {
+                self.k.pglue_conv_ar_norm288_rows_kernel(
+                    self.st,
+                    cfg([t.div_ceil(CONV_AR_ROWS), 1, 1], 288, 0),
+                    PglueConvArNorm288RowsKernelArgs {
+                        ax: b(ax),
+                        cw: b(cw),
+                        state: b(state),
+                        st_slot_stride: (NVISITS * 3 * SLD) as i64,
+                        R: r,
+                        hin: b(hin),
+                        block_start: i32::from(blk_out.is_some()),
+                        blk_out: opt(blk_out),
+                        partial32: b(partial),
+                        s: *s,
+                        query: b(query),
+                        norm_w: b(norm_w),
+                        xm_out: b(xm_out),
+                        eps: EPS,
+                        T: i(t),
+                    },
+                )
+            } else {
+                self.k.pglue_conv_ar_norm288_kernel(
+                    self.st,
+                    cfg([t, 1, 1], 288, 0),
+                    PglueConvArNorm288KernelArgs {
+                        ax: b(ax),
+                        cw: b(cw),
+                        state: b(state),
+                        st_slot_stride: (NVISITS * 3 * SLD) as i64,
+                        R: r,
+                        hin: b(hin),
+                        block_start: i32::from(blk_out.is_some()),
+                        blk_out: opt(blk_out),
+                        partial32: b(partial),
+                        s: *s,
+                        query: b(query),
+                        norm_w: b(norm_w),
+                        xm_out: b(xm_out),
+                        eps: EPS,
+                    },
+                )
+            }
         }
     }
 
-    /// `pglue::conv_ar_gate288_kernel<<<T, 288>>>`: fused conv_partial + ar_mlp_m + mg_in (loop-message visits).
+    /// `pglue::conv_ar_gate288_kernel<<<T, 288>>>` (or row-coarsened `conv_ar_gate288_rows_kernel` for `t > 64`):
+    /// fused conv_partial + ar_mlp_m + mg_in (loop-message visits).
     #[expect(clippy::too_many_arguments, reason = "the kernel's parameters")]
     pub fn conv_ar_gate288(
         &self,
@@ -664,12 +849,94 @@ impl Dev<'_> {
             need(bk, t * H, "conv_ar_gate blk_out")?;
         }
         let gi = gate_in(1, 1, t, query, ar_out, Some(gates))?;
-        // SAFETY: block t runs 288 threads, writes partial (+ blk_out if bstart), ar_out[t], and gate 0's gin[t] (all checked).
+        // SAFETY: block runs 288 threads, writes partial (+ blk_out if bstart), ar_out[t], and gate 0's gin[t] (all checked).
         unsafe {
-            self.k.pglue_conv_ar_gate288_kernel(
+            if t > 64 {
+                self.k.pglue_conv_ar_gate288_rows_kernel(
+                    self.st,
+                    cfg([t.div_ceil(CONV_AR_ROWS), 1, 1], 288, 0),
+                    PglueConvArGate288RowsKernelArgs {
+                        ax: b(ax),
+                        cw: b(cw),
+                        state: b(state),
+                        st_slot_stride: (NVISITS * 3 * SLD) as i64,
+                        R: r,
+                        hin: b(hin),
+                        block_start: i32::from(blk_out.is_some()),
+                        blk_out: opt(blk_out),
+                        partial32: b(partial),
+                        s: *s,
+                        query: b(query),
+                        ar_out: b(ar_out),
+                        eps: EPS,
+                        gi,
+                        T: i(t),
+                    },
+                )
+            } else {
+                self.k.pglue_conv_ar_gate288_kernel(
+                    self.st,
+                    cfg([t, 1, 1], 288, 0),
+                    PglueConvArGate288KernelArgs {
+                        ax: b(ax),
+                        cw: b(cw),
+                        state: b(state),
+                        st_slot_stride: (NVISITS * 3 * SLD) as i64,
+                        R: r,
+                        hin: b(hin),
+                        block_start: i32::from(blk_out.is_some()),
+                        blk_out: opt(blk_out),
+                        partial32: b(partial),
+                        s: *s,
+                        query: b(query),
+                        ar_out: b(ar_out),
+                        eps: EPS,
+                        gi,
+                    },
+                )
+            }
+        }
+    }
+
+    /// Track 3A-7: `conv_ar_gate288_vmsg_kernel` (reconstructs exact `msgs[3]` from L2-hot `msrc0/1` + `mw`).
+    #[expect(clippy::too_many_arguments, reason = "the kernel's parameters")]
+    pub fn conv_ar_gate288_vmsg(
+        &self,
+        t: usize,
+        ax: &DevBuf<Bf16>,
+        cw: &DevBuf<f32>,
+        state: &DevBuf<Bf16>,
+        r: glue::Rows,
+        hin: &DevBuf<Bf16>,
+        blk_out: Option<&DevBuf<Bf16>>,
+        partial: &DevBuf<f32>,
+        s: &glue::ResSrc,
+        query: &DevBuf<f32>,
+        ar_out: &DevBuf<f32>,
+        msrc0: &DevBuf<Bf16>,
+        msrc1: &DevBuf<Bf16>,
+        mw: &DevBuf<f32>,
+        gin: &DevBuf<Bf16>,
+    ) -> Result<()> {
+        need(ax, t * H, "conv_ar_gate_vmsg ax")?;
+        need(cw, H * 4, "conv_ar_gate_vmsg cw")?;
+        need(hin, t * H, "conv_ar_gate_vmsg hin")?;
+        need(partial, t * H, "conv_ar_gate_vmsg partial")?;
+        need(query, H, "conv_ar_gate_vmsg query")?;
+        need(ar_out, t * H, "conv_ar_gate_vmsg ar_out")?;
+        need(msrc0, t * H, "conv_ar_gate_vmsg msrc0")?;
+        need(msrc1, t * H, "conv_ar_gate_vmsg msrc1")?;
+        need(mw, t * 16, "conv_ar_gate_vmsg mw")?;
+        need(gin, t * 2 * H, "conv_ar_gate_vmsg gin")?;
+        if let Some(bk) = blk_out {
+            need(bk, t * H, "conv_ar_gate_vmsg blk_out")?;
+        }
+        // SAFETY: block runs 288 threads x 4 rows, writes partial (+ blk_out if bstart), ar_out, and gin (all checked).
+        unsafe {
+            self.k.pglue_conv_ar_gate288_vmsg_kernel(
                 self.st,
-                cfg([t, 1, 1], 288, 0),
-                PglueConvArGate288KernelArgs {
+                cfg([t.div_ceil(CONV_AR_ROWS), 1, 1], 288, 0),
+                PglueConvArGate288VmsgKernelArgs {
                     ax: b(ax),
                     cw: b(cw),
                     state: b(state),
@@ -683,7 +950,11 @@ impl Dev<'_> {
                     query: b(query),
                     ar_out: b(ar_out),
                     eps: EPS,
-                    gi,
+                    msrc0: b(msrc0),
+                    msrc1: b(msrc1),
+                    mw: b(mw),
+                    gin: b(gin),
+                    T: i(t),
                 },
             )
         }
@@ -736,14 +1007,14 @@ impl Dev<'_> {
         }
     }
 
-    /// `glue::softcap_kernel<<<grid1(nlog V), 256>>>(logits, nlog, VOCAB_PAD, VOCAB)`.
+    /// `glue::softcap_kernel<<<(ceil(V / 1024), nlog), 256>>>(logits, nlog, VOCAB_PAD, VOCAB)`.
     pub fn softcap(&self, nlog: usize, lg: &DevBuf<f32>) -> Result<()> {
         need(lg, nlog * VOCAB_PAD, "logits")?;
-        // SAFETY: grid-stride over nlog x VOCAB valid entries of rows with stride VOCAB_PAD (checked).
+        // SAFETY: 2D grid (float4 blocks along vocab, rows along y) over nlog x VOCAB valid entries (checked).
         unsafe {
             self.k.glue_softcap_kernel(
                 self.st,
-                cfg([grid1(nlog * VOCAB), 1, 1], 256, 0),
+                cfg([VOCAB.div_ceil(4 * 256), nlog, 1], 256, 0),
                 GlueSoftcapKernelArgs {
                     lg: b(lg),
                     rows: i(nlog),
@@ -1044,8 +1315,7 @@ impl Dev<'_> {
             a.out[y] = out[y].ptr();
         }
         // SAFETY: warp (t, y), t < T, reads H values at in[y] + t ldi and w[y], writes row t of out[y] (stride H): all
-        // checked above; entries at y >= gridDim.y = G are unused. The DevPtrs name engine buffers that outlive the
-        // launch.
+        // checked above; entries at y >= gridDim.y = G are unused.
         unsafe {
             self.k.pglue_norm_rows_kernel(
                 self.st,
@@ -1241,7 +1511,7 @@ impl Dev<'_> {
     /// [`Dev::mg_tail`], accepted by the head; decode row groups stay on `mg_tail`).
     pub fn mg_tail_tc(&self, n: usize, gates: &[MgTcGate<'_>], ldh: usize, ldm: usize, ldo: usize) -> Result<()> {
         let g = gates.len();
-        if n == 0 || g == 0 || g > 4 || !ldh.is_multiple_of(2) || !ldm.is_multiple_of(2) || !ldo.is_multiple_of(4) {
+        if n == 0 || g == 0 || g > 4 || !ldh.is_multiple_of(4) || !ldm.is_multiple_of(4) || !ldo.is_multiple_of(4) {
             return Err(CudaError::Bounds {
                 what: "mg_tail_tc",
                 detail: format!(
@@ -1276,6 +1546,60 @@ impl Dev<'_> {
                     ldh: i(ldh),
                     ldm: i(ldm),
                     ldo: i(ldo),
+                },
+            )
+        }
+    }
+
+    /// Track 3A-7: `pglue::mg_tail_tc_vmsg_kernel<<<(H / 128, ceil(n / 32), G), 128>>>`: reads L2-hot bf16
+    /// `msrc0/1` + `mw` instead of fp32 `a.msgs`, bit-identical to `mg_tail_tc` and `mg_tail_tc_dec`.
+    #[expect(clippy::too_many_arguments, reason = "the kernel's parameters")]
+    pub fn mg_tail_tc_vmsg(
+        &self,
+        n: usize,
+        gates: &[MgTcGate<'_>],
+        msrc0: &DevBuf<Bf16>,
+        msrc1: &DevBuf<Bf16>,
+        mw: &DevBuf<f32>,
+        ldh: usize,
+        ldo: usize,
+        q_off: usize,
+    ) -> Result<()> {
+        let g = gates.len();
+        if n == 0 || g == 0 || g > 4 || !ldh.is_multiple_of(4) || !ldo.is_multiple_of(4) || q_off + g > 4 {
+            return Err(CudaError::Bounds {
+                what: "mg_tail_tc_vmsg",
+                detail: format!("{n} rows, G = {g}, ldh {ldh}, ldo {ldo}, q_off {q_off}"),
+            });
+        }
+        need(msrc0, n * H, "mg_tail_tc_vmsg msrc0")?;
+        need(msrc1, n * H, "mg_tail_tc_vmsg msrc1")?;
+        need(mw, n * 16, "mg_tail_tc_vmsg mw")?;
+        let mut m = pglue::MgTcVmsg::zeroed();
+        m.msrc0 = msrc0.ptr();
+        m.msrc1 = msrc1.ptr();
+        m.mw = mw.ptr();
+        for (y, x) in gates.iter().enumerate() {
+            need(x.gd, n * MG_RANK, "mg_tail_tc_vmsg gd")?;
+            need(x.w, 2 * H * MG_RANK, "mg_tail_tc_vmsg W")?;
+            need(x.hid, (n - 1) * ldh + H, "mg_tail_tc_vmsg hid")?;
+            need(x.out, (n - 1) * ldo + H, "mg_tail_tc_vmsg out")?;
+            m.gd[y] = x.gd.ptr();
+            m.W[y] = x.w.ptr();
+            m.hid[y] = x.hid.ptr();
+            m.out[y] = x.out.ptr();
+        }
+        // SAFETY: gate y < G reads gd/W/hid (aligned float4), shared msrc0/1 (aligned uint4), mw[n*16], writes out (all checked).
+        unsafe {
+            self.k.pglue_mg_tail_tc_vmsg_kernel(
+                self.st,
+                cfg([H / 128, n.div_ceil(TC_ROWS), g], 128, 0),
+                PglueMgTailTcVmsgKernelArgs {
+                    m,
+                    T: i(n),
+                    ldh: i(ldh),
+                    ldo: i(ldo),
+                    q_off: i(q_off),
                 },
             )
         }
@@ -1474,6 +1798,105 @@ impl Dev<'_> {
     }
 
     // ------------------------------------------------------------------------------------------------ q / k / v post
+
+    /// Track 3A-3: zero-split QKV post reading directly from fused `qkvf` (`a.relk`, row stride `nt`).
+    /// Q warps copy `gate`/`sink` into contiguous buffers so `prefill_attn` stays untouched; KV warps run an 8-row
+    /// sliding window in registers. Bit-identical to `proj_split + qkv_post_rows`.
+    #[expect(clippy::too_many_arguments, reason = "the kernel's parameters")]
+    pub fn qkv_post_fused_rows(
+        &self,
+        t: usize,
+        qkvf: &DevBuf<Bf16>,
+        nt: usize,
+        gate: &DevBuf<Bf16>,
+        sink: &DevBuf<Bf16>,
+        seg_len: &DevBuf<i32>,
+        a: QkvPost<'_>,
+    ) -> Result<()> {
+        need(qkvf, t * nt, "qkvf")?;
+        need(a.q, t * QD, "q")?;
+        need(a.rel, t * NH * 16, "rel")?;
+        need(gate, t * QD, "gate")?;
+        need(sink, t * NH, "sink")?;
+        need(a.kx, t * H, "kx")?;
+        need(a.vx, t * H, "vx")?;
+        need(a.pos, t, "pos")?;
+        let c = cfg([t, 4, 1], 256, 0);
+        if a.fp8 {
+            // SAFETY: reads rows [0..T) of qkvf (stride nt, checked), conv states, scales and conv weights; writes q,
+            // rel, gate, sink, conv_commit tail rows of kx/vx, and E4M3 K/V pages (all checked).
+            unsafe {
+                self.k.pglue_qkv_post_fused_rows_fp8_kernel(
+                    self.st,
+                    c,
+                    PglueQkvPostFusedRowsFp8KernelArgs {
+                        qkvf: b(qkvf),
+                        nt: i(nt),
+                        q_scale: b(a.q_scale),
+                        r_scale: b(a.r_scale),
+                        row_pos: b(a.pos),
+                        full: i32::from(a.full),
+                        T: i(t),
+                        q: b(a.q),
+                        rel: b(a.rel),
+                        gate: b(gate),
+                        sink: b(sink),
+                        kx: b(a.kx),
+                        vx: b(a.vx),
+                        kst: b(a.kst),
+                        vst: b(a.vst),
+                        st_slot_stride: (NVISITS * 3 * SLD) as i64,
+                        R: a.rows,
+                        seg_len: b(seg_len),
+                        kw: b(a.kw),
+                        vw: b(a.vw),
+                        eps: EPS,
+                        kpool: b(a.kpool),
+                        vpool: b(a.vpool),
+                        pt: b(a.pt),
+                        pt_stride: i(crate::engine::meta::KPT),
+                    },
+                )
+            }
+        } else {
+            let kpool = a.kpool.cast::<Bf16>()?;
+            let vpool = a.vpool.cast::<Bf16>()?;
+            // SAFETY: as FP8 variant above, writing bf16 K/V pages (all checked).
+            unsafe {
+                self.k.pglue_qkv_post_fused_rows_kernel(
+                    self.st,
+                    c,
+                    PglueQkvPostFusedRowsKernelArgs {
+                        qkvf: b(qkvf),
+                        nt: i(nt),
+                        q_scale: b(a.q_scale),
+                        r_scale: b(a.r_scale),
+                        row_pos: b(a.pos),
+                        full: i32::from(a.full),
+                        T: i(t),
+                        q: b(a.q),
+                        rel: b(a.rel),
+                        gate: b(gate),
+                        sink: b(sink),
+                        kx: b(a.kx),
+                        vx: b(a.vx),
+                        kst: b(a.kst),
+                        vst: b(a.vst),
+                        st_slot_stride: (NVISITS * 3 * SLD) as i64,
+                        R: a.rows,
+                        seg_len: b(seg_len),
+                        kw: b(a.kw),
+                        vw: b(a.vw),
+                        eps: EPS,
+                        kpool: b(&kpool),
+                        vpool: b(&vpool),
+                        pt: b(a.pt),
+                        pt_stride: i(crate::engine::meta::KPT),
+                    },
+                )
+            }
+        }
+    }
 
     /// `pglue::qkv_post_rows_kernel` (or `_fp8_kernel`)`<<<(T, 4), 256>>>` (prefill-carrying calls, production glue).
     pub fn qkv_post_rows(&self, t: usize, a: QkvPost<'_>) -> Result<()> {
@@ -1989,11 +2412,11 @@ impl Dev<'_> {
         if let Some(p) = partial {
             need(p, t * H, "partial")?;
         }
-        // SAFETY: as attn_conv_partial; mode 1 reads partial (given), mode 0 none.
+        // SAFETY: as attn_conv_partial; 2D grid (H / 256, T), mode 1 reads partial (given), mode 0 none.
         unsafe {
             self.k.glue_hidden_conv_kernel(
                 self.st,
-                cfg([grid1(t * H), 1, 1], 256, 0),
+                cfg([H / 256, t, 1], 256, 0),
                 GlueHiddenConvKernelArgs {
                     x: b(x),
                     w: b(w),
@@ -2254,7 +2677,7 @@ impl Dev<'_> {
         }
     }
 
-    /// `glue::route_select_kernel<<<T, 32>>>(group logits, T, bias, ridx, rw)`.
+    /// `glue::route_select_kernel<<<T, 32>>>` (or 4-warp `pglue::route_select_rows_kernel<<<ceil(T/4), 128>>>` for `t > 64`).
     pub fn route_select(
         &self,
         t: usize,
@@ -2267,23 +2690,37 @@ impl Dev<'_> {
         need(bias, NEXP, "router bias")?;
         need(idx, t * TOPK, "ridx")?;
         need(wts, t * TOPK, "rw")?;
-        // SAFETY: block t sums the three K-group logits of row t ([3][T][128]), writes TOPK entries (checked).
+        // SAFETY: sums the three K-group logits of row t ([3][T][128]), writes TOPK entries (checked).
         unsafe {
-            self.k.glue_route_select_kernel(
-                self.st,
-                cfg([t, 1, 1], 32, 0),
-                GlueRouteSelectKernelArgs {
-                    g: b(g),
-                    T: i(t),
-                    bias: b(bias),
-                    idx: b(idx),
-                    wts: b(wts),
-                },
-            )
+            if t > 64 {
+                self.k.pglue_route_select_rows_kernel(
+                    self.st,
+                    cfg([t.div_ceil(4), 1, 1], 128, 0),
+                    PglueRouteSelectRowsKernelArgs {
+                        g: b(g),
+                        T: i(t),
+                        bias: b(bias),
+                        idx: b(idx),
+                        wts: b(wts),
+                    },
+                )
+            } else {
+                self.k.glue_route_select_kernel(
+                    self.st,
+                    cfg([t, 1, 1], 32, 0),
+                    GlueRouteSelectKernelArgs {
+                        g: b(g),
+                        T: i(t),
+                        bias: b(bias),
+                        idx: b(idx),
+                        wts: b(wts),
+                    },
+                )
+            }
         }
     }
 
-    /// The routing build of `pmoe_rows`: three parallel launches for n > 64 rows, else `moedev::moe_build_kernel`.
+    /// The routing build of `pmoe_rows`: fast `__match_any_sync` 512-row parallel build for `n > 64`, else `moedev::moe_build_dec_kernel`.
     pub fn moe_build(&self, n: usize, r: &MoeBuild<'_>) -> Result<()> {
         let rg = n * TOPK;
         need(r.idx, rg, "ridx")?;
@@ -2300,27 +2737,26 @@ impl Dev<'_> {
         need(r.items, need_items, "items")?;
         need(r.n_items, 1, "n_items")?;
         if n > 64 {
-            let nb = rg.div_ceil(BUILD_ROWS);
+            let nb = rg.div_ceil(BUILD_ROWS_FAST);
             need(r.cntb, nb * NEXP, "cntb")?;
             need(r.baseb, nb * NEXP, "baseb")?;
-            // SAFETY: block x counts experts of routed rows [128 x, 128 x + 128) & < Rg into cntb[x][128]
-            // (checked); the plan kernel turns nb x 128 counts into bases and at most items_bound(Rg) items (checked);
-            // the scatter writes Rg sorted positions into arow13 / arow2 / orow / gamma (checked). Expert ids < 128
-            // (route_select's contract).
+            // SAFETY: block x counts experts of routed rows [512 x, 512 x + 512) & < Rg into cntb[x][128]
+            // (checked); moe_plan_fast turns nb x 128 counts into bases and at most items_bound(Rg) items (checked);
+            // moe_scatter_fast writes Rg sorted positions in O(1) via __match_any_sync (checked). Expert ids < 128.
             unsafe {
-                self.k.pglue_moe_count_kernel(
+                self.k.pglue_moe_count_fast_kernel(
                     self.st,
-                    cfg([nb, 1, 1], 128, 0),
-                    PglueMoeCountKernelArgs {
+                    cfg([nb, 1, 1], 256, 0),
+                    PglueMoeCountFastKernelArgs {
                         idx: b(r.idx),
                         R: i(rg),
                         cntb: b(r.cntb),
                     },
                 )?;
-                self.k.pglue_moe_plan_kernel(
+                self.k.pglue_moe_plan_fast_kernel(
                     self.st,
-                    cfg([1, 1, 1], NEXP, 0),
-                    PglueMoePlanKernelArgs {
+                    cfg([1, 1, 1], 512, 0),
+                    PglueMoePlanFastKernelArgs {
                         cntb: b(r.cntb),
                         nb: i(nb),
                         baseb: b(r.baseb),
@@ -2328,10 +2764,10 @@ impl Dev<'_> {
                         n_items: b(r.n_items),
                     },
                 )?;
-                self.k.pglue_moe_scatter_kernel(
+                self.k.pglue_moe_scatter_fast_kernel(
                     self.st,
-                    cfg([nb, 1, 1], NEXP, 0),
-                    PglueMoeScatterKernelArgs {
+                    cfg([nb, 1, 1], 256, 0),
+                    PglueMoeScatterFastKernelArgs {
                         idx: b(r.idx),
                         wts: b(r.wts),
                         R: i(rg),
@@ -2410,6 +2846,52 @@ impl Dev<'_> {
                     self.k.pmoe_moe_gemm2_1_2_3_8_0(self.st, c, p2)
                 }
             }
+        }
+    }
+
+    /// Track 3A-6: fused `moe_combine` + MLP conv + residual (`pglue::moe_combine_conv_kernel<<<(3, ceil(T/64)), 96>>>`).
+    /// Bit-identical to `moe_combine` + `conv_rows<1>`, writing `mx` only for segment tail rows needed by `conv_commit`.
+    #[expect(clippy::too_many_arguments, reason = "the kernel's parameters")]
+    pub fn moe_combine_conv(
+        &self,
+        t: usize,
+        my: &DevBuf<Bf16>,
+        w: &DevBuf<f32>,
+        state: &DevBuf<Bf16>,
+        r: glue::Rows,
+        seg_len: &DevBuf<i32>,
+        partial: &DevBuf<f32>,
+        mx: &DevBuf<Bf16>,
+        out: &DevBuf<Bf16>,
+    ) -> Result<()> {
+        need(my, t * TOPK * H, "moe_combine_conv my")?;
+        need(w, H * 4, "moe_combine_conv w")?;
+        need(partial, t * H, "moe_combine_conv partial")?;
+        need(mx, t * H, "moe_combine_conv mx")?;
+        need(out, t * H, "moe_combine_conv out")?;
+        // SAFETY: thread = 4 channels x 32 rows (< T); combines my in slot order, runs static_conv + partial -> out,
+        // writes conv_commit tail rows into mx (all extents checked).
+        unsafe {
+            self.k.pglue_moe_combine_conv_kernel(
+                self.st,
+                cfg(
+                    [H / 4 / CONV_THREADS, t.div_ceil(COMBINE_CONV_ROWS), 1],
+                    CONV_THREADS,
+                    0,
+                ),
+                PglueMoeCombineConvKernelArgs {
+                    my: b(my),
+                    w: b(w),
+                    state: b(state),
+                    st_slot_stride: (NVISITS * 3 * SLD) as i64,
+                    R: r,
+                    seg_len: b(seg_len),
+                    T: i(t),
+                    partial32: b(partial),
+                    mx: b(mx),
+                    out: b(out),
+                },
+            )
         }
     }
 
@@ -2732,6 +3214,42 @@ impl Dev<'_> {
                     tau,
                     n: i(n),
                     width: b(width),
+                },
+            )
+        }
+    }
+
+    /// `verify_width_pack_kernel<<<1, 64>>>(conf, drafts, tau, n, out)`: packs `[widths[0..n], drafts[0..7*n]]` into
+    /// one contiguous device buffer for single-sync D2H download.
+    pub fn verify_widths_pack(
+        &self,
+        n: usize,
+        conf: Option<&DevBuf<f32>>,
+        drafts: Option<&DevBuf<i32>>,
+        tau: f32,
+        out: &DevBuf<i32>,
+    ) -> Result<()> {
+        if let Some(c) = conf {
+            need(c, 7 * n, "conf")?;
+        }
+        if let Some(d) = drafts {
+            need(d, 7 * n, "drafts")?;
+            need(out, 8 * n, "packed widths+drafts")?;
+        } else {
+            need(out, n, "widths")?;
+        }
+        // SAFETY: threads compute widths[0..n] (or 8 if conf is null) into out[0..n] and copy drafts[0..7*n] into
+        // out[n..8*n] (all extents checked above).
+        unsafe {
+            self.k.ink_verify_width_pack_kernel(
+                self.st,
+                cfg([1, 1, 1], 64, 0),
+                InkVerifyWidthPackKernelArgs {
+                    margin: opt(conf),
+                    drafts: opt(drafts),
+                    tau,
+                    n: i(n),
+                    out: b(out),
                 },
             )
         }

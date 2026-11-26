@@ -20,9 +20,6 @@ use crate::spec::{Plain, RoundTimes, Speculation, Verify};
 /// Tokens per page of the runtime's own KV pool (`engine/native` global page).
 const PAGE_TOKENS: u32 = 1024;
 
-/// Most rows of a prefill segment (`engine/native` API).
-const MAX_PREFILL_ROWS: u32 = 2048;
-
 /// Most rows of a decode segment (up to 16 rows: anchor + 7 drafter drafts + up to 8 lookup drafts).
 const MAX_DECODE_ROWS: u32 = 16;
 
@@ -153,7 +150,7 @@ impl RuntimeAdapter {
             t_max: config.t_max,
             page_tokens: PAGE_TOKENS,
             max_decode_rows: MAX_DECODE_ROWS,
-            max_prefill_rows: MAX_PREFILL_ROWS.min(config.t_max),
+            max_prefill_rows: config.max_chunk.min(config.t_max),
             external_pages: false,
             drafter: Drafting::None,
             conv_checkpoints: false,

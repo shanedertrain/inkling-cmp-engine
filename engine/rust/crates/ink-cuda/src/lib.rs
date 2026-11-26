@@ -27,7 +27,7 @@ pub use check::{CUBLASLT_MAJOR, MIN_DRIVER_VERSION, StartupReport, startup_check
 pub use context::{Context, DeviceInfo, Event, Stream, format_uuid};
 pub use error::{CudaError, Result};
 pub use gemm::{Bf16, Candidate, GemmElem, LtGemm, Selected, Tuned};
-pub use graph::{Capture, Graph, GraphNode, NodeKind, NodeState};
+pub use graph::{CachedKernelNode, Capture, Graph, GraphNode, NodeKind, NodeState};
 pub use module::{Function, KernelArgs, LaunchCfg, Module};
 pub use nvml::{GpuInfo, PERIOD_10HZ, Sample, Sampler, Summary, summarize};
 pub use pins::{AlgoPin, AlgoPins, Dtype, FORMAT as PINS_FORMAT, GemmShape, PlanClass};

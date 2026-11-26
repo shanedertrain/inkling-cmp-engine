@@ -995,24 +995,32 @@ __global__ void __launch_bounds__(128) mg_tail_tc_kernel(MgTc m, int T, int ldh,
       }
   }
   __syncthreads();
-  // Reuse sb (36,864 B >= 32 * 128 * 4 = 16,384 B) for coalesced float4 hid/msg/out transfers
-  float* stmp = reinterpret_cast<float*>(sb);
+  // Reuse sb (36,864 B >= 2 * 32 * 132 * 4 = 33,792 B) for coalesced float4 hid/msg/out transfers (zero bank conflict)
+  constexpr int kTcSmemLd = 132;
+  float* shid = reinterpret_cast<float*>(sb);
+  float* smsg = shid + kTcRows * kTcSmemLd;
   const float *hid = m.hid[z], *msg = m.msg[z];
   float* out = m.out[z];
   const int nr = min(kTcRows, T - t0);
+  for (int idx = tid; idx < nr * 32; idx += 128) {
+    const int r = idx >> 5, c = idx & 31;
+    *reinterpret_cast<float4*>(shid + r * kTcSmemLd + c * 4) =
+        *reinterpret_cast<const float4*>(hid + (size_t)(t0 + r) * ldh + n0 + c * 4);
+    *reinterpret_cast<float4*>(smsg + r * kTcSmemLd + c * 4) =
+        *reinterpret_cast<const float4*>(msg + (size_t)(t0 + r) * ldm + n0 + c * 4);
+  }
+  __syncthreads();
 #pragma unroll
   for (int i = 0; i < 2; ++i)
 #pragma unroll
     for (int hf = 0; hf < 2; ++hf) {
       const int r = 16 * i + gq + 8 * hf;
       if (r >= nr) continue;
-      const int t = t0 + r;
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const int lc = 32 * warp + 8 * j + 2 * t4;
-        const int h = n0 + lc;
-        const float2 hv = *reinterpret_cast<const float2*>(hid + (size_t)t * ldh + h);
-        const float2 mv = *reinterpret_cast<const float2*>(msg + (size_t)t * ldm + h);
+        const float2 hv = *reinterpret_cast<const float2*>(shid + r * kTcSmemLd + lc);
+        const float2 mv = *reinterpret_cast<const float2*>(smsg + r * kTcSmemLd + lc);
         float2 o;
         {
           const float f = tanhf(acc[0][i][j][2 * hf]), a = tanhf(acc[1][i][j][2 * hf]);
@@ -1022,14 +1030,14 @@ __global__ void __launch_bounds__(128) mg_tail_tc_kernel(MgTc m, int T, int ldh,
           const float f = tanhf(acc[0][i][j][2 * hf + 1]), a = tanhf(acc[1][i][j][2 * hf + 1]);
           o.y = __fadd_rn(__fmul_rn(__fadd_rn(1.0f, -f), hv.y), __fmul_rn(a, mv.y));
         }
-        *reinterpret_cast<float2*>(stmp + r * 128 + lc) = o;
+        *reinterpret_cast<float2*>(shid + r * kTcSmemLd + lc) = o;
       }
     }
   __syncthreads();
   for (int idx = tid; idx < nr * 32; idx += 128) {
     const int r = idx >> 5, c = idx & 31;
     *reinterpret_cast<float4*>(out + (size_t)(t0 + r) * ldo + n0 + c * 4) =
-        *reinterpret_cast<const float4*>(stmp + r * 128 + c * 4);
+        *reinterpret_cast<const float4*>(shid + r * kTcSmemLd + c * 4);
   }
 }
 // W of one gate from the fp32 transposed controller weights FT / GT [64][H] (exact bf16 values): grid 2 H, block 64
@@ -1870,6 +1878,1541 @@ __global__ void __launch_bounds__(288) conv_ar_gate288_kernel(const bf16* __rest
   bf16* gdst = gi.g + (size_t)t * 2 * H;
   st8(gdst + c0, ya);
   st8(gdst + H + c0, yb);
+}
+
+// ---------------------------------------------------------------------------------------------- Track 3A prefill glue fusions (100% bit-identical to production path)
+
+// Helper: unpack 8 bf16 from uint4 into float[8]
+__device__ __forceinline__ void unpack8(const uint4 u, float (&v)[8]) {
+  const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const float2 f = __bfloat1622float2(h[k]);
+    v[2 * k] = f.x;
+    v[2 * k + 1] = f.y;
+  }
+}
+
+// Helper: pack float[8] into uint4 (8 bf16)
+__device__ __forceinline__ uint4 pack8(const float (&v)[8]) {
+  uint4 u;
+  __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(&u);
+#pragma unroll
+  for (int k = 0; k < 4; ++k) h[k] = __floats2bfloat162_rn(v[2 * k], v[2 * k + 1]);
+  return u;
+}
+
+// Helper: ar288_finish using pre-scaled query vector qv[8] = query * (1/48)
+__device__ __forceinline__ void ar288_finish_qv(const float (&xs)[5][8], int N, const float (&qv)[8],
+                                                float eps, float* sh, float (&res)[8]) {
+  const float invH = (float)(1.0 / 2304.0);
+  float v[10];
+#pragma unroll
+  for (int i = 0; i < 10; ++i) v[i] = 0.f;
+#pragma unroll
+  for (int n = 0; n < 5; ++n) {
+    if (n < N) {
+      float ss = 0.f, dq = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const float x = xs[n][e];
+        ss = __fadd_rn(ss, __fmul_rn(x, x));
+        dq = __fadd_rn(dq, __fmul_rn(x, qv[e]));
+      }
+      v[2 * n] = ss;
+      v[2 * n + 1] = dq;
+    }
+  }
+  block_sum288<10>(v, sh);
+  float rstd[5], l[5], p[5];
+  float mx = -INFINITY;
+#pragma unroll
+  for (int n = 0; n < 5; ++n) {
+    if (n < N) {
+      rstd[n] = rsqrtf(__fmaf_rn(v[2 * n], invH, eps));
+      l[n] = __fmul_rn(v[2 * n + 1], rstd[n]);
+      mx = fmaxf(mx, l[n]);
+    } else {
+      rstd[n] = 0.f;
+      l[n] = 0.f;
+    }
+  }
+  float sum = 0.f;
+#pragma unroll
+  for (int n = 0; n < 5; ++n) {
+    if (n < N) {
+      p[n] = expf(__fadd_rn(l[n], -mx));
+      sum = __fadd_rn(sum, p[n]);
+    } else {
+      p[n] = 0.f;
+    }
+  }
+  const float inv = __fdiv_rn(1.0f, sum);
+#pragma unroll
+  for (int n = 0; n < 5; ++n)
+    if (n < N) p[n] = __fmul_rn(p[n], rstd[n]);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    float acc = 0.f;
+#pragma unroll
+    for (int n = 0; n < 5; ++n)
+      if (n < N) acc = __fmaf_rn(p[n], xs[n][e], acc);
+    res[e] = __fmul_rn(acc, inv);
+  }
+}
+
+// 3A-1a: Single-CTA Q=4, G=0, N=2 msgs AttnRes (1 row/CTA -> 2048 CTAs, max occupancy, zero tail effect).
+// Reads msrc[0..1] ONCE instead of 4x, streams queries one at a time for low register count (4 CTAs/SM).
+// Bit-identical to ar288_kernel<0>. Grid (T, 1, 1), block 288.
+__global__ void __launch_bounds__(288) ar288_msgs_rows_kernel(glue::ResSrc s, const float* __restrict__ queries,
+                                                              float* __restrict__ out, float eps, int T) {
+  __shared__ float sh[9 * 10];
+  const int t = blockIdx.x, c0 = threadIdx.x * 8;
+  if (t >= T) return;
+  const float qsc = (float)(1.0 / 48.0);
+  const float invH = (float)(1.0 / 2304.0);
+  float x0[8], x1[8];
+  ld8(s.blk[0] + (size_t)t * H + c0, x0);
+  ld8(s.last16 + (size_t)t * s.ld_last + c0, x1);
+  float v[10];
+  float ss0 = 0.f, ss1 = 0.f;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    ss0 = __fadd_rn(ss0, __fmul_rn(x0[e], x0[e]));
+    ss1 = __fadd_rn(ss1, __fmul_rn(x1[e], x1[e]));
+  }
+  v[0] = ss0;
+  v[1] = ss1;
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    float qv[8];
+    ld8(queries + (size_t)q * H + c0, qv);
+    float d0 = 0.f, d1 = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const float qs = __fmul_rn(qv[e], qsc);
+      d0 = __fadd_rn(d0, __fmul_rn(x0[e], qs));
+      d1 = __fadd_rn(d1, __fmul_rn(x1[e], qs));
+    }
+    v[2 + 2 * q] = d0;
+    v[2 + 2 * q + 1] = d1;
+  }
+  block_sum288<10>(v, sh);
+  const float rstd0 = rsqrtf(__fmaf_rn(v[0], invH, eps));
+  const float rstd1 = rsqrtf(__fmaf_rn(v[1], invH, eps));
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    const float l0 = __fmul_rn(v[2 + 2 * q], rstd0);
+    const float l1 = __fmul_rn(v[2 + 2 * q + 1], rstd1);
+    const float mx = fmaxf(l0, l1);
+    const float p0_raw = expf(__fadd_rn(l0, -mx));
+    const float p1_raw = expf(__fadd_rn(l1, -mx));
+    const float sum = __fadd_rn(p0_raw, p1_raw);
+    const float inv = __fdiv_rn(1.0f, sum);
+    const float p0 = __fmul_rn(p0_raw, rstd0);
+    const float p1 = __fmul_rn(p1_raw, rstd1);
+    float res[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const float acc = __fmaf_rn(p1, x1[e], __fmaf_rn(p0, x0[e], 0.f));
+      res[e] = __fmul_rn(acc, inv);
+    }
+    st8(out + ((size_t)t * 4 + q) * H + c0, res);
+  }
+}
+
+// 3A-1b: Single-CTA Q=1, G=3, qsel=0 AttnRes + gate inputs (ar_in_lm, 1 row/CTA -> 2048 CTAs, high occupancy).
+// Reads all N sources ONCE and computes AttnRes + res RMSNorm ONCE instead of 3x. Bit-identical to ar288_kernel<1>.
+// Grid (T, 1, 1), block 288.
+__global__ void __launch_bounds__(288) ar288_g3_shared_rows_kernel(glue::ResSrc s, const float* __restrict__ queries,
+                                                                   float* __restrict__ out, float eps, glue::GateIn gi,
+                                                                   int T) {
+  __shared__ float sh1[9 * 10];
+  __shared__ float sh2[9 * 4];
+  const int t = blockIdx.x, c0 = threadIdx.x * 8;
+  if (t >= T) return;
+  const int N = s.nb + 1;
+  float xs[5][8];
+#pragma unroll
+  for (int n = 0; n < 5; ++n) {
+    if (n < s.nb) ld8(s.blk[n] + (size_t)t * H + c0, xs[n]);
+    else if (n == s.nb) {
+      if (s.last32) ld8(s.last32 + (size_t)t * s.ld_last + c0, xs[n]);
+      else ld8(s.last16 + (size_t)t * s.ld_last + c0, xs[n]);
+    }
+  }
+  float res[8];
+  ar288_finish(xs, N, queries, c0, eps, sh1, res);
+  st8(out + (size_t)t * H + c0, res);
+  float mv[3][8];
+  const float* mrow = gi.msg + (size_t)t * gi.ldm + c0;
+#pragma unroll
+  for (int y = 0; y < 3; ++y) ld8(mrow + (size_t)y * H, mv[y]);
+  float u[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    u[0] = __fadd_rn(u[0], __fmul_rn(res[e], res[e]));
+    u[1] = __fadd_rn(u[1], __fmul_rn(mv[0][e], mv[0][e]));
+    u[2] = __fadd_rn(u[2], __fmul_rn(mv[1][e], mv[1][e]));
+    u[3] = __fadd_rn(u[3], __fmul_rn(mv[2][e], mv[2][e]));
+  }
+  block_sum288<4>(u, sh2);
+  const float ra = glue::rstd_of(u[0], H, eps);
+  float ya[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) ya[e] = __fmul_rn(res[e], ra);
+  const uint4 ya_u4 = pack8(ya);
+#pragma unroll
+  for (int y = 0; y < 3; ++y) {
+    const float rb = glue::rstd_of(u[1 + y], H, eps);
+    float yb[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) yb[e] = __fmul_rn(mv[y][e], rb);
+    bf16* gdst = gi.g + (size_t)y * gi.gs + (size_t)t * 2 * H;
+    *reinterpret_cast<uint4*>(gdst + c0) = ya_u4;
+    st8(gdst + H + c0, yb);
+  }
+}
+
+// 3A-1c: Single-CTA Q=3, G=3, qsel=1 AttnRes + gate inputs (ar_in_gm, 1 row/CTA -> 2048 CTAs, streams queries).
+// Reads all N sources ONCE instead of 3x. Bit-identical to ar288_kernel<1>. Grid (T, 1, 1), block 288.
+__global__ void __launch_bounds__(288) ar288_q3g3_rows_kernel(glue::ResSrc s, const float* __restrict__ queries,
+                                                              float* __restrict__ out, float eps, glue::GateIn gi,
+                                                              int T) {
+  __shared__ float sh1[9 * 20];
+  __shared__ float sh2[9 * 6];
+  const int t = blockIdx.x, c0 = threadIdx.x * 8;
+  if (t >= T) return;
+  const int N = s.nb + 1;
+  const float qsc = (float)(1.0 / 48.0);
+  const float invH = (float)(1.0 / 2304.0);
+  float xs[5][8];
+#pragma unroll
+  for (int n = 0; n < 5; ++n) {
+    if (n < s.nb) ld8(s.blk[n] + (size_t)t * H + c0, xs[n]);
+    else if (n == s.nb) {
+      if (s.last32) ld8(s.last32 + (size_t)t * s.ld_last + c0, xs[n]);
+      else ld8(s.last16 + (size_t)t * s.ld_last + c0, xs[n]);
+    }
+  }
+  float v[20];
+#pragma unroll
+  for (int i = 0; i < 20; ++i) v[i] = 0.f;
+#pragma unroll
+  for (int n = 0; n < 5; ++n) {
+    if (n < N) {
+      float ss = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) ss = __fadd_rn(ss, __fmul_rn(xs[n][e], xs[n][e]));
+      v[4 * n] = ss;
+    }
+  }
+#pragma unroll
+  for (int q = 0; q < 3; ++q) {
+    float qv[8];
+    ld8(queries + (size_t)q * H + c0, qv);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) qv[e] = __fmul_rn(qv[e], qsc);
+#pragma unroll
+    for (int n = 0; n < 5; ++n) {
+      if (n < N) {
+        float dq = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) dq = __fadd_rn(dq, __fmul_rn(xs[n][e], qv[e]));
+        v[4 * n + 1 + q] = dq;
+      }
+    }
+  }
+  block_sum288<20>(v, sh1);
+  float rstd[5];
+#pragma unroll
+  for (int n = 0; n < 5; ++n) rstd[n] = n < N ? rsqrtf(__fmaf_rn(v[4 * n], invH, eps)) : 0.f;
+  float res[3][8];
+#pragma unroll
+  for (int q = 0; q < 3; ++q) {
+    float l[5], p[5], mx = -INFINITY;
+#pragma unroll
+    for (int n = 0; n < 5; ++n) {
+      if (n < N) { l[n] = __fmul_rn(v[4 * n + 1 + q], rstd[n]); mx = fmaxf(mx, l[n]); }
+      else l[n] = 0.f;
+    }
+    float sum = 0.f;
+#pragma unroll
+    for (int n = 0; n < 5; ++n) {
+      if (n < N) { p[n] = expf(__fadd_rn(l[n], -mx)); sum = __fadd_rn(sum, p[n]); }
+      else p[n] = 0.f;
+    }
+    const float inv = __fdiv_rn(1.0f, sum);
+#pragma unroll
+    for (int n = 0; n < 5; ++n)
+      if (n < N) p[n] = __fmul_rn(p[n], rstd[n]);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      float acc = 0.f;
+#pragma unroll
+      for (int n = 0; n < 5; ++n)
+        if (n < N) acc = __fmaf_rn(p[n], xs[n][e], acc);
+      res[q][e] = __fmul_rn(acc, inv);
+    }
+    st8(out + ((size_t)t * 3 + q) * H + c0, res[q]);
+  }
+  float mv[3][8];
+  const float* mrow = gi.msg + (size_t)t * gi.ldm + c0;
+#pragma unroll
+  for (int y = 0; y < 3; ++y) ld8(mrow + (size_t)y * H, mv[y]);
+  float u[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int q = 0; q < 3; ++q) {
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      u[2 * q] = __fadd_rn(u[2 * q], __fmul_rn(res[q][e], res[q][e]));
+      u[2 * q + 1] = __fadd_rn(u[2 * q + 1], __fmul_rn(mv[q][e], mv[q][e]));
+    }
+  }
+  block_sum288<6>(u, sh2);
+#pragma unroll
+  for (int q = 0; q < 3; ++q) {
+    const float ra = glue::rstd_of(u[2 * q], H, eps);
+    const float rb = glue::rstd_of(u[2 * q + 1], H, eps);
+    float ya[8], yb[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      ya[e] = __fmul_rn(res[q][e], ra);
+      yb[e] = __fmul_rn(mv[q][e], rb);
+    }
+    bf16* gdst = gi.g + (size_t)q * gi.gs + (size_t)t * 2 * H;
+    st8(gdst + c0, ya);
+    st8(gdst + H + c0, yb);
+  }
+}
+
+// 3A-1d: Single-CTA Q=1 or Q=3 AttnRes + RMSNorm (1 row/CTA -> 2048 CTAs, streams queries & norm weights).
+// Reads sources ONCE (3x fewer reads for Q=3). Bit-identical to ar_norm288_kernel. Grid (T, 1, 1), block 288.
+template <int Q>
+__global__ void __launch_bounds__(288) ar_norm288_rows_kernel(glue::ResSrc s, const float* __restrict__ queries,
+                                                              const float* w0, const float* w1, const float* w2,
+                                                              bf16* o0, bf16* o1, bf16* o2, float eps, int T) {
+  constexpr int NV = 5 * (Q + 1);
+  __shared__ float sh1[9 * NV];
+  __shared__ float sh2[9 * Q];
+  const int t = blockIdx.x, c0 = threadIdx.x * 8;
+  if (t >= T) return;
+  const int N = s.nb + 1;
+  const float qsc = (float)(1.0 / 48.0);
+  const float invH = (float)(1.0 / 2304.0);
+  const float* ws[3] = {w0, w1, w2};
+  bf16* os[3] = {o0, o1, o2};
+  float xs[5][8];
+#pragma unroll
+  for (int n = 0; n < 5; ++n) {
+    if (n < s.nb) ld8(s.blk[n] + (size_t)t * H + c0, xs[n]);
+    else if (n == s.nb) {
+      if (s.last32) ld8(s.last32 + (size_t)t * s.ld_last + c0, xs[n]);
+      else ld8(s.last16 + (size_t)t * s.ld_last + c0, xs[n]);
+    }
+  }
+  float v[NV];
+#pragma unroll
+  for (int i = 0; i < NV; ++i) v[i] = 0.f;
+#pragma unroll
+  for (int n = 0; n < 5; ++n) {
+    if (n < N) {
+      float ss = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) ss = __fadd_rn(ss, __fmul_rn(xs[n][e], xs[n][e]));
+      v[n * (Q + 1)] = ss;
+    }
+  }
+#pragma unroll
+  for (int q = 0; q < Q; ++q) {
+    float qv[8];
+    ld8(queries + (size_t)q * H + c0, qv);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) qv[e] = __fmul_rn(qv[e], qsc);
+#pragma unroll
+    for (int n = 0; n < 5; ++n) {
+      if (n < N) {
+        float dq = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) dq = __fadd_rn(dq, __fmul_rn(xs[n][e], qv[e]));
+        v[n * (Q + 1) + 1 + q] = dq;
+      }
+    }
+  }
+  block_sum288<NV>(v, sh1);
+  float rstd[5];
+#pragma unroll
+  for (int n = 0; n < 5; ++n) rstd[n] = n < N ? rsqrtf(__fmaf_rn(v[n * (Q + 1)], invH, eps)) : 0.f;
+  float res[Q][8], u[Q];
+#pragma unroll
+  for (int q = 0; q < Q; ++q) {
+    float l[5], p[5], mx = -INFINITY;
+#pragma unroll
+    for (int n = 0; n < 5; ++n) {
+      if (n < N) { l[n] = __fmul_rn(v[n * (Q + 1) + 1 + q], rstd[n]); mx = fmaxf(mx, l[n]); }
+      else l[n] = 0.f;
+    }
+    float sum = 0.f;
+#pragma unroll
+    for (int n = 0; n < 5; ++n) {
+      if (n < N) { p[n] = expf(__fadd_rn(l[n], -mx)); sum = __fadd_rn(sum, p[n]); }
+      else p[n] = 0.f;
+    }
+    const float inv = __fdiv_rn(1.0f, sum);
+#pragma unroll
+    for (int n = 0; n < 5; ++n)
+      if (n < N) p[n] = __fmul_rn(p[n], rstd[n]);
+    float sq = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      float acc = 0.f;
+#pragma unroll
+      for (int n = 0; n < 5; ++n)
+        if (n < N) acc = __fmaf_rn(p[n], xs[n][e], acc);
+      const float rv = __fmul_rn(acc, inv);
+      res[q][e] = rv;
+      sq = __fadd_rn(sq, __fmul_rn(rv, rv));
+    }
+    u[q] = sq;
+  }
+  block_sum288<Q>(u, sh2);
+#pragma unroll
+  for (int q = 0; q < Q; ++q) {
+    const float r = glue::rstd_of(u[q], H, eps);
+    float wv[8], y[8];
+    if (ws[q]) ld8(ws[q] + c0, wv);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      float val = __fmul_rn(res[q][e], r);
+      if (ws[q]) val = __fmul_rn(val, wv[e]);
+      y[e] = val;
+    }
+    st8(os[q] + (size_t)t * H + c0, y);
+  }
+}
+
+// 3A-4: Row-coarsened conv_ar_norm288 & conv_ar_gate288 (kConvArRows = 4 rows/CTA -> 512 CTAs, preloads cw[8][4]).
+// Keeps conv weights cw[8][4] + 3-row bf16 sliding window in registers -> 4x fewer ax & cw reads.
+constexpr int kConvArRows = 4;
+__global__ void __launch_bounds__(288) conv_ar_norm288_rows_kernel(
+    const bf16* __restrict__ ax, const float* __restrict__ cw, const bf16* __restrict__ state,
+    long long st_slot_stride, glue::Rows R, const bf16* __restrict__ hin, int block_start,
+    bf16* __restrict__ blk_out, float* __restrict__ partial32, glue::ResSrc s,
+    const float* __restrict__ query, const float* __restrict__ norm_w, bf16* __restrict__ xm_out,
+    float eps, int T) {
+  __shared__ float sh1[2][9 * 10];
+  __shared__ float sh2[2][9];
+  const int c0 = threadIdx.x * 8;
+  const int t0 = blockIdx.x * kConvArRows, t1 = min(T, t0 + kConvArRows);
+  float wv[8][4];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    const float4 q = *reinterpret_cast<const float4*>(cw + (size_t)(c0 + e) * 4);
+    wv[e][0] = q.x; wv[e][1] = q.y; wv[e][2] = q.z; wv[e][3] = q.w;
+  }
+  const float qsc = (float)(1.0 / 48.0);
+  float qv[8];
+  ld8(query + c0, qv);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) qv[e] = __fmul_rn(qv[e], qsc);
+  uint4 prev[3];
+#pragma unroll
+  for (int j = 0; j < 3; ++j) {
+    const int r = t0 - 3 + j;
+    prev[j] = r >= 0 ? *reinterpret_cast<const uint4*>(ax + (size_t)r * H + c0) : make_uint4(0, 0, 0, 0);
+  }
+  constexpr float kInv5 = (float)(1.0 / 2.23606797749979);
+  const int nb_prev = s.nb;
+  const int N = nb_prev + (block_start ? 2 : 1);
+  for (int t = t0; t < t1; ++t) {
+    const int pb = (t - t0) & 1;
+    const size_t o = (size_t)t * H + c0;
+    const uint4 cur_u4 = *reinterpret_cast<const uint4*>(ax + o);
+    float cur[8], ex[3][8];
+    unpack8(cur_u4, cur);
+    const int seg = R.seg[t], i = t - R.row0[seg];
+    const bf16* st = state + (size_t)R.slot[seg] * st_slot_stride;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+      if (i + j < 3) ld8(st + (size_t)(i + j) * glue::SLD + c0, ex[j]);
+      else unpack8(prev[j], ex[j]);
+    }
+    float y[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      float acc = __fmul_rn(wv[e][0], ex[0][e]);
+      acc = __fadd_rn(acc, __fmul_rn(wv[e][1], ex[1][e]));
+      acc = __fadd_rn(acc, __fmul_rn(wv[e][2], ex[2][e]));
+      acc = __fadd_rn(acc, __fmul_rn(wv[e][3], cur[e]));
+      y[e] = glue::rr16(__fmul_rn(__fadd_rn(acc, cur[e]), kInv5));
+    }
+    prev[0] = prev[1];
+    prev[1] = prev[2];
+    prev[2] = cur_u4;
+    const uint4 h_raw = *reinterpret_cast<const uint4*>(hin + o);
+    float h_v[8], p_v[8];
+    unpack8(h_raw, h_v);
+    if (block_start) {
+      *reinterpret_cast<uint4*>(blk_out + o) = h_raw;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) p_v[e] = y[e];
+    } else {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) p_v[e] = __fadd_rn(h_v[e], y[e]);
+    }
+    st8(partial32 + o, p_v);
+    float xs[5][8];
+#pragma unroll
+    for (int n = 0; n < 5; ++n) {
+      if (n < nb_prev) ld8(s.blk[n] + o, xs[n]);
+      else if (block_start && n == nb_prev) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) xs[n][e] = h_v[e];
+      } else if (n == N - 1) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) xs[n][e] = p_v[e];
+      }
+    }
+    float res[8];
+    ar288_finish_qv(xs, N, qv, eps, sh1[pb], res);
+    float u[1] = {0.f};
+#pragma unroll
+    for (int e = 0; e < 8; ++e) u[0] = __fadd_rn(u[0], __fmul_rn(res[e], res[e]));
+    block_sum288<1>(u, sh2[pb]);
+    const float r = glue::rstd_of(u[0], H, eps);
+    float nw[8], yo[8];
+    if (norm_w) ld8(norm_w + c0, nw);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      float v = __fmul_rn(res[e], r);
+      if (norm_w) v = __fmul_rn(v, nw[e]);
+      yo[e] = v;
+    }
+    st8(xm_out + o, yo);
+  }
+}
+
+__global__ void __launch_bounds__(288) conv_ar_gate288_rows_kernel(
+    const bf16* __restrict__ ax, const float* __restrict__ cw, const bf16* __restrict__ state,
+    long long st_slot_stride, glue::Rows R, const bf16* __restrict__ hin, int block_start,
+    bf16* __restrict__ blk_out, float* __restrict__ partial32, glue::ResSrc s,
+    const float* __restrict__ query, float* __restrict__ ar_out, float eps, glue::GateIn gi, int T) {
+  __shared__ float sh1[2][9 * 10];
+  __shared__ float sh2[2][9 * 2];
+  const int c0 = threadIdx.x * 8;
+  const int t0 = blockIdx.x * kConvArRows, t1 = min(T, t0 + kConvArRows);
+  float wv[8][4];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    const float4 q = *reinterpret_cast<const float4*>(cw + (size_t)(c0 + e) * 4);
+    wv[e][0] = q.x; wv[e][1] = q.y; wv[e][2] = q.z; wv[e][3] = q.w;
+  }
+  const float qsc = (float)(1.0 / 48.0);
+  float qv[8];
+  ld8(query + c0, qv);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) qv[e] = __fmul_rn(qv[e], qsc);
+  uint4 prev[3];
+#pragma unroll
+  for (int j = 0; j < 3; ++j) {
+    const int r = t0 - 3 + j;
+    prev[j] = r >= 0 ? *reinterpret_cast<const uint4*>(ax + (size_t)r * H + c0) : make_uint4(0, 0, 0, 0);
+  }
+  constexpr float kInv5 = (float)(1.0 / 2.23606797749979);
+  const int nb_prev = s.nb;
+  const int N = nb_prev + (block_start ? 2 : 1);
+  for (int t = t0; t < t1; ++t) {
+    const int pb = (t - t0) & 1;
+    const size_t o = (size_t)t * H + c0;
+    const uint4 cur_u4 = *reinterpret_cast<const uint4*>(ax + o);
+    float cur[8], ex[3][8];
+    unpack8(cur_u4, cur);
+    const int seg = R.seg[t], i = t - R.row0[seg];
+    const bf16* st = state + (size_t)R.slot[seg] * st_slot_stride;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+      if (i + j < 3) ld8(st + (size_t)(i + j) * glue::SLD + c0, ex[j]);
+      else unpack8(prev[j], ex[j]);
+    }
+    float y[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      float acc = __fmul_rn(wv[e][0], ex[0][e]);
+      acc = __fadd_rn(acc, __fmul_rn(wv[e][1], ex[1][e]));
+      acc = __fadd_rn(acc, __fmul_rn(wv[e][2], ex[2][e]));
+      acc = __fadd_rn(acc, __fmul_rn(wv[e][3], cur[e]));
+      y[e] = glue::rr16(__fmul_rn(__fadd_rn(acc, cur[e]), kInv5));
+    }
+    prev[0] = prev[1];
+    prev[1] = prev[2];
+    prev[2] = cur_u4;
+    const uint4 h_raw = *reinterpret_cast<const uint4*>(hin + o);
+    float h_v[8], p_v[8];
+    unpack8(h_raw, h_v);
+    if (block_start) {
+      *reinterpret_cast<uint4*>(blk_out + o) = h_raw;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) p_v[e] = y[e];
+    } else {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) p_v[e] = __fadd_rn(h_v[e], y[e]);
+    }
+    st8(partial32 + o, p_v);
+    float xs[5][8];
+#pragma unroll
+    for (int n = 0; n < 5; ++n) {
+      if (n < nb_prev) ld8(s.blk[n] + o, xs[n]);
+      else if (block_start && n == nb_prev) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) xs[n][e] = h_v[e];
+      } else if (n == N - 1) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) xs[n][e] = p_v[e];
+      }
+    }
+    float res[8];
+    ar288_finish_qv(xs, N, qv, eps, sh1[pb], res);
+    st8(ar_out + o, res);
+    float mv[8];
+    ld8(gi.msg + (size_t)t * gi.ldm + c0, mv);
+    float u[2] = {0.f, 0.f};
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      u[0] = __fadd_rn(u[0], __fmul_rn(res[e], res[e]));
+      u[1] = __fadd_rn(u[1], __fmul_rn(mv[e], mv[e]));
+    }
+    block_sum288<2>(u, sh2[pb]);
+    const float ra = glue::rstd_of(u[0], H, eps);
+    const float rb = glue::rstd_of(u[1], H, eps);
+    float ya[8], yb[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      ya[e] = __fmul_rn(res[e], ra);
+      yb[e] = __fmul_rn(mv[e], rb);
+    }
+    bf16* gdst = gi.g + (size_t)t * 2 * H;
+    st8(gdst + c0, ya);
+    st8(gdst + H + c0, yb);
+  }
+}
+
+// 3A-7: Virtual Messages (100% bit-identical to materializing a.msgs [T, 4, H] fp32!).
+// Eliminates ~87 GB of HBM traffic at 32K: computes [12][T][4] float4 (p0, p1, inv, 0) ONCE per pass in a.msgs
+// (~1.6 MB vs 75.5 MB/visit x 12) and reconstructs exact msgs[t, q, h] on-the-fly from L2-hot bf16 msrc[0..1].
+// Grid (ceil(T / 16), 12, 1), block 288: each CTA preloads 1 visit's 4 queries once into registers across 16 rows!
+constexpr int kVmsgRows = 16;
+__global__ void __launch_bounds__(288) vmsg_weights_kernel(
+    const bf16* __restrict__ msrc0, const bf16* __restrict__ msrc1, const float* __restrict__ msg_queries,
+    float* __restrict__ mw, float eps, int T) {
+  __shared__ float sh[2][9 * 10];
+  const int t0 = blockIdx.x * kVmsgRows, t1 = min(T, t0 + kVmsgRows);
+  const int i = blockIdx.y, c0 = threadIdx.x * 8;
+  const float qsc = (float)(1.0 / 48.0);
+  const float invH = (float)(1.0 / 2304.0);
+  const float* queries = msg_queries + (size_t)i * 4 * H;
+  float qv[4][8];
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    ld8(queries + (size_t)q * H + c0, qv[q]);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) qv[q][e] = __fmul_rn(qv[q][e], qsc);
+  }
+  for (int t = t0; t < t1; ++t) {
+    float x0[8], x1[8];
+    ld8(msrc0 + (size_t)t * H + c0, x0);
+    ld8(msrc1 + (size_t)t * H + c0, x1);
+    float v[10];
+    float ss0 = 0.f, ss1 = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      ss0 = __fadd_rn(ss0, __fmul_rn(x0[e], x0[e]));
+      ss1 = __fadd_rn(ss1, __fmul_rn(x1[e], x1[e]));
+    }
+    v[0] = ss0;
+    v[1] = ss1;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      float d0 = 0.f, d1 = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        d0 = __fadd_rn(d0, __fmul_rn(x0[e], qv[q][e]));
+        d1 = __fadd_rn(d1, __fmul_rn(x1[e], qv[q][e]));
+      }
+      v[2 + 2 * q] = d0;
+      v[2 + 2 * q + 1] = d1;
+    }
+    block_sum288<10>(v, sh[(t - t0) & 1]);
+    if (threadIdx.x < 4) {
+      const int q = threadIdx.x;
+      const float rstd0 = rsqrtf(__fmaf_rn(v[0], invH, eps));
+      const float rstd1 = rsqrtf(__fmaf_rn(v[1], invH, eps));
+      const float l0 = __fmul_rn(v[2 + 2 * q], rstd0);
+      const float l1 = __fmul_rn(v[2 + 2 * q + 1], rstd1);
+      const float mx = fmaxf(l0, l1);
+      const float p0_raw = expf(__fadd_rn(l0, -mx));
+      const float p1_raw = expf(__fadd_rn(l1, -mx));
+      const float sum = __fadd_rn(p0_raw, p1_raw);
+      const float inv = __fdiv_rn(1.0f, sum);
+      const float p0 = __fmul_rn(p0_raw, rstd0);
+      const float p1 = __fmul_rn(p1_raw, rstd1);
+      *reinterpret_cast<float4*>(mw + ((size_t)i * T + t) * 16 + q * 4) = make_float4(p0, p1, inv, 0.f);
+    }
+  }
+}
+
+__global__ void __launch_bounds__(288) ar288_g3_vmsg_kernel(
+    glue::ResSrc s, const float* __restrict__ queries, float* __restrict__ out, float eps,
+    const bf16* __restrict__ msrc0, const bf16* __restrict__ msrc1, const float* __restrict__ mw,
+    bf16* __restrict__ gin, long long gs, int T) {
+  __shared__ float sh1[9 * 10];
+  __shared__ float sh2[9 * 4];
+  const int t = blockIdx.x, c0 = threadIdx.x * 8;
+  if (t >= T) return;
+  const int N = s.nb + 1;
+  float xs[5][8];
+#pragma unroll
+  for (int n = 0; n < 5; ++n) {
+    if (n < s.nb) ld8(s.blk[n] + (size_t)t * H + c0, xs[n]);
+    else if (n == s.nb) {
+      if (s.last32) ld8(s.last32 + (size_t)t * s.ld_last + c0, xs[n]);
+      else ld8(s.last16 + (size_t)t * s.ld_last + c0, xs[n]);
+    }
+  }
+  float res[8];
+  ar288_finish(xs, N, queries, c0, eps, sh1, res);
+  st8(out + (size_t)t * H + c0, res);
+  float x0[8], x1[8];
+  ld8(msrc0 + (size_t)t * H + c0, x0);
+  ld8(msrc1 + (size_t)t * H + c0, x1);
+  float4 mwv[3];
+#pragma unroll
+  for (int y = 0; y < 3; ++y) mwv[y] = *reinterpret_cast<const float4*>(mw + (size_t)t * 16 + y * 4);
+  float u[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    u[0] = __fadd_rn(u[0], __fmul_rn(res[e], res[e]));
+#pragma unroll
+    for (int y = 0; y < 3; ++y) {
+      const float m = __fmul_rn(__fmaf_rn(mwv[y].y, x1[e], __fmaf_rn(mwv[y].x, x0[e], 0.f)), mwv[y].z);
+      u[1 + y] = __fadd_rn(u[1 + y], __fmul_rn(m, m));
+    }
+  }
+  block_sum288<4>(u, sh2);
+  const float ra = glue::rstd_of(u[0], H, eps);
+  float ya[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) ya[e] = __fmul_rn(res[e], ra);
+  const uint4 ya_u4 = pack8(ya);
+#pragma unroll
+  for (int y = 0; y < 3; ++y) {
+    const float rb = glue::rstd_of(u[1 + y], H, eps);
+    float yb[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const float m = __fmul_rn(__fmaf_rn(mwv[y].y, x1[e], __fmaf_rn(mwv[y].x, x0[e], 0.f)), mwv[y].z);
+      yb[e] = __fmul_rn(m, rb);
+    }
+    bf16* gdst = gin + (size_t)y * gs + (size_t)t * 2 * H;
+    *reinterpret_cast<uint4*>(gdst + c0) = ya_u4;
+    st8(gdst + H + c0, yb);
+  }
+}
+
+__global__ void __launch_bounds__(288) ar288_q3g3_vmsg_kernel(
+    glue::ResSrc s, const float* __restrict__ queries, float* __restrict__ out, float eps,
+    const bf16* __restrict__ msrc0, const bf16* __restrict__ msrc1, const float* __restrict__ mw,
+    bf16* __restrict__ gin, long long gs, int T) {
+  __shared__ float sh1[9 * 20];
+  __shared__ float sh2[9 * 6];
+  const int t = blockIdx.x, c0 = threadIdx.x * 8;
+  if (t >= T) return;
+  const int N = s.nb + 1;
+  const float qsc = (float)(1.0 / 48.0);
+  const float invH = (float)(1.0 / 2304.0);
+  float xs[5][8];
+#pragma unroll
+  for (int n = 0; n < 5; ++n) {
+    if (n < s.nb) ld8(s.blk[n] + (size_t)t * H + c0, xs[n]);
+    else if (n == s.nb) {
+      if (s.last32) ld8(s.last32 + (size_t)t * s.ld_last + c0, xs[n]);
+      else ld8(s.last16 + (size_t)t * s.ld_last + c0, xs[n]);
+    }
+  }
+  float v[20];
+#pragma unroll
+  for (int i = 0; i < 20; ++i) v[i] = 0.f;
+#pragma unroll
+  for (int n = 0; n < 5; ++n) {
+    if (n < N) {
+      float ss = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) ss = __fadd_rn(ss, __fmul_rn(xs[n][e], xs[n][e]));
+      v[4 * n] = ss;
+    }
+  }
+#pragma unroll
+  for (int q = 0; q < 3; ++q) {
+    float qv[8];
+    ld8(queries + (size_t)q * H + c0, qv);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) qv[e] = __fmul_rn(qv[e], qsc);
+#pragma unroll
+    for (int n = 0; n < 5; ++n) {
+      if (n < N) {
+        float dq = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) dq = __fadd_rn(dq, __fmul_rn(xs[n][e], qv[e]));
+        v[4 * n + 1 + q] = dq;
+      }
+    }
+  }
+  block_sum288<20>(v, sh1);
+  float rstd[5];
+#pragma unroll
+  for (int n = 0; n < 5; ++n) rstd[n] = n < N ? rsqrtf(__fmaf_rn(v[4 * n], invH, eps)) : 0.f;
+  float res[3][8];
+#pragma unroll
+  for (int q = 0; q < 3; ++q) {
+    float l[5], p[5], mx = -INFINITY;
+#pragma unroll
+    for (int n = 0; n < 5; ++n) {
+      if (n < N) { l[n] = __fmul_rn(v[4 * n + 1 + q], rstd[n]); mx = fmaxf(mx, l[n]); }
+      else l[n] = 0.f;
+    }
+    float sum = 0.f;
+#pragma unroll
+    for (int n = 0; n < 5; ++n) {
+      if (n < N) { p[n] = expf(__fadd_rn(l[n], -mx)); sum = __fadd_rn(sum, p[n]); }
+      else p[n] = 0.f;
+    }
+    const float inv = __fdiv_rn(1.0f, sum);
+#pragma unroll
+    for (int n = 0; n < 5; ++n)
+      if (n < N) p[n] = __fmul_rn(p[n], rstd[n]);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      float acc = 0.f;
+#pragma unroll
+      for (int n = 0; n < 5; ++n)
+        if (n < N) acc = __fmaf_rn(p[n], xs[n][e], acc);
+      res[q][e] = __fmul_rn(acc, inv);
+    }
+    st8(out + ((size_t)t * 3 + q) * H + c0, res[q]);
+  }
+  float x0[8], x1[8];
+  ld8(msrc0 + (size_t)t * H + c0, x0);
+  ld8(msrc1 + (size_t)t * H + c0, x1);
+  float4 mwv[3];
+#pragma unroll
+  for (int q = 0; q < 3; ++q) mwv[q] = *reinterpret_cast<const float4*>(mw + (size_t)t * 16 + q * 4);
+  float u[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int q = 0; q < 3; ++q) {
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const float m = __fmul_rn(__fmaf_rn(mwv[q].y, x1[e], __fmaf_rn(mwv[q].x, x0[e], 0.f)), mwv[q].z);
+      u[2 * q] = __fadd_rn(u[2 * q], __fmul_rn(res[q][e], res[q][e]));
+      u[2 * q + 1] = __fadd_rn(u[2 * q + 1], __fmul_rn(m, m));
+    }
+  }
+  block_sum288<6>(u, sh2);
+#pragma unroll
+  for (int q = 0; q < 3; ++q) {
+    const float ra = glue::rstd_of(u[2 * q], H, eps);
+    const float rb = glue::rstd_of(u[2 * q + 1], H, eps);
+    float ya[8], yb[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const float m = __fmul_rn(__fmaf_rn(mwv[q].y, x1[e], __fmaf_rn(mwv[q].x, x0[e], 0.f)), mwv[q].z);
+      ya[e] = __fmul_rn(res[q][e], ra);
+      yb[e] = __fmul_rn(m, rb);
+    }
+    bf16* gdst = gin + (size_t)q * gs + (size_t)t * 2 * H;
+    st8(gdst + c0, ya);
+    st8(gdst + H + c0, yb);
+  }
+}
+
+__global__ void __launch_bounds__(288) conv_ar_gate288_vmsg_kernel(
+    const bf16* __restrict__ ax, const float* __restrict__ cw, const bf16* __restrict__ state,
+    long long st_slot_stride, glue::Rows R, const bf16* __restrict__ hin, int block_start,
+    bf16* __restrict__ blk_out, float* __restrict__ partial32, glue::ResSrc s,
+    const float* __restrict__ query, float* __restrict__ ar_out, float eps,
+    const bf16* __restrict__ msrc0, const bf16* __restrict__ msrc1, const float* __restrict__ mw,
+    bf16* __restrict__ gin, int T) {
+  __shared__ float sh1[2][9 * 10];
+  __shared__ float sh2[2][9 * 2];
+  const int c0 = threadIdx.x * 8;
+  const int t0 = blockIdx.x * kConvArRows, t1 = min(T, t0 + kConvArRows);
+  float wv[8][4];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    const float4 q = *reinterpret_cast<const float4*>(cw + (size_t)(c0 + e) * 4);
+    wv[e][0] = q.x; wv[e][1] = q.y; wv[e][2] = q.z; wv[e][3] = q.w;
+  }
+  const float qsc = (float)(1.0 / 48.0);
+  float qv[8];
+  ld8(query + c0, qv);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) qv[e] = __fmul_rn(qv[e], qsc);
+  uint4 prev[3];
+#pragma unroll
+  for (int j = 0; j < 3; ++j) {
+    const int r = t0 - 3 + j;
+    prev[j] = r >= 0 ? *reinterpret_cast<const uint4*>(ax + (size_t)r * H + c0) : make_uint4(0, 0, 0, 0);
+  }
+  constexpr float kInv5 = (float)(1.0 / 2.23606797749979);
+  const int nb_prev = s.nb;
+  const int N = nb_prev + (block_start ? 2 : 1);
+  for (int t = t0; t < t1; ++t) {
+    const int pb = (t - t0) & 1;
+    const size_t o = (size_t)t * H + c0;
+    const uint4 cur_u4 = *reinterpret_cast<const uint4*>(ax + o);
+    float cur[8], ex[3][8];
+    unpack8(cur_u4, cur);
+    const int seg = R.seg[t], i = t - R.row0[seg];
+    const bf16* st = state + (size_t)R.slot[seg] * st_slot_stride;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+      if (i + j < 3) ld8(st + (size_t)(i + j) * glue::SLD + c0, ex[j]);
+      else unpack8(prev[j], ex[j]);
+    }
+    float y[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      float acc = __fmul_rn(wv[e][0], ex[0][e]);
+      acc = __fadd_rn(acc, __fmul_rn(wv[e][1], ex[1][e]));
+      acc = __fadd_rn(acc, __fmul_rn(wv[e][2], ex[2][e]));
+      acc = __fadd_rn(acc, __fmul_rn(wv[e][3], cur[e]));
+      y[e] = glue::rr16(__fmul_rn(__fadd_rn(acc, cur[e]), kInv5));
+    }
+    prev[0] = prev[1];
+    prev[1] = prev[2];
+    prev[2] = cur_u4;
+    const uint4 h_raw = *reinterpret_cast<const uint4*>(hin + o);
+    float h_v[8], p_v[8];
+    unpack8(h_raw, h_v);
+    if (block_start) {
+      *reinterpret_cast<uint4*>(blk_out + o) = h_raw;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) p_v[e] = y[e];
+    } else {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) p_v[e] = __fadd_rn(h_v[e], y[e]);
+    }
+    st8(partial32 + o, p_v);
+    float xs[5][8];
+#pragma unroll
+    for (int n = 0; n < 5; ++n) {
+      if (n < nb_prev) ld8(s.blk[n] + o, xs[n]);
+      else if (block_start && n == nb_prev) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) xs[n][e] = h_v[e];
+      } else if (n == N - 1) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) xs[n][e] = p_v[e];
+      }
+    }
+    float res[8];
+    ar288_finish_qv(xs, N, qv, eps, sh1[pb], res);
+    st8(ar_out + o, res);
+    float x0[8], x1[8], mv[8];
+    ld8(msrc0 + o, x0);
+    ld8(msrc1 + o, x1);
+    const float4 mw3 = *reinterpret_cast<const float4*>(mw + (size_t)t * 16 + 12);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) mv[e] = __fmul_rn(__fmaf_rn(mw3.y, x1[e], __fmaf_rn(mw3.x, x0[e], 0.f)), mw3.z);
+    float u[2] = {0.f, 0.f};
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      u[0] = __fadd_rn(u[0], __fmul_rn(res[e], res[e]));
+      u[1] = __fadd_rn(u[1], __fmul_rn(mv[e], mv[e]));
+    }
+    block_sum288<2>(u, sh2[pb]);
+    const float ra = glue::rstd_of(u[0], H, eps);
+    const float rb = glue::rstd_of(u[1], H, eps);
+    float ya[8], yb[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      ya[e] = __fmul_rn(res[e], ra);
+      yb[e] = __fmul_rn(mv[e], rb);
+    }
+    bf16* gdst = gin + (size_t)t * 2 * H;
+    st8(gdst + c0, ya);
+    st8(gdst + H + c0, yb);
+  }
+}
+
+struct MgTcVmsg {
+  const bf16* gd[4];
+  const bf16* W[4];
+  const float* hid[4];
+  const bf16* msrc0;
+  const bf16* msrc1;
+  const float* mw;
+  float* out[4];
+};
+__global__ void __launch_bounds__(128) mg_tail_tc_vmsg_kernel(MgTcVmsg m, int T, int ldh, int ldo, int q_off) {
+  const int z = blockIdx.z, n0 = blockIdx.x * 128, t0 = blockIdx.y * kTcRows;
+  __shared__ __align__(16) bf16 sa[kTcRows * kTcLd];
+  __shared__ __align__(16) bf16 sb[2][128 * kTcLd];
+  const int tid = threadIdx.x;
+  for (int i = tid; i < kTcRows * 8; i += 128) {
+    const int r = i / 8, c = i % 8;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (t0 + r < T) v = *reinterpret_cast<const uint4*>(m.gd[z] + (size_t)(t0 + r) * 64 + 8 * c);
+    *reinterpret_cast<uint4*>(sa + r * kTcLd + 8 * c) = v;
+  }
+  for (int i = tid; i < 2 * 128 * 8; i += 128) {
+    const int w = i / 1024, r = (i / 8) % 128, c = i % 8;
+    *reinterpret_cast<uint4*>(sb[w] + r * kTcLd + 8 * c) =
+        *reinterpret_cast<const uint4*>(m.W[z] + ((size_t)w * H + n0 + r) * 64 + 8 * c);
+  }
+  __syncthreads();
+  const int warp = tid >> 5, lane = tid & 31, gq = lane >> 2, t4 = lane & 3;
+  float acc[2][2][4][4];
+#pragma unroll
+  for (int w = 0; w < 2; ++w)
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) acc[w][i][j][e] = 0.f;
+  auto u32 = [](const bf16* p) { return *reinterpret_cast<const uint32_t*>(p); };
+#pragma unroll
+  for (int ks = 0; ks < 4; ++ks) {
+    const int k0 = 16 * ks + 2 * t4;
+    uint32_t a[2][4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const bf16* r0 = sa + (16 * i + gq) * kTcLd, *r1 = r0 + 8 * kTcLd;
+      a[i][0] = u32(r0 + k0); a[i][1] = u32(r1 + k0); a[i][2] = u32(r0 + k0 + 8); a[i][3] = u32(r1 + k0 + 8);
+    }
+#pragma unroll
+    for (int w = 0; w < 2; ++w)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const bf16* bn = sb[w] + (32 * warp + 8 * j + gq) * kTcLd;
+        const uint32_t b0 = u32(bn + k0), b1 = u32(bn + k0 + 8);
+#pragma unroll
+        for (int i = 0; i < 2; ++i) mma16816(acc[w][i][j], a[i], b0, b1);
+      }
+  }
+  __syncthreads();
+  // Reuse sb (36,864 B >= 16,896 + 8,704 + 8,704 + 512 = 34,816 B): coalesced hid (f32) + L2-hot msrc0/1 (bf16)!
+  constexpr int kTcSmemLd = 132;
+  constexpr int kTcBf16Ld = 136;
+  uint8_t* raw = reinterpret_cast<uint8_t*>(sb);
+  float* shid = reinterpret_cast<float*>(raw);
+  bf16* sm0 = reinterpret_cast<bf16*>(raw + kTcRows * kTcSmemLd * sizeof(float));
+  bf16* sm1 = reinterpret_cast<bf16*>(raw + kTcRows * kTcSmemLd * sizeof(float) + kTcRows * kTcBf16Ld * sizeof(bf16));
+  float4* smw = reinterpret_cast<float4*>(raw + kTcRows * kTcSmemLd * sizeof(float) + 2 * kTcRows * kTcBf16Ld * sizeof(bf16));
+  const float* hid = m.hid[z];
+  float* out = m.out[z];
+  const int nr = min(kTcRows, T - t0);
+  if (tid < nr) {
+    smw[tid] = *reinterpret_cast<const float4*>(m.mw + ((size_t)(t0 + tid) * 4 + (q_off + z)) * 4);
+  }
+  for (int idx = tid; idx < nr * 32; idx += 128) {
+    const int r = idx >> 5, c = idx & 31;
+    *reinterpret_cast<float4*>(shid + r * kTcSmemLd + c * 4) =
+        *reinterpret_cast<const float4*>(hid + (size_t)(t0 + r) * ldh + n0 + c * 4);
+  }
+  for (int idx = tid; idx < nr * 16; idx += 128) {
+    const int r = idx >> 4, c = idx & 15;
+    *reinterpret_cast<uint4*>(sm0 + r * kTcBf16Ld + c * 8) =
+        *reinterpret_cast<const uint4*>(m.msrc0 + (size_t)(t0 + r) * H + n0 + c * 8);
+    *reinterpret_cast<uint4*>(sm1 + r * kTcBf16Ld + c * 8) =
+        *reinterpret_cast<const uint4*>(m.msrc1 + (size_t)(t0 + r) * H + n0 + c * 8);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < 2; ++i)
+#pragma unroll
+    for (int hf = 0; hf < 2; ++hf) {
+      const int r = 16 * i + gq + 8 * hf;
+      if (r >= nr) continue;
+      const float4 mwv = smw[r];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int lc = 32 * warp + 8 * j + 2 * t4;
+        const float2 hv = *reinterpret_cast<const float2*>(shid + r * kTcSmemLd + lc);
+        const uint32_t u0 = *reinterpret_cast<const uint32_t*>(sm0 + r * kTcBf16Ld + lc);
+        const uint32_t u1 = *reinterpret_cast<const uint32_t*>(sm1 + r * kTcBf16Ld + lc);
+        const float2 x0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u0));
+        const float2 x1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u1));
+        const float mvx = __fmul_rn(__fmaf_rn(mwv.y, x1.x, __fmaf_rn(mwv.x, x0.x, 0.f)), mwv.z);
+        const float mvy = __fmul_rn(__fmaf_rn(mwv.y, x1.y, __fmaf_rn(mwv.x, x0.y, 0.f)), mwv.z);
+        float2 o;
+        {
+          const float f = tanhf(acc[0][i][j][2 * hf]), a = tanhf(acc[1][i][j][2 * hf]);
+          o.x = __fadd_rn(__fmul_rn(__fadd_rn(1.0f, -f), hv.x), __fmul_rn(a, mvx));
+        }
+        {
+          const float f = tanhf(acc[0][i][j][2 * hf + 1]), a = tanhf(acc[1][i][j][2 * hf + 1]);
+          o.y = __fadd_rn(__fmul_rn(__fadd_rn(1.0f, -f), hv.y), __fmul_rn(a, mvy));
+        }
+        *reinterpret_cast<float2*>(shid + r * kTcSmemLd + lc) = o;
+      }
+    }
+  __syncthreads();
+  for (int idx = tid; idx < nr * 32; idx += 128) {
+    const int r = idx >> 5, c = idx & 31;
+    *reinterpret_cast<float4*>(out + (size_t)(t0 + r) * ldo + n0 + c * 4) =
+        *reinterpret_cast<const float4*>(shid + r * kTcSmemLd + c * 4);
+  }
+}
+
+// 3A-3: Zero-split QKV post reading directly from fused projection qkvf [T, nt] (a.relk).
+// 1 row/CTA across all 4 y-blocks (zero tail wave): Q warps copy gate + sink into contiguous buffers so prefill_attn
+// stays untouched; KV warps write kx/vx ONLY for conv_commit tail rows. Bit-identical to proj_split + qkv_post_rows.
+template <bool FP8, class PoolT>
+__device__ __forceinline__ void qkv_post_fused_body(
+    const bf16* __restrict__ qkvf, int nt, const float* __restrict__ q_scale, const float* __restrict__ r_scale,
+    const int* __restrict__ row_pos, int full, int T, bf16* __restrict__ q, bf16* __restrict__ rel,
+    bf16* __restrict__ gate, bf16* __restrict__ sink, bf16* __restrict__ kx, bf16* __restrict__ vx,
+    const bf16* __restrict__ kst, const bf16* __restrict__ vst, long long st_slot_stride, glue::Rows R,
+    const int* __restrict__ seg_len, const float* __restrict__ kw, const float* __restrict__ vw, float eps,
+    PoolT* __restrict__ kpool, PoolT* __restrict__ vpool, const int* __restrict__ pt, int pt_stride) {
+  using glue::ld;
+  using glue::rr16;
+  const int t = blockIdx.x, hh = blockIdx.y * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  if (t >= T) return;
+  constexpr int HD = glue::HD;
+  constexpr int QD = NH * HD;
+  constexpr int NQ = 2 * QD + NH * DREL + NH;  // 6552
+  const int d0 = 4 * lane;
+  const bf16* row = qkvf + (size_t)t * nt;
+  if (hh < NH) {
+    *reinterpret_cast<uint2*>(gate + ((size_t)t * NH + hh) * HD + d0) =
+        *reinterpret_cast<const uint2*>(row + QD + hh * HD + d0);
+    if (lane == 0) sink[(size_t)t * NH + hh] = row[2 * QD + NH * DREL + hh];
+    float y[4], r[4] = {0.f, 0.f, 0.f, 0.f}, v[4][2], a[4], b[4];
+    ld4(row + hh * HD + d0, a);
+    ld4(q_scale + hh * HD + d0, b);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) y[e] = __fmul_rn(a[e], b[e]);
+    if (d0 < DREL) {
+      ld4(row + 2 * QD + hh * DREL + d0, a);
+      ld4(r_scale + hh * DREL + d0, b);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) r[e] = __fmul_rn(a[e], b[e]);
+    }
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      v[e][0] = __fmul_rn(y[e], y[e]);
+      v[e][1] = __fmul_rn(r[e], r[e]);
+    }
+    bsum4c<2>(v);
+    auto clipf = [](float s2, float thr) {
+      const float norm = s2 > 0.f ? __fmul_rn(s2, rsqrtf(s2)) : 0.f;
+      return fminf(__fdiv_rn(thr, __fadd_rn(norm, 1e-6f)), 1.0f);
+    };
+    const float cq = clipf(v[0][0], 22.627416997969522f), cr = clipf(v[0][1], 8.0f);
+    const float tau = full ? glue::tau_of(row_pos[t]) : 1.f;
+    float qo[4], ro[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      qo[e] = rr16(__fmul_rn(y[e], cq));
+      ro[e] = rr16(__fmul_rn(r[e], cr));
+      if (full) {
+        qo[e] = rr16(__fmul_rn(qo[e], tau));
+        ro[e] = rr16(__fmul_rn(ro[e], tau));
+      }
+    }
+    st4(q + ((size_t)t * NH + hh) * HD + d0, qo);
+    if (d0 < DREL) st4(rel + ((size_t)t * NH + hh) * DREL + d0, ro);
+    return;
+  }
+  const int g = hh - NH;
+  const int s = R.seg[t], r0 = R.row0[s], i = t - r0;
+  const int slen = seg_len[s];
+  const bf16* ks = kst + (size_t)R.slot[s] * st_slot_stride;
+  const bf16* vs = vst + (size_t)R.slot[s] * st_slot_stride;
+  const int c0 = g * HD + d0;
+  const int nk = 1024 + (full ? 32 : 0);
+  const int k_off = NQ + c0;
+  const int v_off = NQ + nk + c0;
+  const int kd_off = NQ + 1024 + g * 4;
+  const int vd_off = NQ + nk + 1024 + g * 4;
+  const uint2 uk = *reinterpret_cast<const uint2*>(row + k_off);
+  const uint2 uv = *reinterpret_cast<const uint2*>(row + v_off);
+  if (slen <= 16 || i + 3 >= slen) {
+    *reinterpret_cast<uint2*>(kx + (size_t)t * 1024 + c0) = uk;
+    *reinterpret_cast<uint2*>(vx + (size_t)t * 1024 + c0) = uv;
+  }
+  auto conv = [&](const float* w, int x_off, const bf16* st, int dy_off, const uint2 u_cur, float (&out)[4]) {
+    float xw[4][4], xt[4];
+    {
+      const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u_cur);
+      const float2 a = __bfloat1622float2(h[0]), b = __bfloat1622float2(h[1]);
+      xt[0] = a.x; xt[1] = a.y; xt[2] = b.x; xt[3] = b.y;
+    }
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+      if (i + j < 3) ld4(st + (size_t)(i + j) * glue::SLD + c0, xw[j]);
+      else ld4(qkvf + (size_t)(t + j - 3) * nt + x_off, xw[j]);
+    }
+    if (!full) {
+      float wv[4][4];
+#pragma unroll
+      for (int e = 0; e < 4; ++e) ld4(w + (size_t)(c0 + e) * 4, wv[e]);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        float acc = __fmul_rn(wv[e][0], xw[0][e]);
+        acc = __fadd_rn(acc, __fmul_rn(wv[e][1], xw[1][e]));
+        acc = __fadd_rn(acc, __fmul_rn(wv[e][2], xw[2][e]));
+        acc = __fadd_rn(acc, __fmul_rn(wv[e][3], xt[e]));
+        out[e] = __fmul_rn(__fadd_rn(acc, xt[e]), (float)(1.0 / 2.23606797749979));
+      }
+    } else {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) xw[3][e] = xt[e];
+      float acc[4];
+#pragma unroll
+      for (int lag = 0; lag < 4; ++lag) {
+        float sw[4];
+        ld4(w + lag * 1024 + c0, sw);
+        const float dv = ld(row + dy_off + lag);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const float wl = __fadd_rn(sw[e], dv);
+          acc[e] = lag == 0 ? __fmul_rn(wl, xw[3 - lag][e]) : __fmaf_rn(wl, xw[3 - lag][e], acc[e]);
+        }
+      }
+#pragma unroll
+      for (int e = 0; e < 4; ++e) out[e] = __fmul_rn(__fadd_rn(acc[e], xt[e]), (float)(1.0 / 3.0));
+    }
+  };
+  float ck[4], cv[4], v[4][2];
+  conv(kw, k_off, ks, kd_off, uk, ck);
+  conv(vw, v_off, vs, vd_off, uv, cv);
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    ck[e] = rr16(ck[e]);
+    cv[e] = rr16(cv[e]);
+    v[e][0] = __fmul_rn(ck[e], ck[e]);
+    v[e][1] = __fmul_rn(cv[e], cv[e]);
+  }
+  bsum4c<2>(v);
+  const float norm = v[0][0] > 0.f ? __fmul_rn(v[0][0], rsqrtf(v[0][0])) : 0.f;
+  const float f = fminf(__fdiv_rn(22.627416997969522f, __fadd_rn(norm, 1e-6f)), 1.0f);
+  const float rv = glue::rstd_of(v[0][1], HD, eps);
+  const int pos = R.pos[t];
+  const int page = pt[(size_t)s * pt_stride + (pos >> 10)];
+  float ko[4], vo[4];
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    ko[e] = __fmul_rn(ck[e], f);
+    vo[e] = __fmul_rn(cv[e], rv);
+  }
+  const size_t off = (((size_t)page * glue::KVH + g) * 1024 + (pos & 1023)) * HD + d0;
+  if constexpr (FP8) {
+    st4_e4m3(kpool + off, ko);
+    st4_e4m3(vpool + off, vo);
+  } else {
+    st4(kpool + off, ko);
+    st4(vpool + off, vo);
+  }
+}
+
+__global__ void __launch_bounds__(256) qkv_post_fused_rows_kernel(
+    const bf16* qkvf, int nt, const float* q_scale, const float* r_scale, const int* row_pos, int full, int T,
+    bf16* q, bf16* rel, bf16* gate, bf16* sink, bf16* kx, bf16* vx, const bf16* kst, const bf16* vst,
+    long long st_slot_stride, glue::Rows R, const int* seg_len, const float* kw, const float* vw, float eps,
+    bf16* kpool, bf16* vpool, const int* pt, int pt_stride) {
+  qkv_post_fused_body<false>(qkvf, nt, q_scale, r_scale, row_pos, full, T, q, rel, gate, sink, kx, vx, kst, vst,
+                             st_slot_stride, R, seg_len, kw, vw, eps, kpool, vpool, pt, pt_stride);
+}
+
+__global__ void __launch_bounds__(256) qkv_post_fused_rows_fp8_kernel(
+    const bf16* qkvf, int nt, const float* q_scale, const float* r_scale, const int* row_pos, int full, int T,
+    bf16* q, bf16* rel, bf16* gate, bf16* sink, bf16* kx, bf16* vx, const bf16* kst, const bf16* vst,
+    long long st_slot_stride, glue::Rows R, const int* seg_len, const float* kw, const float* vw, float eps,
+    uint8_t* kpool, uint8_t* vpool, const int* pt, int pt_stride) {
+  qkv_post_fused_body<true>(qkvf, nt, q_scale, r_scale, row_pos, full, T, q, rel, gate, sink, kx, vx, kst, vst,
+                            st_slot_stride, R, seg_len, kw, vw, eps, kpool, vpool, pt, pt_stride);
+}
+
+// 3A-5a: Fast __match_any_sync prefill MoE routing build (kBuildRowsFast = 512, 4x fewer blocks, O(1) scatter).
+// Bit-identical outputs to moe_count_kernel + moe_plan_kernel + moe_scatter_kernel.
+constexpr int kBuildRowsFast = 512;
+__global__ void __launch_bounds__(256) moe_count_fast_kernel(const int* __restrict__ idx, int R, int* __restrict__ cntb) {
+  __shared__ uint16_t wcnt[16][pmoe::E];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  uint32_t* w32 = reinterpret_cast<uint32_t*>(wcnt);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) w32[tid + i * 256] = 0u;
+  __syncthreads();
+  const int r0 = blockIdx.x * kBuildRowsFast;
+#pragma unroll
+  for (int pass = 0; pass < 2; ++pass) {
+    const int w = warp + pass * 8;
+    const int r = r0 + (w << 5) + lane;
+    const bool ok = r < R;
+    const int e = ok ? idx[r] : -1;
+    const unsigned active = __ballot_sync(0xffffffffu, ok);
+    if (ok) {
+      const unsigned m = __match_any_sync(active, e);
+      if ((m & ((1u << lane) - 1u)) == 0u) wcnt[w][e] = static_cast<uint16_t>(__popc(m));
+    }
+  }
+  __syncthreads();
+  if (tid < pmoe::E) {
+    int s = 0;
+#pragma unroll
+    for (int w = 0; w < 16; ++w) s += wcnt[w][tid];
+    cntb[blockIdx.x * pmoe::E + tid] = s;
+  }
+}
+
+__global__ void __launch_bounds__(512) moe_plan_fast_kernel(const int* __restrict__ cntb, int nb,
+                                                            int* __restrict__ baseb, pmoe::Item* __restrict__ items,
+                                                            int* __restrict__ n_items) {
+  __shared__ int cnt[pmoe::E], eoff[pmoe::E + 1], order[pmoe::E], tiles[pmoe::E], ioff[pmoe::E + 1];
+  const int tid = threadIdx.x;
+  if (tid < pmoe::E) {
+    int c = 0;
+    for (int b = 0; b < nb; ++b) c += cntb[b * pmoe::E + tid];
+    cnt[tid] = c;
+  }
+  __syncthreads();
+  // Overlap warp 0 scan128 with 4-thread-per-expert rank sort (warps 0..15) after scan128? Just run parallel rank sort then scan128
+  {
+    const int e = tid >> 2, q = tid & 3;
+    const int ce = cnt[e];
+    int rk = 0;
+    const int f0 = q * 32;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+      const int f = f0 + j;
+      rk += cnt[f] > ce || (cnt[f] == ce && f < e);
+    }
+    rk += __shfl_xor_sync(0xffffffffu, rk, 1);
+    rk += __shfl_xor_sync(0xffffffffu, rk, 2);
+    if (q == 0) order[rk] = e;
+  }
+  __syncthreads();
+  moedev::scan128(cnt, eoff);
+  __syncthreads();
+  if (tid < pmoe::E) {
+    int base = eoff[tid];
+    for (int b = 0; b < nb; ++b) {
+      baseb[b * pmoe::E + tid] = base;
+      base += cntb[b * pmoe::E + tid];
+    }
+    const int x = order[tid], cx = cnt[x], nt = (cx + pmoe::BN - 1) >> 7;
+    tiles[tid] = moedev::FT * nt;
+  }
+  __syncthreads();
+  moedev::scan128(tiles, ioff);
+  __syncthreads();
+  if (tid == 0) *n_items = ioff[pmoe::E];
+  if (tid < pmoe::E) {
+    const int x = order[tid], cx = cnt[x], nt = (cx + pmoe::BN - 1) >> 7;
+    int o = ioff[tid];
+    for (int ft = 0; ft < moedev::FT; ++ft)
+      for (int t = 0; t < nt; ++t) items[o++] = {x, ft, eoff[x] + t * pmoe::BN, min(pmoe::BN, cx - t * pmoe::BN)};
+  }
+}
+
+__global__ void __launch_bounds__(256) moe_scatter_fast_kernel(const int* __restrict__ idx, const float* __restrict__ wts,
+                                                               int R, const int* __restrict__ baseb,
+                                                               int* __restrict__ a13, int* __restrict__ a2,
+                                                               int* __restrict__ orow, float* __restrict__ gamma) {
+  __shared__ uint16_t wcnt[16][pmoe::E];
+  __shared__ int sbase[pmoe::E];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  uint32_t* w32 = reinterpret_cast<uint32_t*>(wcnt);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) w32[tid + i * 256] = 0u;
+  if (tid < pmoe::E) sbase[tid] = baseb[blockIdx.x * pmoe::E + tid];
+  __syncthreads();
+  const int r0 = blockIdx.x * kBuildRowsFast;
+  int e_reg[2] = {-1, -1};
+  float w_reg[2] = {0.f, 0.f};
+  int rnk_reg[2] = {0, 0};
+#pragma unroll
+  for (int pass = 0; pass < 2; ++pass) {
+    const int w = warp + pass * 8;
+    const int r = r0 + (w << 5) + lane;
+    const bool ok = r < R;
+    const int e = ok ? idx[r] : -1;
+    if (ok) {
+      e_reg[pass] = e;
+      w_reg[pass] = wts[r];
+    }
+    const unsigned active = __ballot_sync(0xffffffffu, ok);
+    if (ok) {
+      const unsigned m = __match_any_sync(active, e);
+      const unsigned lower = m & ((1u << lane) - 1u);
+      rnk_reg[pass] = __popc(lower);
+      if (lower == 0u) wcnt[w][e] = static_cast<uint16_t>(__popc(m));
+    }
+  }
+  __syncthreads();
+  if (tid < pmoe::E) {
+    int s = 0;
+#pragma unroll
+    for (int w = 0; w < 16; ++w) {
+      const int c = wcnt[w][tid];
+      wcnt[w][tid] = static_cast<uint16_t>(s);
+      s += c;
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int pass = 0; pass < 2; ++pass) {
+    const int e = e_reg[pass];
+    if (e >= 0) {
+      const int w = warp + pass * 8;
+      const int r = r0 + (w << 5) + lane;
+      const int p = sbase[e] + static_cast<int>(wcnt[w][e]) + rnk_reg[pass];
+      a13[p] = r >> 3;
+      a2[p] = p;
+      orow[p] = r;
+      gamma[p] = w_reg[pass];
+    }
+  }
+}
+
+// 3A-5b: 4-warp-per-CTA route_select with parallel 8-lane softmax (bit-identical to glue::route_select_kernel).
+// Grid (ceil(T / 4), 1, 1), block 128.
+__global__ void __launch_bounds__(128) route_select_rows_kernel(const float* __restrict__ g, int T,
+                                                                const float* __restrict__ bias,
+                                                                int* __restrict__ idx, float* __restrict__ wts) {
+  const int t = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  if (t >= T) return;
+  float lgv[4], key[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int e = lane + 32 * i;
+    const float l = __fadd_rn(__fadd_rn(g[(size_t)t * glue::NEXP + e], g[((size_t)T + t) * glue::NEXP + e]),
+                              g[((size_t)2 * T + t) * glue::NEXP + e]);
+    lgv[i] = l;
+    key[i] = __fadd_rn(__fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-l))), bias[e]);
+  }
+  unsigned used = 0;
+  int sel[glue::TOPK];
+  float sl[glue::TOPK];
+#pragma unroll
+  for (int j = 0; j < glue::TOPK; ++j) {
+    float bk = -INFINITY;
+    int be = 1 << 30;
+    float bl = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      if (!((used >> i) & 1) && (key[i] > bk || (key[i] == bk && lane + 32 * i < be))) {
+        bk = key[i]; be = lane + 32 * i; bl = lgv[i];
+      }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ok = __shfl_xor_sync(0xffffffffu, bk, o);
+      const int oe = __shfl_xor_sync(0xffffffffu, be, o);
+      const float ol = __shfl_xor_sync(0xffffffffu, bl, o);
+      if (ok > bk || (ok == bk && oe < be)) { bk = ok; be = oe; bl = ol; }
+    }
+    sel[j] = be;
+    sl[j] = bl;
+    if ((be & 31) == lane) used |= 1u << (be >> 5);
+  }
+  if (lane < 8) {
+    const float my_l = sl[lane];
+    const float my_lp = __fadd_rn(fminf(my_l, 0.f), -log1pf(expf(-fabsf(my_l))));
+    float mx = my_lp;
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffu, mx, o));
+    const float my_ex = expf(__fadd_rn(my_lp, -mx));
+    const float e_pair = __fadd_rn(my_ex, __shfl_xor_sync(0xffu, my_ex, 2));
+    const float e_quad = __fadd_rn(e_pair, __shfl_xor_sync(0xffu, e_pair, 1));
+    const float s8 = __fadd_rn(e_quad, __shfl_xor_sync(0xffu, e_quad, 4));
+    const float base = __fadd_rn(mx, logf(s8));
+    idx[t * glue::TOPK + lane] = sel[lane];
+    wts[t * glue::TOPK + lane] = __fmul_rn(expf(__fadd_rn(my_lp, -base)), 8.0f);
+  }
+}
+
+// 3A-6: Fused moe_combine + MLP short conv + residual (glue_end) for prefill (T > 64).
+// 4 channels/thread (uint2), kCombineConvRows = 32, grid (6, ceil(T / 32), 1), block 96 -> 384 CTAs, preloaded wv[4][4]
+// and fp32 prev[3][4] (avoids per-row bf16 pack/unpack). Bit-identical to moe_combine + conv_rows<1>.
+constexpr int kCombineConvRows = 32;
+__device__ __forceinline__ void combine_row4(const bf16* __restrict__ y, int t, int c0, float (&out)[4]) {
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int s = 0; s < pmoe::TOPK; ++s) {
+    const uint2 v = *reinterpret_cast<const uint2*>(y + ((size_t)t * pmoe::TOPK + s) * H + c0);
+    const __nv_bfloat162* hv = reinterpret_cast<const __nv_bfloat162*>(&v);
+    const float2 a = __bfloat1622float2(hv[0]), b = __bfloat1622float2(hv[1]);
+    acc[0] = __fadd_rn(acc[0], a.x);
+    acc[1] = __fadd_rn(acc[1], a.y);
+    acc[2] = __fadd_rn(acc[2], b.x);
+    acc[3] = __fadd_rn(acc[3], b.y);
+  }
+#pragma unroll
+  for (int e = 0; e < 4; ++e) out[e] = glue::rr16(acc[e]);
+}
+
+__global__ void __launch_bounds__(kConvThreads) moe_combine_conv_kernel(
+    const bf16* __restrict__ my, const float* __restrict__ w, const bf16* __restrict__ state,
+    long long st_slot_stride, glue::Rows R, const int* __restrict__ seg_len, int T,
+    const float* __restrict__ partial32, bf16* __restrict__ mx, bf16* __restrict__ out) {
+  const int c0 = 4 * (blockIdx.x * kConvThreads + threadIdx.x);
+  const int t0 = blockIdx.y * kCombineConvRows, t1 = min(T, t0 + kCombineConvRows);
+  float wv[4][4];
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    const float4 q = *reinterpret_cast<const float4*>(w + (size_t)(c0 + e) * 4);
+    wv[e][0] = q.x; wv[e][1] = q.y; wv[e][2] = q.z; wv[e][3] = q.w;
+  }
+  float prev[3][4];
+#pragma unroll
+  for (int j = 0; j < 3; ++j) {
+    const int r = t0 - 3 + j;
+    if (r >= 0) combine_row4(my, r, c0, prev[j]);
+    else {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) prev[j][e] = 0.f;
+    }
+  }
+  constexpr float kInv5 = (float)(1.0 / 2.23606797749979);
+  for (int t = t0; t < t1; ++t) {
+    float cur[4];
+    combine_row4(my, t, c0, cur);
+    const int s = R.seg[t], i = t - R.row0[s], slen = seg_len[s];
+    const size_t o = (size_t)t * H + c0;
+    if (slen <= 16 || i + 3 >= slen) st4(mx + o, cur);
+    float ex[3][4];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+      if (i + j < 3) ld4(state + (size_t)R.slot[s] * st_slot_stride + (size_t)(i + j) * glue::SLD + c0, ex[j]);
+      else {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) ex[j][e] = prev[j][e];
+      }
+    }
+    float y[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      float acc = __fmul_rn(wv[e][0], ex[0][e]);
+      acc = __fadd_rn(acc, __fmul_rn(wv[e][1], ex[1][e]));
+      acc = __fadd_rn(acc, __fmul_rn(wv[e][2], ex[2][e]));
+      acc = __fadd_rn(acc, __fmul_rn(wv[e][3], cur[e]));
+      y[e] = glue::rr16(__fmul_rn(__fadd_rn(acc, cur[e]), kInv5));
+    }
+    const float4 pa0 = *reinterpret_cast<const float4*>(partial32 + o);
+    const float pa[4] = {pa0.x, pa0.y, pa0.z, pa0.w};
+    float r[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) r[e] = __fadd_rn(pa[e], y[e]);
+    st4(out + o, r);
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      prev[0][e] = prev[1][e];
+      prev[1][e] = prev[2][e];
+      prev[2][e] = cur[e];
+    }
+  }
 }
 
 }  // namespace pglue

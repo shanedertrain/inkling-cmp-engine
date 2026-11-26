@@ -298,6 +298,7 @@ impl Fwd<'_> {
         out: &DevBuf<f32>,
         ldo: usize,
         gin_ready: bool,
+        vmsg: Option<(&DevBuf<Bf16>, &DevBuf<Bf16>, &DevBuf<f32>)>,
     ) -> Res<()> {
         let t = self.t();
         let gi = t * 2 * H;
@@ -402,7 +403,26 @@ impl Fwd<'_> {
             .and_then(Option::as_ref)
             .ok_or_else(|| RuntimeError::request("tensor-core gate tail weights missing"))?;
         for grp in self.m.rgroups.clone() {
-            if grp.dec {
+            if let Some((msrc0, msrc1, mw)) = vmsg {
+                let v = views(grp.r0)?;
+                let gates: Vec<MgTcGate<'_>> = v
+                    .iter()
+                    .enumerate()
+                    .map(|(y, (gd, [hid, msg, out]))| MgTcGate {
+                        gd,
+                        w: &tw[g0 + y],
+                        hid,
+                        msg,
+                        out,
+                    })
+                    .collect();
+                let ms0 = at(msrc0, grp.r0 * H)?;
+                let ms1 = at(msrc1, grp.r0 * H)?;
+                let mwg = at(mw, grp.r0 * 16)?;
+                self.dev
+                    .mg_tail_tc_vmsg(grp.n, &gates, &ms0, &ms1, &mwg, ldh, ldo, g0)
+                    .rt()?;
+            } else if grp.dec {
                 let mut off = 0;
                 while off < grp.n {
                     let chunk = (grp.n - off).min(64);
@@ -563,7 +583,7 @@ impl Fwd<'_> {
     }
 
     /// `Engine::moe`: router (three K-group GEMMs + top-8, or the reference router), routing build, experts, combine.
-    fn moe(&mut self, v: usize, l: &LayerW, mx: &DevBuf<Bf16>) -> Res<()> {
+    fn moe(&mut self, v: usize, l: &LayerW, mx: &DevBuf<Bf16>, combine_here: bool) -> Res<()> {
         let t = self.t();
         let a = self.a;
         let tm = self.mem.t_max;
@@ -673,14 +693,25 @@ impl Fwd<'_> {
         p2.out = a.my.ptr();
         self.fmark("moe_gemm")?;
         self.dev.moe_gemm(l.fmt == ExpertFmt::Nvfp4, t * TOPK, &p13, &p2).rt()?;
-        self.fmark("moe_combine")?;
-        self.dev.moe_combine(t, &a.my, mx).rt()
+        if combine_here {
+            self.fmark("moe_combine")?;
+            self.dev.moe_combine(t, &a.my, mx).rt()?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------------------------------------ one visit
 
     /// `Engine::visit`.
-    fn visit(&mut self, v: usize, hin: Hin, hout: usize, nb: &mut usize, has_msgs: bool) -> Res<()> {
+    fn visit(
+        &mut self,
+        v: usize,
+        hin: Hin,
+        hout: usize,
+        nb: &mut usize,
+        has_msgs: bool,
+        vmsg_i: Option<usize>,
+    ) -> Res<()> {
         let vi = self.plan[v];
         let w = self.w;
         let l = &w.layers[vi.layer];
@@ -712,6 +743,11 @@ impl Fwd<'_> {
         let (mut pk_is_xq, mut pv_is_xq) = (false, false);
         let aq = l.attn_query.as_ref();
         let rows_glue = !reference && t > PGLUE_ROWS; // the prefill glue kernels (pglue)
+        let mw_buf = match vmsg_i {
+            Some(mi) => Some(span(&a.msgs, mi * t * 16, t * 16)?),
+            None => None,
+        };
+        let vmsg = mw_buf.as_ref().map(|mw| (&a.msrc[0], &a.msrc[1], mw));
         if l.full && !has_msgs && !reference {
             let (s, q) = (
                 res_src(&blk_now, Some(&hin_b), None, H),
@@ -721,17 +757,23 @@ impl Fwd<'_> {
             let no = [Some(&a.xq), Some(&a.xk), Some(&a.xv)];
             self.dev.ar_norm288(3, t, &s, q, nw, no).rt()?;
         } else if l.full {
-            self.attn_res(
-                3,
-                need_some(&l.attn_query, "attn_query")?,
-                *nb,
-                Some(&hin_b),
-                None,
-                &a.ar_out,
-                if has_msgs { 3 } else { 0 },
-                Some(&a.msgs),
-                true,
-            )?;
+            if let Some((ms0, ms1, mw)) = vmsg {
+                let s = res_src(&blk_now, Some(&hin_b), None, H);
+                let q = need_some(&l.attn_query, "attn_query")?;
+                self.dev.ar288_vmsg(3, t, &s, q, &a.ar_out, ms0, ms1, mw, &a.gin).rt()?;
+            } else {
+                self.attn_res(
+                    3,
+                    need_some(&l.attn_query, "attn_query")?,
+                    *nb,
+                    Some(&hin_b),
+                    None,
+                    &a.ar_out,
+                    if has_msgs { 3 } else { 0 },
+                    Some(&a.msgs),
+                    true,
+                )?;
+            }
             let qkv_w = [
                 need_some(&l.q_norm, "q_norm")?,
                 need_some(&l.k_norm, "k_norm")?,
@@ -750,10 +792,12 @@ impl Fwd<'_> {
                     &a.mg_out,
                     3 * H,
                     !reference,
+                    vmsg,
                 )?;
+                self.norm3(&a.mg_out, 3 * H, qkv_w)?;
+            } else {
+                self.norm3(&a.ar_out, 3 * H, qkv_w)?;
             }
-            let src = if has_msgs { &a.mg_out } else { &a.ar_out };
-            self.norm3(src, 3 * H, qkv_w)?;
         } else if vi.layer == 0 {
             self.dev
                 .rmsnorm_bf16(t, &hin_b, H, need_some(&l.attn_norm, "attn_norm")?, &a.xq)
@@ -785,18 +829,37 @@ impl Fwd<'_> {
             }
             (pk_is_xq, pv_is_xq) = (true, true);
         } else {
-            self.attn_res(
-                1,
-                need_some(&l.attn_query, "attn_query")?,
-                *nb,
-                Some(&hin_b),
-                None,
-                &a.ar_out,
+            if let Some((ms0, ms1, mw)) = vmsg {
+                let s = res_src(&blk_now, Some(&hin_b), None, H);
+                let q = need_some(&l.attn_query, "attn_query")?;
+                self.dev.ar288_vmsg(1, t, &s, q, &a.ar_out, ms0, ms1, mw, &a.gin).rt()?;
+            } else {
+                self.attn_res(
+                    1,
+                    need_some(&l.attn_query, "attn_query")?,
+                    *nb,
+                    Some(&hin_b),
+                    None,
+                    &a.ar_out,
+                    3,
+                    Some(&a.msgs),
+                    false,
+                )?;
+            }
+            self.message_gates(
+                l,
+                0,
                 3,
-                Some(&a.msgs),
-                false,
+                &a.ar_out,
+                0,
+                H,
+                &a.msgs,
+                4 * H,
+                &a.mg_out,
+                3 * H,
+                !reference,
+                vmsg,
             )?;
-            self.message_gates(l, 0, 3, &a.ar_out, 0, H, &a.msgs, 4 * H, &a.mg_out, 3 * H, !reference)?;
             let n = need_some(&l.attn_norm, "attn_norm")?;
             self.norm3(&a.mg_out, 3 * H, [n, n, n])?;
         }
@@ -811,16 +874,72 @@ impl Fwd<'_> {
             self.tap(Some(v), "xv", pv, TapType::Bf16, &[t, H])?;
         }
         // ---- projections: fused cuBLASLt over the contiguous [q | gate | r | sink | k (| k_dyn) | v (| v_dyn)]
-        // weight for both decode rows (into `a.qkvf`, Decode plan) and prefill rows (into unused `a.relk`, Mixed
-        // plan), then one split copy; tapped calls keep one GEMM per matrix.
+        // weight. On prefill-carrying production calls (`fused_qkv_pf`), every row group writes into `a.relk` at
+        // `o * nt` (skipping `proj_split` completely for prefill rows; decode rows in mixed calls split into
+        // `gate`/`sink` for `decode_attn`); `qkv_post_fused_rows` and `prefill_attn` read directly from `a.relk`.
         self.mark("proj")?;
         let tapping = self.tap.is_some();
+        let any_pre = self.m.call.iter().any(|c| c.m > MAX_DEC_ROWS);
+        let any_dec = self.m.call.iter().any(|c| c.m <= MAX_DEC_ROWS);
+        let fused_qkv_pf = !reference && !tapping && any_pre;
+        let nq = 2 * QD + NH * DREL + NH;
+        let nk = KD + if l.full { 32 } else { 0 };
+        let nt = nq + 2 * nk;
         for g in self.m.rgroups.clone() {
             let RowGroup { r0: o, n, dec } = g;
-            if !tapping && (!dec || self.m.dec_rows <= FUSED_ROWS) {
-                let nq = 2 * QD + NH * DREL + NH;
-                let nk = KD + if l.full { 32 } else { 0 };
-                let nt = nq + 2 * nk;
+            if fused_qkv_pf {
+                let c = class(dec);
+                if pk_is_xq && pv_is_xq {
+                    self.run(c, (nt, H, H), px, o * H, H, &l.wqkv, 0, &a.relk, o * nt, nt, n)?;
+                } else {
+                    self.run(c, (nq, H, H), px, o * H, H, &l.wqkv, 0, &a.relk, o * nt, nt, n)?;
+                    let shape = GemmShape {
+                        n: nk as u32,
+                        k: H as u32,
+                        ldw: H as u32,
+                        input: ink_cuda::Dtype::Bf16,
+                        output: ink_cuda::Dtype::Bf16,
+                        class: c,
+                    };
+                    self.lt
+                        .run2(
+                            self.st,
+                            shape,
+                            &at(self.xkv, o * H)?,
+                            H as u32,
+                            (tm * H) as u64,
+                            &at(&l.wqkv, nq * H)?,
+                            &at(&a.relk, o * nt + nq)?,
+                            nt as u32,
+                            n as u32,
+                        )
+                        .rt()?;
+                }
+                if dec {
+                    let s = |x: &DevBuf<Bf16>, ld: usize| at(x, o * ld);
+                    let (q, gt, r, sk, k, kd, vv, vd) = (
+                        s(&a.qproj, QD)?,
+                        s(&a.gate, QD)?,
+                        s(&a.rproj, NH * DREL)?,
+                        s(&a.sink, NH)?,
+                        s(&kx, KD)?,
+                        s(&a.kdyn, 32)?,
+                        s(&vx, KD)?,
+                        s(&a.vdyn, 32)?,
+                    );
+                    let out = ProjOut {
+                        q: &q,
+                        g: &gt,
+                        r: &r,
+                        s: &sk,
+                        k: &k,
+                        kd: &kd,
+                        v: &vv,
+                        vd: &vd,
+                    };
+                    self.dev.proj_split(n, &at(&a.relk, o * nt)?, nt, l.full, &out).rt()?;
+                }
+            } else if !tapping && (!dec || self.m.dec_rows <= FUSED_ROWS) {
                 let c = class(dec);
                 let qkvf = if dec { &a.qkvf } else { &a.relk };
                 if pk_is_xq && pv_is_xq {
@@ -891,8 +1010,6 @@ impl Fwd<'_> {
         }
         // ---- q / rel post, relative logits, key / value conv, KV write
         self.mark("qkv_post")?;
-        let any_pre = self.m.call.iter().any(|c| c.m > MAX_DEC_ROWS);
-        let any_dec = self.m.call.iter().any(|c| c.m <= MAX_DEC_ROWS);
         let (kw, vw) = if l.full {
             (need_some(&l.k_static, "k_static")?, need_some(&l.v_static, "v_static")?)
         } else {
@@ -923,7 +1040,11 @@ impl Fwd<'_> {
             vpool: &vb,
             pt,
         };
-        if !reference && any_pre {
+        if fused_qkv_pf {
+            self.dev
+                .qkv_post_fused_rows(t, &a.relk, nt, &a.gate, &a.sink, &a.len, qp)
+                .rt()?;
+        } else if !reference && any_pre {
             self.dev.qkv_post_rows(t, qp).rt()?;
         } else if !reference {
             self.dev.qkv_post_rows(t, qp).rt()?;
@@ -1018,31 +1139,53 @@ impl Fwd<'_> {
                 }
             } else {
                 let mlp_msg = at(&a.msgs, 3 * H)?;
-                self.dev
-                    .conv_ar_gate288(
-                        t,
-                        &ax,
-                        &l.attn_conv,
-                        &cst_attn,
-                        rws,
-                        &hin_b,
-                        blk_out,
-                        &a.partial,
-                        &s_prev,
-                        &l.mlp_query,
-                        &a.ar_out,
-                        GateInputs {
-                            msg: &mlp_msg,
-                            ldm: 4 * H,
-                            gin: &a.gin,
-                            qsel: false,
-                        },
-                    )
-                    .rt()?;
+                if let Some((ms0, ms1, mw)) = vmsg {
+                    self.dev
+                        .conv_ar_gate288_vmsg(
+                            t,
+                            &ax,
+                            &l.attn_conv,
+                            &cst_attn,
+                            rws,
+                            &hin_b,
+                            blk_out,
+                            &a.partial,
+                            &s_prev,
+                            &l.mlp_query,
+                            &a.ar_out,
+                            ms0,
+                            ms1,
+                            mw,
+                            &a.gin,
+                        )
+                        .rt()?;
+                } else {
+                    self.dev
+                        .conv_ar_gate288(
+                            t,
+                            &ax,
+                            &l.attn_conv,
+                            &cst_attn,
+                            rws,
+                            &hin_b,
+                            blk_out,
+                            &a.partial,
+                            &s_prev,
+                            &l.mlp_query,
+                            &a.ar_out,
+                            GateInputs {
+                                msg: &mlp_msg,
+                                ldm: 4 * H,
+                                gin: &a.gin,
+                                qsel: false,
+                            },
+                        )
+                        .rt()?;
+                }
                 if bstart {
                     *nb += 1;
                 }
-                self.message_gates(l, 3, 1, &a.ar_out, 0, H, &mlp_msg, 4 * H, &a.mg_out, H, true)?;
+                self.message_gates(l, 3, 1, &a.ar_out, 0, H, &mlp_msg, 4 * H, &a.mg_out, H, true, vmsg)?;
                 self.fmark("mlp_norm")?;
                 if rows_glue {
                     self.dev.norm_rows(t, &[&a.mg_out], H, &[&l.mlp_norm], &[&a.xm]).rt()?;
@@ -1074,7 +1217,7 @@ impl Fwd<'_> {
                 false,
             )?;
             if has_msgs {
-                self.message_gates(l, 3, 1, &a.ar_out, 0, H, &mlp_msg, 4 * H, &a.mg_out, H, false)?;
+                self.message_gates(l, 3, 1, &a.ar_out, 0, H, &mlp_msg, 4 * H, &a.mg_out, H, false, None)?;
             }
             self.fmark("mlp_norm")?;
             let src = if has_msgs { &a.mg_out } else { &a.ar_out };
@@ -1083,11 +1226,16 @@ impl Fwd<'_> {
         self.tap(Some(v), "xm", &a.xm, TapType::Bf16, &[t, H])?;
         // ---- router, experts, MLP conv + residual
         self.mark("router")?;
-        self.moe(v, l, &mx)?;
+        let fuse_combine_conv = !reference && !tapping && rows_glue;
+        self.moe(v, l, &mx, !fuse_combine_conv)?;
         self.tap(Some(v), "moe", &mx, TapType::Bf16, &[t, H])?;
         self.mark("glue_end")?;
         let cst_mlp = at(&cst, 4352)?;
-        if rows_glue {
+        if fuse_combine_conv {
+            self.dev
+                .moe_combine_conv(t, &a.my, &l.mlp_conv, &cst_mlp, rws, &a.len, &a.partial, &mx, hout_b)
+                .rt()?;
+        } else if rows_glue {
             let mode = ConvRows::Mlp { out: hout_b };
             self.dev
                 .conv_rows(t, &mx, &l.mlp_conv, &cst_mlp, rws, &a.partial, mode)
@@ -1115,24 +1263,31 @@ impl Fwd<'_> {
         self.tap(None, "emb", &a.hid[0], TapType::Bf16, &[t, H])?;
         let (mut cur, mut nb, mut v) = (0usize, 0usize, 0usize);
         let mut hin = Hin::Hid(0);
-        let run_visit =
-            |f: &mut Self, msgs: bool, cur: &mut usize, hin: &mut Hin, nb: &mut usize, v: &mut usize| -> Res<()> {
-                if matches!(*v, 5 | 23 | 41) {
-                    let j = match *v {
-                        5 => 0,
-                        23 => 1,
-                        _ => 2,
-                    };
-                    f.dev.feat_copy(t, Some(f.hin_buf(*hin)), None, &a.feats, j).rt()?;
-                }
-                f.visit(*v, *hin, *cur ^ 1, nb, msgs)?;
-                *cur ^= 1;
-                *hin = Hin::Hid(*cur);
-                *v += 1;
-                Ok(())
-            };
+        let use_vmsgs = !self.reference && self.tap.is_none() && t > PGLUE_ROWS;
+        let run_visit = |f: &mut Self,
+                         msgs: bool,
+                         vmsg_i: Option<usize>,
+                         cur: &mut usize,
+                         hin: &mut Hin,
+                         nb: &mut usize,
+                         v: &mut usize|
+         -> Res<()> {
+            if matches!(*v, 5 | 23 | 41) {
+                let j = match *v {
+                    5 => 0,
+                    23 => 1,
+                    _ => 2,
+                };
+                f.dev.feat_copy(t, Some(f.hin_buf(*hin)), None, &a.feats, j).rt()?;
+            }
+            f.visit(*v, *hin, *cur ^ 1, nb, msgs, vmsg_i)?;
+            *cur ^= 1;
+            *hin = Hin::Hid(*cur);
+            *v += 1;
+            Ok(())
+        };
         for _ in 0..LOOP_START {
-            run_visit(self, false, &mut cur, &mut hin, &mut nb, &mut v)?;
+            run_visit(self, false, None, &mut cur, &mut hin, &mut nb, &mut v)?;
         }
         // blk[0] = embedding (layer 0), blk[1] = pre_hidden (appended at layer 6 of every pass)
         for p in 0..PASSES {
@@ -1144,9 +1299,15 @@ impl Fwd<'_> {
                     .rt()?;
                 hin = Hin::Blk1;
                 nb = 1;
+                if use_vmsgs {
+                    self.mark("msgs")?;
+                    self.dev
+                        .vmsg_weights(t, &a.msrc[0], &a.msrc[1], &w.msg_queries, &a.msgs)
+                        .rt()?;
+                }
             }
             for i in 0..LOOP_END - LOOP_START {
-                if p > 0 {
+                if p > 0 && !use_vmsgs {
                     self.mark("msgs")?;
                     let s = res_src(&[&a.msrc[0]], Some(&a.msrc[1]), None, H);
                     let mq = at(&w.msg_queries, i * 4 * H)?;
@@ -1159,11 +1320,12 @@ impl Fwd<'_> {
                     }
                     self.tap(Some(v), "msgs", &a.msgs, TapType::F32, &[t, 4, H])?;
                 }
-                run_visit(self, p > 0, &mut cur, &mut hin, &mut nb, &mut v)?;
+                let vi = (p > 0 && use_vmsgs).then_some(i);
+                run_visit(self, p > 0, vi, &mut cur, &mut hin, &mut nb, &mut v)?;
             }
         }
         for _ in LOOP_END..NLAYERS {
-            run_visit(self, false, &mut cur, &mut hin, &mut nb, &mut v)?;
+            run_visit(self, false, None, &mut cur, &mut hin, &mut nb, &mut v)?;
         }
         if v != NVISITS || nb != 4 {
             return Err(RuntimeError::request("visit count / blocks"));

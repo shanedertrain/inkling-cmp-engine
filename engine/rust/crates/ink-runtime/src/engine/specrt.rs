@@ -60,6 +60,10 @@ pub(super) struct SpecState {
     /// The device sampler's controls of the last call's segments (`max_slots` entries, own allocation as the C ABI's
     /// `cudaMalloc`, outside the planned arena), allocated by the first sampled call.
     samp: Option<(Arena, DevBuf<SampleParam>)>,
+    /// Raw bytes of the last uploaded `SampleParam` slice, to skip redundant H2D uploads on steady decode rounds.
+    last_samp_bytes: Vec<u8>,
+    /// Scratch host buffer for coalesced `verify_widths_and_drafts` single-sync D2H download.
+    width_pack_host: Vec<i32>,
     /// Lazily allocated scratch for [`SamplerProbe::sample_test_rows`].
     probe: Option<ProbeScratch>,
 }
@@ -96,6 +100,11 @@ impl SpecState {
     /// Device bytes the drafter's captured graph holds.
     pub(super) fn draft_graph_bytes(&self) -> usize {
         self.draft_graph.get()
+    }
+
+    /// Whether every segment of the active `forward_dev` call carries device token ids (so `m.ids` H2D can be skipped).
+    pub(super) fn all_dev_ids(&self, nseg: usize) -> bool {
+        self.dev_ids.len() == nseg && self.dev_ids.iter().all(Option::is_some)
     }
 
     /// The `dev_ids` copies of `Engine::forward`: each device-id segment's ids into the call's id buffer at its first
@@ -140,7 +149,12 @@ impl Engine {
         }
         let (_, par) = self.spec.samp.as_ref().expect("allocated above");
         let host: Vec<SampleParam> = params.iter().map(sample_param).collect();
-        self.st.htod(&par.slice(0..nseg).rt()?, &host).rt()?;
+        let raw = bytemuck::cast_slice::<SampleParam, u8>(&host);
+        if self.spec.last_samp_bytes.as_slice() != raw {
+            self.st.htod(&par.slice(0..nseg).rt()?, &host).rt()?;
+            self.spec.last_samp_bytes.clear();
+            self.spec.last_samp_bytes.extend_from_slice(raw);
+        }
         if nlog == 0 {
             return Ok(());
         }
@@ -210,7 +224,12 @@ impl Engine {
                 }
                 let (_, par) = self.spec.samp.as_ref().expect("allocated above");
                 let host: Vec<SampleParam> = params.iter().map(sample_param).collect();
-                self.st.htod(&par.slice(0..s).rt()?, &host).rt()?;
+                let raw = bytemuck::cast_slice::<SampleParam, u8>(&host);
+                if self.spec.last_samp_bytes.as_slice() != raw {
+                    self.st.htod(&par.slice(0..s).rt()?, &host).rt()?;
+                    self.spec.last_samp_bytes.clear();
+                    self.spec.last_samp_bytes.extend_from_slice(raw);
+                }
                 let a = &self.a;
                 self.spec_dev()
                     .sample_leviathan(
@@ -288,21 +307,29 @@ impl SpecRuntime for Engine {
 
     #[allow(unsafe_code)] // implements the trait's contract method (ink-rt-api bounds contract)
     unsafe fn forward_dev(&mut self, segs: &[DevSeg]) -> Res<usize> {
+        static ZEROS: [i32; 32] = [0; 32];
         let mut ids = Vec::with_capacity(segs.len());
+        let mut fallback: Vec<Vec<i32>> = Vec::new();
         for s in segs {
             ids.push(Some(self.spec.bufs.borrow().typed::<i32>(
                 s.ids,
                 s.rows,
                 "segment ids",
             )?));
+            if s.rows > ZEROS.len() {
+                fallback.push(vec![0; s.rows]);
+            }
         }
-        let zeros: Vec<Vec<i32>> = segs.iter().map(|s| vec![0; s.rows]).collect();
+        let mut fb = fallback.iter();
         let host: Vec<SegIn<'_>> = segs
             .iter()
-            .zip(&zeros)
-            .map(|(s, z)| SegIn {
+            .map(|s| SegIn {
                 slot: s.slot,
-                ids: z,
+                ids: if s.rows <= ZEROS.len() {
+                    &ZEROS[..s.rows]
+                } else {
+                    fb.next().expect("fallback buffer").as_slice()
+                },
                 logits: s.logits,
             })
             .collect();
@@ -374,6 +401,49 @@ impl SpecRuntime for Engine {
         out.clear();
         out.resize(n, 0);
         self.st.dtoh(out, &w).rt()
+    }
+
+    fn verify_widths_and_drafts(
+        &mut self,
+        conf: Option<ApiBuf>,
+        drafts: ApiBuf,
+        tau: f32,
+        n: usize,
+        packed: ApiBuf,
+        widths_out: &mut Vec<i32>,
+        drafts_out: &mut [i32],
+    ) -> Res<()> {
+        if n == 0 || n > self.mem.max_slots {
+            return Err(RuntimeError::request(format!(
+                "verify_widths_and_drafts: n must be 1..{}",
+                self.mem.max_slots
+            )));
+        }
+        let total = n * (1 + DRAFTS);
+        if drafts_out.len() != n * DRAFTS {
+            return Err(RuntimeError::request(format!(
+                "verify_widths_and_drafts: drafts_out len {}, expected {}",
+                drafts_out.len(),
+                n * DRAFTS
+            )));
+        }
+        let b = self.spec.bufs.borrow();
+        let c = match conf {
+            Some(h) => Some(b.typed::<f32>(h, n * DRAFTS, "conf")?),
+            None => None,
+        };
+        let d = b.typed::<i32>(drafts, n * DRAFTS, "drafts")?;
+        let p = b.typed::<i32>(packed, total, "packed widths+drafts")?;
+        self.spec_dev()
+            .verify_widths_pack(n, c.as_ref(), Some(&d), tau, &p)
+            .rt()?;
+        drop(b);
+        self.spec.width_pack_host.resize(total, 0);
+        self.st.dtoh(&mut self.spec.width_pack_host, &p).rt()?;
+        widths_out.clear();
+        widths_out.extend_from_slice(&self.spec.width_pack_host[..n]);
+        drafts_out.copy_from_slice(&self.spec.width_pack_host[n..total]);
+        Ok(())
     }
 
     #[allow(unsafe_code)] // implements the trait's contract method (ink-rt-api bounds contract)

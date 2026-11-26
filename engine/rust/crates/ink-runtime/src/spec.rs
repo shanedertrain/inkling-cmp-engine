@@ -190,7 +190,8 @@ impl Speculation {
             cfeats: sp.alloc(t_max.max(max_verify_rows * n) * FEAT_ROW_BYTES)?,
         };
         let vids = sp.alloc(max_verify_rows * n * 4)?;
-        let wdev = sp.alloc(n * 4)?;
+        // Packed device buffer for coalesced widths [0..n] + drafts [n..n + 7*n] single-sync D2H.
+        let wdev = sp.alloc((1 + DRAFTS) * n * 4)?;
         let ramp = sp.alloc(t_max * 4)?;
         let meta = sp.alloc(3 * t_max * 4)?;
         let rows: Vec<i32> = (0..t_max).map(to_i32).collect::<Result<_, _>>()?;
@@ -318,20 +319,36 @@ impl Speculation {
         }
         self.drafter.draft_sessions(&slots)?;
         let sp = spec_of(rt)?;
-        if let Some(conf) = self.drafter.conf() {
-            sp.verify_widths(conf, self.verify_tau_ln, self.slots, self.wdev, &mut self.widths)?;
-        } else {
-            self.widths.fill(VERIFY_ROWS as i32);
-        }
+        let mut any_lookup = false;
+        let round_drafts;
+        let round_k;
         if self.lookup_len > 0 {
-            sp.download(self.drafter.drafts(), &mut self.drafts_host)?;
-            self.all_drafts.fill(-1);
+            // Single-sync coalesced D2H of both gated widths and drafter drafts.
+            sp.verify_widths_and_drafts(
+                self.drafter.conf(),
+                self.drafter.drafts(),
+                self.verify_tau_ln,
+                self.slots,
+                self.wdev,
+                &mut self.widths,
+                &mut self.drafts_host,
+            )?;
             let mut extra = [0i32; VERIFY_ROWS];
             let mut prop = [-1i32; MAX_DRAFTS - DRAFTS];
+            // Lazily touch all_drafts + H2D upload ONLY if at least one session triggers lookup (or trace is active).
+            let mut filled = false;
+            if self.trace.is_some() {
+                self.all_drafts.fill(-1);
+                for g in segs {
+                    let q = g.slot;
+                    let ds = &self.drafts_host[q * DRAFTS..(q + 1) * DRAFTS];
+                    self.all_drafts[q * self.draft_k..q * self.draft_k + DRAFTS].copy_from_slice(ds);
+                }
+                filled = true;
+            }
             for g in segs {
                 let q = g.slot;
                 let ds = &self.drafts_host[q * DRAFTS..(q + 1) * DRAFTS];
-                self.all_drafts[q * self.draft_k..q * self.draft_k + DRAFTS].copy_from_slice(ds);
                 // Only extend full-width (confident) sessions when all 7 drafts are valid tokens.
                 if self.widths[q] as usize == VERIFY_ROWS
                     && g.pos0 + self.max_verify_rows <= self.ctx
@@ -341,18 +358,54 @@ impl Speculation {
                     extra[1..VERIFY_ROWS].copy_from_slice(ds);
                     let (cnt, back) = self.lookup[q].propose(&extra, &mut prop[..self.lookup_len]);
                     if back >= self.lookup_min && cnt > 0 {
+                        if !filled {
+                            self.all_drafts.fill(-1);
+                            for g2 in segs {
+                                let q2 = g2.slot;
+                                let ds2 = &self.drafts_host[q2 * DRAFTS..(q2 + 1) * DRAFTS];
+                                self.all_drafts[q2 * self.draft_k..q2 * self.draft_k + DRAFTS].copy_from_slice(ds2);
+                            }
+                            filled = true;
+                        }
                         self.all_drafts[q * self.draft_k + DRAFTS..q * self.draft_k + DRAFTS + cnt]
                             .copy_from_slice(&prop[..cnt]);
                         self.widths[q] = to_i32(VERIFY_ROWS + cnt)?;
                         t.lookup_triggers += 1;
                         self.lookup_triggers_total += 1;
+                        any_lookup = true;
                     }
                 }
             }
-            sp.upload(self.bufs.drafts, &self.all_drafts)?;
+            if filled {
+                sp.upload(self.bufs.drafts, &self.all_drafts)?;
+                round_drafts = self.bufs.drafts;
+                round_k = self.draft_k;
+            } else {
+                round_drafts = self.drafter.drafts();
+                round_k = DRAFTS;
+            }
+        } else {
+            if let Some(conf) = self.drafter.conf() {
+                let wbuf = sub(self.wdev, 0, self.slots)?;
+                sp.verify_widths(conf, self.verify_tau_ln, self.slots, wbuf, &mut self.widths)?;
+            } else {
+                self.widths.fill(VERIFY_ROWS as i32);
+            }
+            round_drafts = self.bufs.drafts;
+            round_k = self.draft_k;
         }
-        sp.build_verify_ids(self.bufs.anchor, self.bufs.drafts, self.vids, self.slots, self.draft_k)?;
-        let max_rows = self.max_verify_rows;
+        let round_vstride = round_k + 1;
+        let round_rs = round_k + 2;
+        let round_bufs = AcceptBufs {
+            drafts: round_drafts,
+            ..self.bufs
+        };
+        sp.build_verify_ids(self.bufs.anchor, round_drafts, self.vids, self.slots, round_k)?;
+        let max_rows = if any_lookup || self.trace.is_some() {
+            self.max_verify_rows
+        } else {
+            VERIFY_ROWS
+        };
         let width = |q: usize| -> Result<usize, RuntimeError> {
             usize::try_from(self.widths[q])
                 .ok()
@@ -372,7 +425,7 @@ impl Speculation {
                 let q = segs[i].slot;
                 Ok(DevSeg {
                     slot: q,
-                    ids: sub(self.vids, max_rows * q, w)?,
+                    ids: sub(self.vids, round_vstride * q, w)?,
                     rows: w,
                     logits: w,
                 })
@@ -399,14 +452,14 @@ impl Speculation {
         let sp = spec_of(rt)?;
         let t2 = Instant::now();
         if segs.iter().all(|g| g.sampling.temperature == 0.0) {
-            sp.spec_accept(&self.bufs, self.draft_k, &mut self.res)?;
+            sp.spec_accept(&round_bufs, round_k, &mut self.res)?;
         } else {
             // one per segment of the call, in call order
             let params: Vec<DeviceSampling> = ord.iter().map(|&i| segs[i].sampling).collect();
             if let Some(prop) = self.drafter.proposal() {
-                sp.spec_accept_leviathan(&self.bufs, &prop, self.draft_k, &params, &mut self.res)?;
+                sp.spec_accept_leviathan(&round_bufs, &prop, round_k, &params, &mut self.res)?;
             } else {
-                sp.spec_accept_sampled(&self.bufs, self.draft_k, &params, &mut self.res)?;
+                sp.spec_accept_sampled(&round_bufs, round_k, &params, &mut self.res)?;
             }
         }
         let t3 = Instant::now();
@@ -415,22 +468,21 @@ impl Speculation {
             self.write_trace(rt, &called, &dev, &gated)?;
         }
         self.rounds += 1;
-        let rs = self.res_stride;
+        let rs = round_rs;
         let mut out = vec![(Vec::new(), 0); segs.len()];
         let mut kept = Vec::with_capacity(segs.len());
+        let mut old_anchors = Vec::with_capacity(if self.lookup_len > 0 { segs.len() } else { 0 });
         for (s, &i) in ord.iter().enumerate() {
             let g = &segs[i];
             let a = usize::try_from(self.res[rs * s])
                 .ok()
-                .filter(|&a| a <= self.draft_k)
+                .filter(|&a| a <= round_k)
                 .ok_or_else(|| RuntimeError::request(format!("accepted count {} out of range", self.res[rs * s])))?;
             let mut emitted = self.res[rs * s + 1..rs * s + 2 + a].to_vec();
             emitted.truncate(g.stop.keep(&emitted));
             let n = emitted.len();
             if self.lookup_len > 0 {
-                let old_anchor = self.anchor[g.slot];
-                self.lookup[g.slot].push(old_anchor);
-                self.lookup[g.slot].extend_from_slice(&emitted[..n - 1]);
+                old_anchors.push((g.slot, self.anchor[g.slot], i));
                 let lk_acc = n.saturating_sub(VERIFY_ROWS);
                 if lk_acc > 0 {
                     t.lookup_accepted += lk_acc as u32;
@@ -461,6 +513,14 @@ impl Speculation {
                 .commit_rows(self.bufs.cfeats, self.bufs.cpos, self.bufs.csess, rows)
         };
         commit?;
+        // Overlap CPU n-gram index updates behind GPU commit + drafter.commit_rows kernels.
+        if self.lookup_len > 0 {
+            for (slot, old_anchor, idx) in old_anchors {
+                let emitted = &out[idx].0;
+                self.lookup[slot].push(old_anchor);
+                self.lookup[slot].extend_from_slice(&emitted[..emitted.len() - 1]);
+            }
+        }
         t.draft += t1 - t0;
         t.verify += t2 - t1;
         t.accept += t3 - t2;

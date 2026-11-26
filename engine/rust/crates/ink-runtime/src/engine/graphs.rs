@@ -24,10 +24,19 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use ink_cuda::{Graph, NodeState};
+use ink_cuda::{CachedKernelNode, Graph, NodeState};
 use ink_rt_api::RuntimeError;
 
 use super::{Res, Rt};
+
+/// Cached decode-attention or combine node for fast in-place `CUgraphExec` retargeting.
+#[derive(Debug)]
+pub(super) struct DaNode {
+    pub cached: CachedKernelNode,
+    pub params: ink_kernels::da::Params,
+    pub grid: [u32; 3],
+    pub is_combine: bool,
+}
 
 /// One held graph and the key chunks its decode-attention nodes are set to.
 #[derive(Debug)]
@@ -38,8 +47,10 @@ pub(super) struct Entry {
     pub chunks: (usize, usize),
     /// Row bound `R` of the decode-attention nodes now.
     pub r: usize,
-    /// Indices of the decode-attention and combine kernel nodes.
-    pub da_nodes: Vec<usize>,
+    /// Cached global (full-attention) decode-attention and combine kernel nodes (16 nodes).
+    pub da_global: Vec<DaNode>,
+    /// Cached sliding-window decode-attention and combine kernel nodes (80 nodes).
+    pub da_swa: Vec<DaNode>,
 }
 
 /// Captured decode graphs by key within a fixed byte reserve, and the regions disabled in all of them.
@@ -124,28 +135,52 @@ impl GraphCache {
     }
 
     /// Adds a newly captured graph (ablation applied, replayed once) charged `bytes`, captured at key chunks
-    /// `chunks`; its decode-attention nodes are those whose kernel is in namespace `da`.
-    pub fn insert(&mut self, key: String, graph: Graph, bytes: usize, chunks: (usize, usize), r: usize) {
+    /// `chunks`; its decode-attention nodes are cached and split into global vs SWA for fast retargeting.
+    pub fn insert(&mut self, key: String, graph: Graph, bytes: usize, chunks: (usize, usize), r: usize) -> Res<()> {
+        let mut da_global = Vec::new();
+        let mut da_swa = Vec::new();
+        for i in 0..graph.nodes().len() {
+            let node = &graph.nodes()[i];
+            let Some(k) = node.kernel.as_deref() else {
+                continue;
+            };
+            if !k.starts_with("_ZN2da") {
+                continue;
+            }
+            let Some((grid, _, _)) = node.dims else {
+                return Err(RuntimeError::request(format!(
+                    "graph node {i} has no launch dimensions"
+                )));
+            };
+            let (cached, params) = graph.cache_kernel_node::<ink_kernels::da::Params>(i).rt()?;
+            let full = params.window >= 1 << 30;
+            let is_combine = k.starts_with("_ZN2da14combine_kernel");
+            let dn = DaNode {
+                cached,
+                params,
+                grid,
+                is_combine,
+            };
+            if full {
+                da_global.push(dn);
+            } else {
+                da_swa.push(dn);
+            }
+        }
         self.captures += 1;
         self.largest = self.largest.max(bytes);
         self.held += bytes;
-        let da_nodes = (0..graph.nodes().len())
-            .filter(|&i| {
-                graph.nodes()[i]
-                    .kernel
-                    .as_deref()
-                    .is_some_and(|k| k.starts_with("_ZN2da"))
-            })
-            .collect();
         self.graphs.insert(
             key,
             Entry {
                 graph,
                 chunks,
                 r,
-                da_nodes,
+                da_global,
+                da_swa,
             },
         );
+        Ok(())
     }
 
     /// Graphs captured so far.

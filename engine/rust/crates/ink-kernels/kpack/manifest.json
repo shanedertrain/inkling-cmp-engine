@@ -1,9 +1,9 @@
 {
  "format": "ink-kpack-manifest/1",
- "kpack_id": "de0e981af145e4b07974e6c85c77340e5221cf8056ce06c858dd116ad7c09842",
+ "kpack_id": "9af3241f6232e8cf24bae61bae11efeeb563c14f5185deef501db3154145a713",
  "nvcc": "Cuda compilation tools, release 13.3, V13.3.73",
  "flags": "-O3 -lineinfo -Xptxas -warn-spills -O3 -DNDEBUG -std=c++20 -gencode arch=compute_80,code=sm_80",
- "layout_sha256": "ea93c6d361ce700650f41556c56b41da8a8443493afefdc99b7aa5e6510bc2c5",
+ "layout_sha256": "2853716509283f4e8bc545bc5938227f276bf8861b3a1d348872ad856c67708d",
  "inputs": [
   {
    "path": "engine/kernels/common/common.hpp",
@@ -27,7 +27,7 @@
   },
   {
    "path": "engine/kernels/drafter/draft_leviathan.cuh",
-   "sha256": "cb75ed99972b3e667200a8f2031e485f23388035f68571fa0e2ef3faa13bbbc6"
+   "sha256": "1db34208648a1703106d12dc5625c87c6f3edf16a960173529364e430d30f71f"
   },
   {
    "path": "engine/kernels/drafter/draft_sel.cuh",
@@ -43,19 +43,19 @@
   },
   {
    "path": "engine/kernels/glue/engine_kernels.cuh",
-   "sha256": "38d3096bd4be220e772b1ae7098052e2e8152e4c307d6301788aa88fca2afa19"
+   "sha256": "c67649977f6014f342feeb2770e13f216d65dd5ac425c744b0db1bee0379976f"
   },
   {
    "path": "engine/kernels/glue/glue.cuh",
-   "sha256": "38888a5f2cad70c8efcfc4db81d23e007c1cbe85761994a118d76a7da9d7b3a0"
+   "sha256": "d20447b658fce607333cbdc639ea89b9b33baa577df0641c10a5c14917149f8d"
   },
   {
    "path": "engine/kernels/glue/moe_dev.cuh",
-   "sha256": "2539485863ac15b4d393de41e936ee4e2736ed3dc5f6cfd3cba82ecae3203900"
+   "sha256": "35d7900e367dd08481bfaa82a31572975e6543dfea4f0e13ad10bf0ba960c92d"
   },
   {
    "path": "engine/kernels/glue/prefill_glue.cuh",
-   "sha256": "caa3c7cb7004ec0d6c323b2a0885d2b259abf99323e7dde6c0c627169b4517a0"
+   "sha256": "d4d1e21bfdc70fd64ebf04fe6a62c36240d78736adfbb675c1695571d260f0d8"
   },
   {
    "path": "engine/kernels/pack/build.sh",
@@ -63,7 +63,7 @@
   },
   {
    "path": "engine/kernels/pack/keys.toml",
-   "sha256": "c9b519dc49c3585893b925619af330dc0eae763d534fce5450e7a96f6345fd87"
+   "sha256": "f09837a8c42d26ee9ba8e6f2916ee6d2cb06eae5ac53214954fdb31dd20654a3"
   },
   {
    "path": "engine/kernels/pack/layout_emit.cpp",
@@ -79,7 +79,7 @@
   },
   {
    "path": "engine/kernels/pack/structs.def",
-   "sha256": "dad7fec3c4803e7f4bb8e3bd7148d2a994c617b9bd09d96a0e1805c5df70769e"
+   "sha256": "cd33acfd12d37e3e7a70c2a83d64287d2fb525de06f518ffa2f270ce5ff7b246"
   },
   {
    "path": "engine/kernels/prefill_attn/prefill_attn.cuh",
@@ -102,15 +102,15 @@
   {
    "tu": "engine",
    "file": "pack_engine.cubin",
-   "bytes": 23513760,
-   "sha256": "c33c347d4db3b128e8cb1743c1b3fce110e71ae26015a3bf3796116226563422",
-   "keys": 162
+   "bytes": 25172768,
+   "sha256": "9528aa194273151a49f266f5a2f72f1aa94d263980305459598f1977a747544f",
+   "keys": 181
   },
   {
    "tu": "drafter",
    "file": "pack_drafter.cubin",
-   "bytes": 16098640,
-   "sha256": "0a369a7ff17b5f611f4c76e7d14a9a8531a9aae5e23aa5b1436d464adc2cf9fc",
+   "bytes": 16218704,
+   "sha256": "a467ae74705c4f867e0ed67238c98150323f71d2f6fb71e57598a8d4f9f88a6b",
    "keys": 205
   }
  ]

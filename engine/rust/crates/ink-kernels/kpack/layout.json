@@ -156,6 +156,14 @@
   {"name": "hid", "type": "float const* [4]", "offset": 64, "size": 32, "align": 8},
   {"name": "msg", "type": "float const* [4]", "offset": 96, "size": 32, "align": 8},
   {"name": "out", "type": "float* [4]", "offset": 128, "size": 32, "align": 8}]},
+ {"name": "pglue::MgTcVmsg", "size": 152, "align": 8, "fields": [
+  {"name": "gd", "type": "__nv_bfloat16 const* [4]", "offset": 0, "size": 32, "align": 8},
+  {"name": "W", "type": "__nv_bfloat16 const* [4]", "offset": 32, "size": 32, "align": 8},
+  {"name": "hid", "type": "float const* [4]", "offset": 64, "size": 32, "align": 8},
+  {"name": "msrc0", "type": "__nv_bfloat16 const*", "offset": 96, "size": 8, "align": 8},
+  {"name": "msrc1", "type": "__nv_bfloat16 const*", "offset": 104, "size": 8, "align": 8},
+  {"name": "mw", "type": "float const*", "offset": 112, "size": 8, "align": 8},
+  {"name": "out", "type": "float* [4]", "offset": 120, "size": 32, "align": 8}]},
  {"name": "pglue::MgDown", "size": 112, "align": 8, "fields": [
   {"name": "x", "type": "__nv_bfloat16 const* [4]", "offset": 0, "size": 32, "align": 8},
   {"name": "W", "type": "__nv_bfloat16 const* [4]", "offset": 32, "size": 32, "align": 8},
@@ -245,7 +253,7 @@
   {"name": "zd", "type": "float*", "offset": 8, "size": 8, "align": 8},
   {"name": "vd", "type": "int*", "offset": 16, "size": 8, "align": 8},
   {"name": "part", "type": "float*", "offset": 24, "size": 8, "align": 8}]},
- {"name": "s2f::LevBuf", "size": 120, "align": 8, "fields": [
+ {"name": "s2f::LevBuf", "size": 136, "align": 8, "fields": [
   {"name": "chunk_val", "type": "float*", "offset": 0, "size": 8, "align": 8},
   {"name": "chunk_id", "type": "int*", "offset": 8, "size": 8, "align": 8},
   {"name": "chunk_z", "type": "float*", "offset": 16, "size": 8, "align": 8},
@@ -261,7 +269,9 @@
   {"name": "prop_w", "type": "unsigned int*", "offset": 96, "size": 8, "align": 8},
   {"name": "conf_c", "type": "float*", "offset": 104, "size": 8, "align": 8},
   {"name": "full_verify", "type": "int", "offset": 112, "size": 4, "align": 4},
-  {"name": "conf_mode", "type": "int", "offset": 116, "size": 4, "align": 4}]},
+  {"name": "conf_mode", "type": "int", "offset": 116, "size": 4, "align": 4},
+  {"name": "active_mask", "type": "unsigned int*", "offset": 120, "size": 8, "align": 8},
+  {"name": "early_tau_ln", "type": "float", "offset": 128, "size": 4, "align": 4}]},
  {"name": "RealHead", "size": 40, "align": 8, "fields": [
   {"name": "nrec", "type": "int", "offset": 0, "size": 4, "align": 4},
   {"name": "h", "type": "__nv_bfloat16*", "offset": 8, "size": 8, "align": 8},

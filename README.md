@@ -3,7 +3,7 @@
 <p align="center">
   <sub>Custom pure-Rust + CUDA (<code>sm_80</code>) single-model inference engine for 1–8× CMP 170HX (64 GB, 140 W cap)</sub>
   <br><br>
-  <img src="https://img.shields.io/badge/release-v1.0.0-2ea44f?style=for-the-badge" alt="v1.0.0" height="28" />
+  <img src="https://img.shields.io/badge/release-v1.1.0-2ea44f?style=for-the-badge" alt="v1.1.0" height="28" />
   <img src="https://img.shields.io/badge/engine-Rust%20%2B%20CUDA%20sm__80-1f6feb?style=for-the-badge" alt="Rust + CUDA sm_80" height="28" />
   <img src="https://img.shields.io/badge/model-Inkling--2--Mini-4b32c3?style=for-the-badge" alt="Inkling-2-Mini" height="28" />
   <img src="https://img.shields.io/badge/context-262%2C144%20tokens-181717?style=for-the-badge" alt="262,144 context" height="28" />
@@ -15,8 +15,8 @@
 Serve Thinking Machines Lab's **[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (looped MoE: 128 experts, top-8, native NVFP4/MXFP8 weights, GQA + SWA-1024 + 4 global layers, zero weight modification or re-quantization) on **NVIDIA CMP 170HX (GA100, `sm_80`, 64 GB HBM2e)** through a pure-Rust OpenAI-compatible API: streaming tool calls, reasoning parsing, prefix-checkpoint KV reuse, **DSpark** full-vocab `top_p`-filtered exact Leviathan speculative decoding + lossless verbatim lookup drafts, and opt-in **DFlash2** and **`--kv-fp8`**. *(All benchmarks below were measured under a host-level 140 W/card cap; the engine does not enforce a power limit, so uncapped 250 W CMP 170HX or A100 cards run at their full configured limit.)*
 
 > [!TIP]
-> **100% lossless by default — `+25%` over vLLM Config B on real multi-turn agent workloads.**
-> On the canonical 343-request / 118,056-token agent replay (`N=4`, `T=1.0`, `~45K` median context, 140 W), a single card delivers **`323.8–333.7 tok/s`** (**`+25.2%` to `+25.6%`** over vLLM Config B, TTFT p99 `2.94–3.56 s`), **`347.6–360.6 tok/s`** at `T=0`, and up to **`380.2 tok/s`** at `N=8` — while passing the 4,072-position Config B full-envelope KL gate (`0.00477 <= 0.00535`, `98.04%` top-1, `0/20` greedy fails), `0/8,000` speculative argmax mismatches, and `13/13` exact Leviathan distribution tests (`0` zero-prob draws).
+> **100% lossless by default — `+27%` over vLLM Config B on real multi-turn agent workloads.**
+> On the canonical 343-request / 118,056-token agent replay (`N=4`, `T=1.0`, `~45K` median context, 140 W), a single card delivers **`328.0–338.1 tok/s`** (**`+26.8%` to `+27.2%`** over vLLM Config B, TTFT p99 `2.91–3.34 s`), **`355.4–373.3 tok/s`** at `T=0`, up to **`380.2 tok/s`** at `N=8`, and **`7,009 tok/s`** cold 32K prefill at 140 W — while passing the 4,072-position Config B full-envelope KL gate (`0.00477 <= 0.00535`, `98.04%` top-1, `0/20` greedy fails), `0` differing bits in `ink-inv` (BF16 & `--kv-fp8`), `0/8,000` speculative argmax mismatches, and exact Leviathan distribution tests (`0` zero-prob draws).
 
 > [!TIP]
 > **One card per replica, scales linearly to 8× CMP 170HX (`~2.6–3.0K tok/s` cluster goodput).**
@@ -26,7 +26,7 @@ Serve Thinking Machines Lab's **[Inkling-2-Mini](https://huggingface.co/thinking
 
 - **Checkpoint:** `thinkingmachines/Inkling-2-Mini` @ `ed40e7da` (native NVFP4 layers 0–19, MXFP8 layers 20–23, `18.98 GB` on GPU; weights mounted read-only and never modified)
 - **API:** OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/metrics`; model id `inkling-2-mini`; loopback ports `127.0.0.1:8400..8407`
-- **Engine:** Pure-Rust host stack (`ink-server`, `ink-sched`, `ink-runtime`, `ink-kernels`, `ink-tools`) + embedded byte-reproducible CUDA `sm_80` kernel pack (`367` kernels, `0` new spills)
+- **Engine:** Pure-Rust host stack (`ink-server`, `ink-sched`, `ink-runtime`, `ink-kernels`, `ink-tools`) + embedded byte-reproducible CUDA `sm_80` kernel pack (`386` kernels, `0` new spills)
 - **License:** [Apache License 2.0](LICENSE)
 
 ## Contents
@@ -69,30 +69,30 @@ Uses the MiaAI-Lab structured / code / prose prompt suite (`engine/tools/bench/m
 
 ### Prefill — cold prompt reading, one request (1 card)
 
-Measured with `ink-bench --mode prefill --prof 0` (chunk 2,048, 0 prefix cache hits) on `6D` and `67` cards at 250 W and 140 W, versus Config B (0 prefix cache hits) on `6D` at 140 W.
+Measured with `ink-bench --mode prefill --prof 0` (0 prefix cache hits; `v1.1.0` default chunk `3,072` at 32k/120k 140 W, `v1.0.0` chunk `2,048` on remaining cells) on `6D` and `67` cards at 250 W and 140 W, versus Config B (0 prefix cache hits) on `6D` at 140 W.
 
 | Context | Prompt tokens | **250 W TTFT & tok/s (`6D` / `67`)** | **140 W TTFT & tok/s (`6D` / `67`)** | Config B @ 140 W (`6D`) | 140 W vs Config B (`6D`) |
 |---:|---:|---:|---:|---:|---:|
 | **4k** | 4,096 | **`0.43 s` (`9,455`) / `0.44 s` (`9,308`)** | `0.53 s` (`7,665`) / `0.54 s` (`7,576`) | `0.71 s` (`5,745`) | **`+33.4%`** (`1.33×`) |
 | **8k** | 8,192 | **`0.89 s` (`9,196`) / `0.90 s` (`9,102`)** | `1.12 s` (`7,309`) / `1.12 s` (`7,295`) | `1.50 s` (`5,480`) | **`+33.4%`** (`1.33×`) |
 | **16k** | 16,384 | **`1.85 s` (`8,863`) / `1.86 s` (`8,789`)** | `2.32 s` (`7,053`) / `2.33 s` (`7,043`) | `3.11 s` (`5,277`) | **`+33.7%`** (`1.34×`) |
-| **32k** | 32,768 | **`3.92 s` (`8,360`) / `3.95 s` (`8,304`)** | `4.93 s` (`6,649`) / `4.93 s` (`6,643`) | `6.72 s` (`4,880`) | **`+36.3%`** (`1.36×`) |
+| **32k** | 32,768 | **`3.92 s` (`8,360`) / `3.95 s` (`8,304`)** | **`4.68 s` (`7,009`)** *(v1.1.0 `6D`)* / `4.93 s` (`6,643`) | `6.72 s` (`4,880`) | **`+43.6%`** (`1.44×`) |
 | **64k** | 65,536 | **`8.72 s` (`7,512`) / `8.78 s` (`7,468`)** | `10.96 s` (`5,981`) / `10.98 s` (`5,970`) | `15.65 s` (`4,187`) | **`+42.8%`** (`1.43×`) |
-| **120k** | 122,880 | **`19.27 s` (`6,378`) / `19.40 s` (`6,336`)** | `24.32 s` (`5,052`) / `24.29 s` (`5,060`) | `37.16 s` (`3,307`) | **`+52.8%`** (`1.53×`) |
+| **120k** | 122,880 | **`19.27 s` (`6,378`) / `19.40 s` (`6,336`)** | **`23.41 s` (`5,248`)** *(v1.1.0 `6D`)* / `24.29 s` (`5,060`) | `37.16 s` (`3,307`) | **`+58.7%`** (`1.59×`) |
 
 ### Realistic multi-turn agent workload (M1 replay, `~45K` median context)
 
-343 multi-turn agent requests (`118,056` output tokens, `~12.6M` prompt tokens, `~96%` prefix-cached, `0` errors) on the same benchmark GPUs (`6D` self-fed history, `67` recorded history). At 250 W, SM clocks uncap from `~1,050 MHz` to `~1,390 MHz`, lifting `6D` cards (1,728 MHz HBM) by `+35–37%` and `67` cards (1,458 MHz HBM) by `+23–25%`, while 140 W remains ~23% more energy-efficient (`0.38–0.43` vs `0.50–0.59 J/tok`). Full hill-climb ledger in [`docs/LEDGER.md`](docs/LEDGER.md).
+343 multi-turn agent requests (`118,056` output tokens, `~12.6M` prompt tokens, `~96%` prefix-cached, `0` errors) on the same benchmark GPUs (`6D` self-fed history, `67` recorded history). 140 W numbers are `v1.1.0` (`+1.8%` to `+4.1%` throughput and `−15%` to `−27%` TTFT p99 over `v1.0.0`); 250 W numbers are `v1.0.0` at uncapped stock power. At 250 W, SM clocks uncap from `~1,050 MHz` to `~1,390 MHz`, lifting `6D` cards (1,728 MHz HBM) by `+35–37%` and `67` cards (1,458 MHz HBM) by `+23–25%`, while 140 W remains ~23% more energy-efficient (`0.37–0.43` vs `0.50–0.59 J/tok`). Full hill-climb ledger in [`docs/LEDGER.md`](docs/LEDGER.md).
 
-| Card / Workload | **250 W M1** (TTFT p99, `J/tok`) | **140 W M1** (TTFT p99, `J/tok`) | Config B @ 140 W | 140 W vs Config B |
+| Card / Workload | **250 W M1** (`v1.0.0`, TTFT p99, `J/tok`) | **140 W M1** (`v1.1.0`, TTFT p99, `J/tok`) | Config B @ 140 W | 140 W vs Config B |
 |---|---:|---:|---:|---:|
-| **`6D` card · `N=4, T=1.0`** (self-fed) | **`440.2 tok/s`** (`2.32 s`, `0.563`) | **`323.8 tok/s`** (`3.56 s`, `0.432`) | `257.9 tok/s` (`5.35 s`) | **`+25.6%`** |
-| **`6D` card · `N=4, T=0`** (self-fed) | **`493.0 tok/s`** (`2.15 s`, `0.504`) | **`360.6 tok/s`** (`3.07 s`, `0.388`) | `303.1 tok/s` (`6.61 s`) | **`+19.0%`** |
-| **`67` card · `N=4, T=1.0`** (recorded) | **`413.7 tok/s`** (`2.42 s`, `0.594`) | **`333.7 tok/s`** (`2.94 s`, `0.418`) | `266.6 tok/s` (`6.06 s`) | **`+25.2%`** |
-| **`67` card · `N=4, T=0`** (recorded) | **`435.8 tok/s`** (`2.70 s`, `0.563`) | **`347.6 tok/s`** (`2.77 s`, `0.402`) | `293.8 tok/s` (`4.98 s`) | **`+18.3%`** |
-| **`6D` card · `N=8, T=1.0`** (`--slots 8, --lookup 8`) | **`483.7 tok/s`** (`5.60 s`, `0.510`) | **`358.9 tok/s`** (`7.65 s`, `0.388`) | `287.8 tok/s` | **`+24.7%`** |
-| **`6D` card · `N=8, T=1.0`** (`--lookup 0`) | — | **`380.2 tok/s`** (`7.02 s`, `0.368`) | `287.8 tok/s` | **`+32.1%`** |
-| **`67` card · `N=8, T=1.0`** (`--slots 8, --lookup 8`) | **`444.4 tok/s`** (`5.34 s`, `0.542`) | **`362.3 tok/s`** (`7.44 s`, `0.384`) | `301.2 tok/s` | **`+20.3%`** |
+| **`6D` card · `N=4, T=1.0`** (self-fed) | **`440.2 tok/s`** (`2.32 s`, `0.563`) | **`328.0 tok/s`** (`3.34 s`, `0.426`) | `257.9 tok/s` (`5.35 s`) | **`+27.2%`** |
+| **`6D` card · `N=4, T=0`** (self-fed) | **`493.0 tok/s`** (`2.15 s`, `0.504`) | **`373.3 tok/s`** (`2.64 s`, `0.374`) | `303.1 tok/s` (`6.61 s`) | **`+23.2%`** |
+| **`67` card · `N=4, T=1.0`** (recorded) | **`413.7 tok/s`** (`2.42 s`, `0.594`) | **`338.1 tok/s`** (`2.91 s`, `0.413`) | `266.6 tok/s` (`6.06 s`) | **`+26.8%`** |
+| **`67` card · `N=4, T=0`** (recorded) | **`435.8 tok/s`** (`2.70 s`, `0.563`) | **`355.4 tok/s`** (`2.50 s`, `0.393`) | `293.8 tok/s` (`4.98 s`) | **`+21.0%`** |
+| **`6D` card · `N=8, T=1.0`** (`--slots 8, --lookup 8`) | **`483.7 tok/s`** (`5.60 s`, `0.510`) | **`360.9 tok/s`** (`5.51 s`, `0.386`) | `287.8 tok/s` | **`+25.4%`** |
+| **`6D` card · `N=8, T=1.0`** (`--lookup 0`, `v1.0.0`) | — | **`380.2 tok/s`** (`7.02 s`, `0.368`) | `287.8 tok/s` | **`+32.1%`** |
+| **`67` card · `N=8, T=1.0`** (`--slots 8, --lookup 8`) | **`444.4 tok/s`** (`5.34 s`, `0.542`) | **`366.9 tok/s`** (`5.84 s`, `0.378`) | `301.2 tok/s` | **`+21.8%`** |
 
 ## Lossless verification
 
@@ -173,7 +173,8 @@ Set `DFLASH2_DIR=/path/to/Inkling-2-Mini-DFlash2` in `scripts/local.sh` (or pass
 - **Dedicated decode MoE + 1-byte `NVFP4_N1S1` scales:** `pmoe::moe_gemm_dec<FMT, MODE, 5, 4>` (`BN_DEC=16`, `ldmatrix.x2` for `NT=1`, 5 stages, `0` spills) + 1-byte native E4M3 scales save **`1.27 GB` VRAM** and cut decode MoE `−18%` without altering weights.
 - **Single-pass 1..16-row decode attention + lossless verbatim lookup drafts:** `decode_attn_kernel16<KV>` + 6-warp SWA ring kernel + Ptok3-gated n-gram lookup (`--lookup 8 --lookup-min 8`), adding **`+2.1–2.2%`** at `N=4 T=1.0` and **`+3.5–4.5%`** at `N=4 T=0` on top of the full stack.
 - **Fused decode router & glue:** smem-tiled K-group `router_decode_kernel<1>` / `route_select9`, `mg_down_dec_kernel`, BF16 TC `mg_tail_tc_dec_kernel`, 288-thread vectorized AttnRes + fused short-convs, weight-stationary `rel_logits_decode` (`4×1` `−13.8%`, `1×8` `−16.8%`, graph memory `10.5 → 8.4 MB`).
-- **In-kernel Tensor Core prefill relative bias:** eliminates `10.3 GB/chunk` `relk` HBM traffic in `prefill_attn` (both BF16 and `--kv-fp8`), plus SMEM `msgs`, faster `moe_build`/`mg_tail_tc`, and fused prefill `wqkv` (`+33%` to `+53%` cold prefill over Config B).
+- **In-kernel Tensor Core prefill relative bias + virtual messages (`v1.1.0`):** eliminates `10.3 GB/chunk` `relk` HBM traffic in `prefill_attn` (BF16 & `--kv-fp8`) and ~87 GB/32K of `msgs` HBM traffic via `vmsg_weights_kernel` (`msgs` `7.50×`), plus fused multi-query AttnRes (`−25.2%`), fast `__match_any_sync` `moe_build`, and default `--prefill-chunk 3072` (`+43.6%` to `+58.7%` cold prefill over Config B at 140 W).
+- **Zero-stall spec round, fast graph retargeting & single-pass decode `moe_build` (`v1.1.0`):** cached `CUgraphExec` kernel-node retargeting (`verify_us >= 200 µs`: `36.0% → 3.5%`, p90 `−70%`), coalesced 1-sync `verify_widths_and_drafts` + lazy lookup H2D + vectorized `softcap`, single-pass `__match_any_sync` decode `moe_build` (`−41.9%` `4×8`, `−50.1%` `4×16`), and opt-in early-exit Markov drafting (`INK_DSPARK_EARLY_TAU=0.70` for `N=1`/ragged).
 - **Fused DSpark Markov drafter + calibrated proposal `top_p=0.90`:** `68 → 58` graph nodes (`−9.9%` draft latency), fast cuBLASLt prefill `commit_rows` (`12.8×` faster), and exact 128-bit Leviathan rejection/residual sampling.
 - **Prefix-preserving scheduler (`ink-sched`):** exact resume + slot rollback checkpoints + `slot_steal_grace_ms = 150 ms` protecting freshly-parked multi-turn prefixes at `N == slots`.
 
@@ -185,6 +186,7 @@ Key `ink-server` flags (and `scripts/local.sh` / environment overrides):
 |---|---|---|
 | `--slots` / `SLOTS` | `8` (max `8` w/ DSpark) | Active + parked KV/ring slots (`acquire_slot` protects freshly-parked long prefixes) |
 | `--kv-pages` / `PAGES` | `504` (`1008` w/ FP8) | 1,024-token global KV pages (`516K` / `1.03M` tokens) |
+| `--prefill-chunk` | `3072` (`2048` saves ~3 GiB) | Max prefill chunk rows per step (`--backend engine` default) |
 | `--max-running` / `MAX_RUNNING` | `8` | Max concurrent active sessions per card |
 | `--lookup` / `--lookup-min` | `8` / `8` | Lossless verbatim n-gram lookup drafts appended to DSpark (`0` disables) |
 | `--verify-call-rows` | `1,2,3,4,6,8,10,12,14,16` | Ptok3 confidence-gated verify widths |

@@ -376,16 +376,28 @@ __device__ __forceinline__ float static_conv(const float* w, const bf16* x, int 
   return __fmul_rn(__fadd_rn(acc, ld(x + (size_t)t * ldx + c)), (float)(1.0 / 2.23606797749979));
 }
 // hidden conv (attn / mlp, C = H): y = bf16(conv). mode 0: out_bf = y. mode 1 (mlp): out_bf = bf16(partial32 + y).
-__global__ void hidden_conv_kernel(const bf16* x, const float* w, const bf16* state, long long st_slot_stride, Rows R,
-                                   int mode, const float* partial32, bf16* out, int T) {
-  const size_t n = (size_t)T * H;
-  for (size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; k < n; k += (size_t)gridDim.x * blockDim.x) {
-    const int t = (int)(k / H), c = (int)(k % H);
-    const int s = R.seg[t], r0 = R.row0[s];
-    const bf16* st = state + (size_t)R.slot[s] * st_slot_stride;
-    const float y = rr16(static_conv(w, x, H, st, t, t - r0, c, H));
-    out[k] = mode == 0 ? r16(y) : r16(__fadd_rn(partial32[k], y));
-  }
+// 2D grid (H / 256 = 9, T), block 256: zero 64-bit div, float4 weight load, bit-identical to original 1D grid-stride.
+__global__ void __launch_bounds__(256) hidden_conv_kernel(const bf16* __restrict__ x, const float* __restrict__ w,
+                                                          const bf16* __restrict__ state, long long st_slot_stride,
+                                                          Rows R, int mode, const float* __restrict__ partial32,
+                                                          bf16* __restrict__ out, int T) {
+  const int c = blockIdx.x * 256 + threadIdx.x;
+  const int t = blockIdx.y;
+  if (t >= T || c >= H) return;
+  const int s = R.seg[t], i = t - R.row0[s];
+  const bf16* st = state + (size_t)R.slot[s] * st_slot_stride;
+  const float4 wv = *reinterpret_cast<const float4*>(w + (size_t)c * 4);
+  const float x0 = ext_at(x, H, st, t, i, 0, c, H);
+  const float x1 = ext_at(x, H, st, t, i, 1, c, H);
+  const float x2 = ext_at(x, H, st, t, i, 2, c, H);
+  const float x3 = ld(x + (size_t)t * H + c);
+  float acc = __fmul_rn(wv.x, x0);
+  acc = __fadd_rn(acc, __fmul_rn(wv.y, x1));
+  acc = __fadd_rn(acc, __fmul_rn(wv.z, x2));
+  acc = __fadd_rn(acc, __fmul_rn(wv.w, x3));
+  const float y = rr16(__fmul_rn(__fadd_rn(acc, x3), (float)(1.0 / 2.23606797749979)));
+  const size_t k = (size_t)t * H + c;
+  out[k] = mode == 0 ? r16(y) : r16(__fadd_rn(partial32[k], y));
 }
 // key/value conv + post, grid (T, 8), block 128 (one kv head of k and v):
 //   local: conv_k = bf16(static_conv(kproj)), dynamic (full): w_lag = static[lag] + dyn[t, head, lag], newest first,
@@ -548,13 +560,23 @@ __global__ void gather_rows_bf16_kernel(const float* h, const int* rows, bf16* o
   const int r = blockIdx.x;
   for (int i = threadIdx.x; i < H; i += blockDim.x) out[(size_t)r * H + i] = r16(h[(size_t)rows[r] * H + i]);
 }
-// logits[r, :200058] = tanh(x / 30) * 30 in place (padded tail untouched)
-__global__ void softcap_kernel(float* lg, int rows, int ld, int vocab) {
-  const size_t n = (size_t)rows * vocab;
-  for (size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; k < n; k += (size_t)gridDim.x * blockDim.x) {
-    const size_t r = k / vocab, c = k % vocab;
-    float* p = lg + r * ld + c;
-    *p = __fmul_rn(tanhf(__fdiv_rn(*p, 30.0f)), 30.0f);
+// logits[r, :200058] = tanh(x / 30) * 30 in place (padded tail untouched); 2D grid (blocks, rows), float4 coalesced
+__global__ void __launch_bounds__(256) softcap_kernel(float* lg, int rows, int ld, int vocab) {
+  const int r = blockIdx.y;
+  if (r >= rows) return;
+  float* row = lg + (size_t)r * ld;
+  const int c4 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (c4 + 3 < vocab && (ld & 3) == 0) {
+    float4 v = *reinterpret_cast<const float4*>(row + c4);
+    v.x = __fmul_rn(tanhf(__fdiv_rn(v.x, 30.0f)), 30.0f);
+    v.y = __fmul_rn(tanhf(__fdiv_rn(v.y, 30.0f)), 30.0f);
+    v.z = __fmul_rn(tanhf(__fdiv_rn(v.z, 30.0f)), 30.0f);
+    v.w = __fmul_rn(tanhf(__fdiv_rn(v.w, 30.0f)), 30.0f);
+    *reinterpret_cast<float4*>(row + c4) = v;
+  } else {
+    for (int c = c4; c < vocab && c < c4 + 4; ++c) {
+      row[c] = __fmul_rn(tanhf(__fdiv_rn(row[c], 30.0f)), 30.0f);
+    }
   }
 }
 

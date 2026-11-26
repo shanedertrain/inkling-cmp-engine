@@ -622,6 +622,34 @@ pub trait SpecRuntime {
             "this runtime has no gated verify width".to_owned(),
         ))
     }
+    /// Coalesced verify widths + drafter drafts download in a single D2H sync: packs `[widths[0..n], drafts[0..7*n]]`
+    /// into `packed` (`(1 + DRAFTS) * n` i32s on device) when supported, falling back to `verify_widths` + `download`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError`] when a buffer is too small or not the runtime's, or the device call fails.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_widths_and_drafts(
+        &mut self,
+        conf: Option<DevBuf>,
+        drafts: DevBuf,
+        tau: f32,
+        n: usize,
+        packed: DevBuf,
+        widths_out: &mut Vec<i32>,
+        drafts_out: &mut [i32],
+    ) -> Result<(), RuntimeError> {
+        if let Some(c) = conf {
+            let wbuf = packed
+                .i32s(0, n)
+                .ok_or_else(|| RuntimeError::request("packed buffer too small for widths".to_owned()))?;
+            self.verify_widths(c, tau, n, wbuf, widths_out)?;
+        } else {
+            widths_out.clear();
+            widths_out.resize(n, (DRAFTS + 1) as i32);
+        }
+        self.download(drafts, drafts_out)
+    }
     /// DSpark features of call rows `rows[0..n]` of the last forward call into `dst` (`n` feature rows).
     ///
     /// # Safety

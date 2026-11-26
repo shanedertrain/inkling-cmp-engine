@@ -265,6 +265,10 @@ fn mock_backend(tok: &Arc<Tokenizer>, delay: Duration, tool_call: Option<&(Strin
     Ok(mock)
 }
 
+/// Default prefill chunk for `--backend engine`: 3,072 rows fits in 64 GiB with 504 pages + 8 slots (`3.7 GiB` free),
+/// cuts M1 prefill wall time and TTFT p90/p99 (`bench/raw/2026-11-26-prefill-opt/`), and `--prefill-chunk 2048` lowers it.
+const DEFAULT_ENGINE_PREFILL_CHUNK: u32 = 3072;
+
 /// The scheduler configuration of the fake and engine back ends.
 fn sched_config(cli: &Cli) -> Config {
     let mut cfg = Config::default();
@@ -274,8 +278,17 @@ fn sched_config(cli: &Cli) -> Config {
     if let Some(ms) = cli.stall_budget_ms {
         cfg.stall_budget_ms = ms;
     }
-    if let Some(rows) = cli.prefill_chunk {
+    if matches!(cli.backend, BackendKind::Engine) {
+        let rows = cli.prefill_chunk.unwrap_or(DEFAULT_ENGINE_PREFILL_CHUNK);
         cfg.max_chunk = rows;
+        cfg.max_prefill_rows = cfg.max_prefill_rows.max(rows);
+        cfg.t_max = cfg.t_max.max(rows + 64);
+        cfg.cost_prefill_tok_ms = 0.140;
+        cfg.cost_attn_ms_per_tok_kkey = 0.00195;
+    } else if let Some(rows) = cli.prefill_chunk {
+        cfg.max_chunk = rows;
+        cfg.max_prefill_rows = cfg.max_prefill_rows.max(rows);
+        cfg.t_max = cfg.t_max.max(rows + 64);
     }
     if let Some(n) = cli.session_cap {
         cfg.session_cap_tokens = n;
@@ -332,10 +345,7 @@ fn engine_backend(cli: &Cli) -> Result<(EngineBackend, Source)> {
         .clone()
         .context("--backend engine needs --gemm-algos (pinned cuBLASLt algorithms)")?;
     let default_cfg = EngineConfig::default();
-    let max_chunk = cli
-        .prefill_chunk
-        .unwrap_or(default_cfg.max_chunk)
-        .max(default_cfg.max_chunk);
+    let max_chunk = cli.prefill_chunk.unwrap_or(DEFAULT_ENGINE_PREFILL_CHUNK);
     let config = EngineConfig {
         model_dir: cli.model_dir.clone(),
         gemm_algos,

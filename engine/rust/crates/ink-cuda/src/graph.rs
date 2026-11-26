@@ -368,6 +368,67 @@ impl Graph {
         Ok(())
     }
 
+    /// Reads and caches the driver parameter template and initial value of a single-parameter kernel node `index`,
+    /// so later in-place updates avoid `cuGraphKernelNodeGetParams` and `cuFuncGetParamInfo`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Graph::kernel_param`].
+    pub fn cache_kernel_node<T: bytemuck::Pod>(&self, index: usize) -> Result<(CachedKernelNode, T)> {
+        let size = std::mem::size_of::<T>();
+        let p = self.kernel_node(index, size)?;
+        // SAFETY: kernelParams[0] points to the node's copy of its one parameter, `size` bytes (checked above).
+        let val = unsafe { std::ptr::read_unaligned((*p.kernelParams).cast::<T>()) };
+        Ok((
+            CachedKernelNode {
+                index,
+                params: p,
+                param_size: size,
+            },
+            val,
+        ))
+    }
+
+    /// Updates a previously cached kernel node's grid and parameter value in the graph executable only
+    /// (`cuGraphExecKernelNodeSetParams_v2`), with zero `GetParams` / `GetParamInfo` calls.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Graph`] on parameter size mismatch; the driver error.
+    pub fn update_cached_kernel_node<T: bytemuck::Pod>(
+        &mut self,
+        cached: &mut CachedKernelNode,
+        grid: [u32; 3],
+        param: &T,
+    ) -> Result<()> {
+        if cached.param_size != std::mem::size_of::<T>() {
+            return Err(CudaError::Graph(format!(
+                "node {}: cached param size {}, got {}",
+                cached.index,
+                cached.param_size,
+                std::mem::size_of::<T>()
+            )));
+        }
+        let mut p = cached.params;
+        let mut arg: *mut std::ffi::c_void = std::ptr::from_ref(param).cast_mut().cast();
+        p.kernelParams = &mut arg;
+        p.extra = std::ptr::null_mut();
+        [p.gridDimX, p.gridDimY, p.gridDimZ] = grid;
+        let node = self.raw[cached.index];
+        // SAFETY: node belongs to self.exec's graph (both owned by self); p is its own validated parameter struct with
+        // kernelParams pointing to one live T of checked size.
+        check_driver("cuGraphExecKernelNodeSetParams", unsafe {
+            sys::cuGraphExecKernelNodeSetParams_v2(self.exec.cu_graph_exec(), node, &p)
+        })?;
+        cached.params.gridDimX = grid[0];
+        cached.params.gridDimY = grid[1];
+        cached.params.gridDimZ = grid[2];
+        if let Some((g, _, _)) = self.nodes[cached.index].dims.as_mut() {
+            *g = grid;
+        }
+        Ok(())
+    }
+
     /// Sets every node of `region` that can be disabled to `state` (the C++ `apply_ablation`); returns how many.
     ///
     /// # Errors
@@ -391,6 +452,22 @@ pub enum NodeState {
     Enabled,
     /// The node is skipped.
     Disabled,
+}
+
+/// Cached driver parameter template for a single-parameter kernel node ([`Graph::cache_kernel_node`]),
+/// used by [`Graph::update_cached_kernel_node`] to update `CUgraphExec` without `GetParams` / `GetParamInfo`.
+#[derive(Debug, Clone)]
+pub struct CachedKernelNode {
+    index: usize,
+    params: sys::CUDA_KERNEL_NODE_PARAMS,
+    param_size: usize,
+}
+
+impl CachedKernelNode {
+    /// Node index in [`Graph::nodes`].
+    pub fn index(&self) -> usize {
+        self.index
+    }
 }
 
 type KernelInfo = (Option<String>, Option<([u32; 3], [u32; 3], u32)>);
