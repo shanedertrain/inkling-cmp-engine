@@ -14,6 +14,7 @@ axum.workspace = true
 clap.workspace = true
 ink-api.workspace = true
 ink-backend.workspace = true
+ink-model.workspace = true
 ink-record.workspace = true
 ink-rt-api.workspace = true
 ink-runtime.workspace = true

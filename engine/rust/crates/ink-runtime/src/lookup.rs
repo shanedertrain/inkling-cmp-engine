@@ -14,7 +14,63 @@ const KS: [usize; 3] = [5, 4, 3];
 const BACK_CAP: usize = 64;
 
 /// Maximum hash-collision / self-match chain steps walked per lookup.
-const MAX_CHAIN: usize = 8;
+pub const MAX_CHAIN: usize = 32;
+
+/// Distance threshold (tokens) beyond DFlash2's SWA-2048 attention window.
+pub const FAR_DIST: usize = 2048;
+
+/// Policy for hybrid anchor-triggered + post-draft verbatim lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LookupPolicy {
+    /// Rescue SWA-blind far matches (`dist > 2048`) via anchor lookup when `back >= far_min` (`0` = off).
+    pub far_min: usize,
+    /// Cap far-anchor drafts when `back < lookup_min` (`0` = uncapped `draft_k`) to avoid 16-row verify on weak hits.
+    pub far_cap_short: usize,
+}
+
+impl LookupPolicy {
+    /// Selects the calibrated hybrid policy for the active drafter:
+    /// - Global-attention drafter (DSpark): relies on longest-back-in-chain (`MAX_CHAIN = 32`) post-draft extension.
+    /// - SWA-2048 drafter (DFlash2): rescues SWA-blind far matches (`dist > 2048`) via anchor lookup at `back >= 7`
+    ///   (capped to 7 drafts / width 8 when `back < lookup_min`, full 15 drafts / width 16 when `back >= lookup_min`),
+    ///   leaving near SWA rounds untouched.
+    #[must_use]
+    pub const fn for_drafter(is_swa_drafter: bool) -> Self {
+        if is_swa_drafter {
+            Self {
+                far_min: 7,
+                far_cap_short: 7,
+            }
+        } else {
+            Self {
+                far_min: 0,
+                far_cap_short: 0,
+            }
+        }
+    }
+
+    /// Whether anchor-triggered lookup is enabled for this drafter.
+    #[must_use]
+    pub const fn uses_anchor(self) -> bool {
+        self.far_min > 0
+    }
+
+    /// Whether an anchor match `(back, dist)` triggers an override.
+    #[must_use]
+    pub const fn anchor_triggers(self, back: usize, dist: usize) -> bool {
+        self.far_min > 0 && dist > FAR_DIST && back >= self.far_min
+    }
+
+    /// Maximum drafts to propose on an anchor trigger of backward match length `back`.
+    #[must_use]
+    pub const fn anchor_cap(self, back: usize, lookup_min: usize, draft_k: usize) -> usize {
+        if self.far_cap_short > 0 && back < lookup_min && self.far_cap_short < draft_k {
+            self.far_cap_short
+        } else {
+            draft_k
+        }
+    }
+}
 
 /// Sentinel for "no earlier occurrence" in `prev`.
 const NONE: usize = usize::MAX;
@@ -127,10 +183,17 @@ impl NgramIndex {
         }
     }
 
-    /// Queries the virtual stream `self.tokens + extra` for the most recent earlier occurrence of its trailing
-    /// `k`-gram (`k = 5, 4, 3`). Copies up to `out.len()` tokens that followed that occurrence into `out` and returns
+    /// Queries the virtual stream `self.tokens + extra` for the longest backward verbatim match among the most recent
+    /// `MAX_CHAIN` earlier occurrences of its trailing `k`-gram (`k = 5, 4, 3`, breaking ties by most recent position).
+    /// Copies up to `out.len()` tokens that followed that occurrence into `out` and returns
     /// `(proposed_count, backward_match_len)`.
     pub fn propose(&self, extra: &[i32], out: &mut [i32]) -> (usize, usize) {
+        let (cnt, back, _) = self.propose_dist(extra, out);
+        (cnt, back)
+    }
+
+    /// As [`NgramIndex::propose`], also returning the distance `dist = n - 1 - match_end` in tokens.
+    pub fn propose_dist(&self, extra: &[i32], out: &mut [i32]) -> (usize, usize, usize) {
         let tlen = self.tokens.len();
         let n = tlen + extra.len();
         let at = |idx: usize| -> i32 {
@@ -154,25 +217,37 @@ impl NgramIndex {
             };
             let mut j = start_j;
             let mut steps = 0;
+            let mut best_j = NONE;
+            let mut best_back = 0usize;
             while j != NONE && steps < MAX_CHAIN {
                 steps += 1;
                 // Skip the suffix itself when extra is empty.
                 if j + 1 < n && j + 1 >= k && self.tokens[j + 1 - k..=j] == key[..k] {
-                    let mut back = 0;
+                    let mut back = k;
                     let limit = BACK_CAP.min(j + 1);
                     while back < limit && at(j - back) == at(n - 1 - back) {
                         back += 1;
                     }
-                    let count = (n - 1 - j).min(out.len());
-                    for (c, dst) in out[..count].iter_mut().enumerate() {
-                        *dst = at(j + 1 + c);
+                    if back > best_back {
+                        best_back = back;
+                        best_j = j;
+                        if best_back >= BACK_CAP {
+                            break;
+                        }
                     }
-                    return (count, back);
                 }
                 j = self.prev[j][q];
             }
+            if best_j != NONE {
+                let dist = n - 1 - best_j;
+                let count = dist.min(out.len());
+                for (c, dst) in out[..count].iter_mut().enumerate() {
+                    *dst = at(best_j + 1 + c);
+                }
+                return (count, best_back, dist);
+            }
         }
-        (0, 0)
+        (0, 0, 0)
     }
 }
 
@@ -228,5 +303,44 @@ mod tests {
         assert_eq!(back, 5);
         assert_eq!(cnt, 8);
         assert_eq!(&prop[..4], &[50, 51, 52, 53]);
+    }
+
+    #[test]
+    fn prefers_longer_earlier_match_over_short_recent_match() {
+        let mut idx = NgramIndex::new();
+        // Earlier 10-token span [10..20] followed by [200, 201, 202]
+        let mut toks: Vec<i32> = (10..20).collect();
+        toks.extend([200, 201, 202]);
+        // Noise + recent 5-token coincidental match [15..20] followed by [900, 901, 902]
+        toks.extend([500, 501, 502, 15, 16, 17, 18, 19, 900, 901, 902]);
+        // Current suffix [10..19] (anchor will be 19)
+        toks.extend(10..19);
+        idx.extend_from_slice(&toks);
+
+        let mut prop = [-1; 4];
+        let (cnt, back, dist) = idx.propose_dist(&[19], &mut prop);
+        assert_eq!(back, 10);
+        assert_eq!(cnt, 4);
+        assert_eq!(&prop[..3], &[200, 201, 202]);
+        assert!(dist > 15);
+    }
+
+    #[test]
+    fn lookup_policy_matches_drafter_architecture() {
+        let dspark = LookupPolicy::for_drafter(false);
+        assert!(!dspark.uses_anchor());
+        assert!(!dspark.anchor_triggers(12, 500));
+        assert!(!dspark.anchor_triggers(12, 4000));
+
+        let df2 = LookupPolicy::for_drafter(true);
+        assert!(df2.uses_anchor());
+        // Near (<= 2048): leaves DFlash2's native SWA-2048 untouched
+        assert!(!df2.anchor_triggers(12, 500));
+        assert!(!df2.anchor_triggers(12, 2048));
+        // Far (> 2048): rescues at back >= 7, capped to 7 drafts when back < lookup_min (8)
+        assert!(!df2.anchor_triggers(6, 4000));
+        assert!(df2.anchor_triggers(7, 4000));
+        assert_eq!(df2.anchor_cap(7, 8, 15), 7);
+        assert_eq!(df2.anchor_cap(8, 8, 15), 15);
     }
 }

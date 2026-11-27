@@ -8,7 +8,7 @@ use ink_cuda::{Bf16, DevPtr, KernelArgs, LaunchCfg, Result, Stream};
 use crate::{CubinInfo, F16, KernelInfo, Kernels, Ptr, push_ptr};
 
 /// Id of the kernel pack this file was generated from (`manifest.json` `kpack_id`).
-pub const KPACK_ID: &str = "9af3241f6232e8cf24bae61bae11efeeb563c14f5185deef501db3154145a713";
+pub const KPACK_ID: &str = "6591b3fdcf8e660a021a28444ab15090d1f98d7cca5c74c6bc09409b2c249c45";
 
 /// FNV-1a 64 of the generator's sources (`xtask/src/kernels/`), checked by `check_fresh.py`: a gen.rs written
 /// by another generator version is stale even when the pack is not.
@@ -26,9 +26,9 @@ pub const CUBINS: [CubinInfo; 2] = [
     CubinInfo {
         tu: "drafter",
         file: "pack_drafter.cubin",
-        bytes: 16218704,
-        sha256: "a467ae74705c4f867e0ed67238c98150323f71d2f6fb71e57598a8d4f9f88a6b",
-        fnv1a64: 0xb94689be4352b670,
+        bytes: 16540496,
+        sha256: "d1ca7bb0ef31c94535fcb50d231617db30cb882c83b70a91ec95cd9f35508af6",
+        fnv1a64: 0xb22d9b8f63514a2a,
     },
 ];
 
@@ -791,10 +791,14 @@ pub enum KernelId {
     Df2GroupedConvOutResNormKernel,
     /// `df2::kv_norm_rope_store_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, __nv_bfloat16*, int)`
     Df2KvNormRopeStoreKernel,
+    /// `df2::kv_norm_rope_store_global_e4m3_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int const*, int const*, unsigned char*, unsigned char*, float*, float*, int, int, int)`
+    Df2KvNormRopeStoreGlobalE4m3Kernel,
     /// `df2::qkv_norm_rope_blk_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, int)`
     Df2QkvNormRopeBlkKernel,
     /// `df2::swa_attn_split_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int const*, int const*, float*, float*, int, int)`
     Df2SwaAttnSplitKernel,
+    /// `df2::global_attn_e4m3_split_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, unsigned char const*, unsigned char const*, float const*, float const*, int const*, int const*, float*, float*, int, int, int, int)`
+    Df2GlobalAttnE4m3SplitKernel,
     /// `df2::swa_attn_reduce_kernel(float const*, float const*, __nv_bfloat16*, int, int)`
     Df2SwaAttnReduceKernel,
     /// `df2::silu_mul_kernel(__nv_bfloat16 const*, __nv_bfloat16*, int)`
@@ -810,7 +814,7 @@ pub enum KernelId {
 }
 
 /// Kernel table, in [`KernelId`] order.
-pub static KERNELS: [KernelInfo; 386] = [
+pub static KERNELS: [KernelInfo; 388] = [
     KernelInfo {
         key: "da_combine_kernel",
         tu: 0,
@@ -4562,6 +4566,27 @@ pub static KERNELS: [KernelInfo; 386] = [
         coop: false,
     },
     KernelInfo {
+        key: "df2_kv_norm_rope_store_global_e4m3_kernel",
+        tu: 1,
+        symbol: "_ZN3df237kv_norm_rope_store_global_e4m3_kernelEPK13__nv_bfloat16S2_S2_PKiS4_PhS5_PfS6_iii",
+        params: &[
+            "__nv_bfloat16 const*",
+            "__nv_bfloat16 const*",
+            "__nv_bfloat16 const*",
+            "int const*",
+            "int const*",
+            "unsigned char*",
+            "unsigned char*",
+            "float*",
+            "float*",
+            "int",
+            "int",
+            "int",
+        ],
+        param_bytes: 84,
+        coop: false,
+    },
+    KernelInfo {
         key: "df2_qkv_norm_rope_blk_kernel",
         tu: 1,
         symbol: "_ZN3df224qkv_norm_rope_blk_kernelEPK13__nv_bfloat16S2_S2_S2_PKiS4_PS0_S5_S5_i",
@@ -4598,6 +4623,30 @@ pub static KERNELS: [KernelInfo; 386] = [
             "int",
         ],
         param_bytes: 80,
+        coop: false,
+    },
+    KernelInfo {
+        key: "df2_global_attn_e4m3_split_kernel",
+        tu: 1,
+        symbol: "_ZN3df229global_attn_e4m3_split_kernelEPK13__nv_bfloat16S2_S2_PKhS4_PKfS6_PKiS8_PfS9_iiii",
+        params: &[
+            "__nv_bfloat16 const*",
+            "__nv_bfloat16 const*",
+            "__nv_bfloat16 const*",
+            "unsigned char const*",
+            "unsigned char const*",
+            "float const*",
+            "float const*",
+            "int const*",
+            "int const*",
+            "float*",
+            "float*",
+            "int",
+            "int",
+            "int",
+            "int",
+        ],
+        param_bytes: 104,
         coop: false,
     },
     KernelInfo {
@@ -9932,6 +9981,34 @@ pub struct Df2KvNormRopeStoreKernelArgs<'a> {
     pub n: i32,
 }
 
+/// Arguments of [`Kernels::df2_kv_norm_rope_store_global_e4m3_kernel`] by C++ parameter name (`df2::kv_norm_rope_store_global_e4m3_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int const*, int const*, unsigned char*, unsigned char*, float*, float*, int, int, int)`).
+pub struct Df2KvNormRopeStoreGlobalE4m3KernelArgs<'a> {
+    /// `__nv_bfloat16 const*`
+    pub kv: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub k_norm: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub cos_sin: Ptr<'a, Bf16>,
+    /// `int const*`
+    pub pos: Ptr<'a, i32>,
+    /// `int const*`
+    pub sess: Ptr<'a, i32>,
+    /// `unsigned char*`
+    pub k_glob: Ptr<'a, u8>,
+    /// `unsigned char*`
+    pub v_glob: Ptr<'a, u8>,
+    /// `float*`
+    pub ks_glob: Ptr<'a, f32>,
+    /// `float*`
+    pub vs_glob: Ptr<'a, f32>,
+    /// `int`
+    pub n: i32,
+    /// `int`
+    pub max_ctx: i32,
+    /// `int`
+    pub kv_stride: i32,
+}
+
 /// Arguments of [`Kernels::df2_qkv_norm_rope_blk_kernel`] by C++ parameter name (`df2::qkv_norm_rope_blk_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, int)`).
 pub struct Df2QkvNormRopeBlkKernelArgs<'a> {
     /// `__nv_bfloat16 const*`
@@ -9978,6 +10055,40 @@ pub struct Df2SwaAttnSplitKernelArgs<'a> {
     pub part_o: Ptr<'a, f32>,
     /// `int`
     pub k: i32,
+    /// `int`
+    pub splits: i32,
+}
+
+/// Arguments of [`Kernels::df2_global_attn_e4m3_split_kernel`] by C++ parameter name (`df2::global_attn_e4m3_split_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, unsigned char const*, unsigned char const*, float const*, float const*, int const*, int const*, float*, float*, int, int, int, int)`).
+pub struct Df2GlobalAttnE4m3SplitKernelArgs<'a> {
+    /// `__nv_bfloat16 const*`
+    pub q_blk: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub k_blk: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub v_blk: Ptr<'a, Bf16>,
+    /// `unsigned char const*`
+    pub k_glob: Ptr<'a, u8>,
+    /// `unsigned char const*`
+    pub v_glob: Ptr<'a, u8>,
+    /// `float const*`
+    pub ks_glob: Ptr<'a, f32>,
+    /// `float const*`
+    pub vs_glob: Ptr<'a, f32>,
+    /// `int const*`
+    pub pos: Ptr<'a, i32>,
+    /// `int const*`
+    pub sel: Ptr<'a, i32>,
+    /// `float*`
+    pub part_ml: Ptr<'a, f32>,
+    /// `float*`
+    pub part_o: Ptr<'a, f32>,
+    /// `int`
+    pub k: i32,
+    /// `int`
+    pub max_ctx: i32,
+    /// `int`
+    pub kv_stride: i32,
     /// `int`
     pub splits: i32,
 }
@@ -18753,6 +18864,46 @@ impl Kernels {
         unsafe { stream.launch(self.function(KernelId::Df2KvNormRopeStoreKernel), cfg, &mut args) }
     }
 
+    /// `df2::kv_norm_rope_store_global_e4m3_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int const*, int const*, unsigned char*, unsigned char*, float*, float*, int, int, int)` in `pack_drafter.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn df2_kv_norm_rope_store_global_e4m3_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: Df2KvNormRopeStoreGlobalE4m3KernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.kv);
+        push_ptr(&mut args, a.k_norm);
+        push_ptr(&mut args, a.cos_sin);
+        push_ptr(&mut args, a.pos);
+        push_ptr(&mut args, a.sess);
+        push_ptr(&mut args, a.k_glob);
+        push_ptr(&mut args, a.v_glob);
+        push_ptr(&mut args, a.ks_glob);
+        push_ptr(&mut args, a.vs_glob);
+        args.value(&a.n);
+        args.value(&a.max_ctx);
+        args.value(&a.kv_stride);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe {
+            stream.launch(
+                self.function(KernelId::Df2KvNormRopeStoreGlobalE4m3Kernel),
+                cfg,
+                &mut args,
+            )
+        }
+    }
+
     /// `df2::qkv_norm_rope_blk_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, int)` in `pack_drafter.cubin`.
     ///
     /// # Safety
@@ -18816,6 +18967,43 @@ impl Kernels {
         // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
         // the kernel's memory contract is the caller's (# Safety).
         unsafe { stream.launch(self.function(KernelId::Df2SwaAttnSplitKernel), cfg, &mut args) }
+    }
+
+    /// `df2::global_attn_e4m3_split_kernel(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*, unsigned char const*, unsigned char const*, float const*, float const*, int const*, int const*, float*, float*, int, int, int, int)` in `pack_drafter.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn df2_global_attn_e4m3_split_kernel(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: Df2GlobalAttnE4m3SplitKernelArgs<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.q_blk);
+        push_ptr(&mut args, a.k_blk);
+        push_ptr(&mut args, a.v_blk);
+        push_ptr(&mut args, a.k_glob);
+        push_ptr(&mut args, a.v_glob);
+        push_ptr(&mut args, a.ks_glob);
+        push_ptr(&mut args, a.vs_glob);
+        push_ptr(&mut args, a.pos);
+        push_ptr(&mut args, a.sel);
+        push_ptr(&mut args, a.part_ml);
+        push_ptr(&mut args, a.part_o);
+        args.value(&a.k);
+        args.value(&a.max_ctx);
+        args.value(&a.kv_stride);
+        args.value(&a.splits);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::Df2GlobalAttnE4m3SplitKernel), cfg, &mut args) }
     }
 
     /// `df2::swa_attn_reduce_kernel(float const*, float const*, __nv_bfloat16*, int, int)` in `pack_drafter.cubin`.

@@ -15,13 +15,16 @@
 mod ops;
 
 use std::cell::{Cell, RefCell};
+use std::fs;
+use std::path::Path;
 use std::rc::Rc;
 
 use ink_cuda::{AlgoPins, Arena, Bf16, Context, CudaError, DevBuf, Dtype, GemmShape, Graph, LtGemm, PlanClass, Stream};
 use ink_kernels::{F16, KernelId, Kernels};
 use ink_model::dflash2::{
-    self as m, ATTN_SMEM, ATTN_SPLITS, BLK, CONV_PROJ_N, COS_SIN_POS, DFlash2Checkpoints, DRAFTS, H, HD, HEAD_N, INTER,
-    KVH, MASK_TOKEN_ID, NH, NLAYERS, RING, ROPE_THETA, SEL_RANK, TOP_K, TOPK_CHUNKS, VOCAB_PAD,
+    self as m, ATTN_SMEM, ATTN_SPLITS, BLK, CONV_PROJ_N, COS_SIN_POS, DFlash2Checkpoints, DFlash2Config, DRAFTS,
+    GLOBAL_ATTN_SMEM, GLOBAL_ATTN_SPLITS, H, HD, HEAD_N, INTER, KVH, LayerType, MASK_TOKEN_ID, NH, NLAYERS, RING,
+    SEL_RANK, TOP_K, TOPK_CHUNKS, VOCAB_PAD,
 };
 use ink_rt_api::{DevBuf as ApiBuf, DraftConfig, Drafter, FEAT_ROW_BYTES, ProposalBufs, RuntimeError, VerifyWidth};
 
@@ -74,11 +77,24 @@ struct Weights {
     head_i8: Option<(DevBuf<i8>, DevBuf<f32>)>,
     mask_emb: DevBuf<Bf16>,
     cos_sin: DevBuf<Bf16>,
+    cos_sin_global: Option<DevBuf<Bf16>>,
+}
+
+enum LayerKv {
+    Swa {
+        k_ring: DevBuf<Bf16>,
+        v_ring: DevBuf<Bf16>,
+    },
+    GlobalE4m3 {
+        k_glob: DevBuf<u8>,
+        v_glob: DevBuf<u8>,
+        ks_glob: DevBuf<f32>,
+        vs_glob: DevBuf<f32>,
+    },
 }
 
 struct State {
-    k_ring: Vec<DevBuf<Bf16>>,
-    v_ring: Vec<DevBuf<Bf16>>,
+    kv: Vec<LayerKv>,
     // Commit scratch (up to COMMIT_CHUNK rows)
     ctx_h: DevBuf<Bf16>,
     ctx_norm: DevBuf<Bf16>,
@@ -156,7 +172,22 @@ fn df2_shapes() -> Vec<(GemmShape, u32)> {
     ]
 }
 
-fn arena_bytes(sessions: usize, shared_target: bool, use_i8_head: bool) -> usize {
+fn part_slots_for(sessions: usize, has_global: bool) -> usize {
+    let base = sessions * ATTN_SPLITS;
+    if has_global {
+        base.max(72).max(sessions * 8)
+    } else {
+        base
+    }
+}
+
+fn arena_bytes(
+    sessions: usize,
+    kv_stride: usize,
+    cfg: &DFlash2Config,
+    shared_target: bool,
+    use_i8_head: bool,
+) -> usize {
     let w_layers = NLAYERS
         * ((2 * H
             + 4 * H
@@ -169,29 +200,39 @@ fn arena_bytes(sessions: usize, shared_target: bool, use_i8_head: bool) -> usize
             + 2 * INTER * H
             + H * INTER)
             * 2);
-    let w_other = (H * 4 * H + 2 * H + SEL_RANK * H + 2 * VOCAB_PAD * SEL_RANK + H + COS_SIN_POS * HD) * 2;
+    let cos_sin_tables = 1 + usize::from(cfg.has_global());
+    let w_other =
+        (H * 4 * H + 2 * H + SEL_RANK * H + 2 * VOCAB_PAD * SEL_RANK + H + cos_sin_tables * COS_SIN_POS * HD) * 2;
     let w_target = if shared_target {
         0
     } else {
         (VOCAB_PAD * H + H + HEAD_N * H) * 2
     };
     let w_head_i8 = if use_i8_head { HEAD_N * H + HEAD_N * 4 } else { 0 };
-    let kv_rings = NLAYERS * 2 * sessions * KVH * RING * HD * 2;
+    let kv_swa = cfg.swa_count() * 2 * sessions * KVH * RING * HD * 2;
+    let kv_global = cfg.global_count() * (2 * sessions * KVH * kv_stride * HD + 2 * sessions * KVH * kv_stride * 4);
     let commit_s = (COMMIT_CHUNK * (2 * H + 2 * KVH * HD)) * 2;
     let rows = sessions * BLK;
     let drows = sessions * DRAFTS;
+    let part_slots = part_slots_for(sessions, cfg.has_global());
     let blk_s = rows * (4 * H + CONV_PROJ_N + (NH + 2 * KVH) * HD + (NH + 2 * KVH) * HD + NH * HD + 3 * INTER) * 2
-        + sessions * KVH * ATTN_SPLITS * 32 * (2 + HD) * 4
+        + part_slots * KVH * 32 * (2 + HD) * 4
         + drows * H * 4
         + drows * (HEAD_N + SEL_RANK + TOPK_CHUNKS + 1 + 2 * TOPK_CHUNKS * TOP_K + 2 * TOP_K) * 4
         + sessions * (3 + DRAFTS) * 4;
     // Generous alignment slack (64 MiB)
-    w_layers + w_other + w_target + w_head_i8 + kv_rings + commit_s + blk_s + (64 << 20)
+    w_layers + w_other + w_target + w_head_i8 + kv_swa + kv_global + commit_s + blk_s + (64 << 20)
 }
 
-/// Split-KV partitions for `k` active sessions (targets >= 192 CTAs across 96 SMs, capped by `ATTN_SPLITS`).
+/// Split-KV partitions for `k` active sessions on SWA-2048 layers (targets >= 192 CTAs across 96 SMs).
 fn splits_for(k: usize) -> usize {
     (256 / (k * KVH)).clamp(4, ATTN_SPLITS)
+}
+
+/// Split-KV partitions for `k` active sessions on global E4M3 layers (Design A: 2 warps/CTA, targets 296 CTAs = 4 CTAs/SM x 74 SMs).
+fn global_splits_for(k: usize) -> usize {
+    let ctas = (296 / (k * KVH)).clamp(4, GLOBAL_ATTN_SPLITS / 2);
+    ctas * 2
 }
 
 /// Native Rust + CUDA DFlash2 speculative drafter.
@@ -199,10 +240,12 @@ pub struct RustDFlash2 {
     graphs: Vec<Option<Graph>>,
     graph_bytes: Rc<Cell<usize>>,
     lt: RefCell<LtGemm>,
+    cfg: DFlash2Config,
     w: Weights,
     s: State,
     sessions: usize,
     max_ctx: usize,
+    kv_stride: usize,
     drafts_api: ApiBuf,
     conf_api: Option<ApiBuf>,
     prop_api: Option<ProposalBufs>,
@@ -263,6 +306,7 @@ impl RustDFlash2 {
             .dflash2_dir
             .as_deref()
             .ok_or_else(|| RuntimeError::request("RustDFlash2 requires DraftConfig::dflash2_dir"))?;
+        let cfg = rt(DFlash2Config::load(dflash_dir))?;
         let sessions = config.sessions as usize;
         let max_ctx = config.max_ctx as usize;
         if sessions == 0 || max_ctx == 0 {
@@ -273,16 +317,21 @@ impl RustDFlash2 {
                 "dflash2: max_ctx {max_ctx} + {BLK} exceeds RoPE table {COS_SIN_POS}"
             )));
         }
+        let kv_stride = max_ctx.next_multiple_of(16);
         let k = rt(Kernels::load(&ctx))?;
         rt(k.function(KernelId::Df2SwaAttnSplitKernel)
             .set_max_dynamic_smem(ATTN_SMEM as u32))?;
+        if cfg.has_global() {
+            rt(k.function(KernelId::Df2GlobalAttnE4m3SplitKernel)
+                .set_max_dynamic_smem(GLOBAL_ATTN_SMEM as u32))?;
+        }
         for (id, mt) in head_gemm_ids() {
             rt(k.function(id).set_max_dynamic_smem(head_gemm_smem(mt) as u32))?;
         }
 
         let is_shared = shared_target.is_some();
         let use_i8_head = !std::env::var("INK_DF2_BF16_HEAD").is_ok_and(|v| v != "0");
-        let total = arena_bytes(sessions, is_shared, use_i8_head);
+        let total = arena_bytes(sessions, kv_stride, &cfg, is_shared, use_i8_head);
         let mut arena = rt(Arena::new(&ctx, &st, total))?;
 
         let ck = rt(DFlash2Checkpoints::open(dflash_dir, Some(config.model_dir.as_path())))?;
@@ -403,19 +452,42 @@ impl RustDFlash2 {
 
         let mask_emb = rt(arena.take::<Bf16>(H, "df2 mask_emb"))?;
         let cos_sin = rt(arena.take::<Bf16>(COS_SIN_POS * HD, "df2 cos_sin"))?;
+        let cos_sin_global = if cfg.has_global() {
+            Some(rt(arena.take::<Bf16>(COS_SIN_POS * HD, "df2 cos_sin_global"))?)
+        } else {
+            None
+        };
 
-        // Allocate head-major KV rings [sessions, KVH, RING, HD] and scratch
-        let mut k_ring = Vec::with_capacity(NLAYERS);
-        let mut v_ring = Vec::with_capacity(NLAYERS);
-        for _ in 0..NLAYERS {
-            k_ring.push(rt(arena.take::<Bf16>(sessions * KVH * RING * HD, "df2 k_ring"))?);
-            v_ring.push(rt(arena.take::<Bf16>(sessions * KVH * RING * HD, "df2 v_ring"))?);
+        // Allocate per-layer KV cache (SWA-2048 BF16 ring or Global E4M3 linear [sessions, KVH, kv_stride, HD])
+        let mut kv = Vec::with_capacity(NLAYERS);
+        for &lt in &cfg.layer_types {
+            match lt {
+                LayerType::SlidingAttention => {
+                    let k_ring = rt(arena.take::<Bf16>(sessions * KVH * RING * HD, "df2 k_ring"))?;
+                    let v_ring = rt(arena.take::<Bf16>(sessions * KVH * RING * HD, "df2 v_ring"))?;
+                    kv.push(LayerKv::Swa { k_ring, v_ring });
+                }
+                LayerType::FullAttention => {
+                    let k_glob = rt(arena.take::<u8>(sessions * KVH * kv_stride * HD, "df2 k_glob"))?;
+                    let v_glob = rt(arena.take::<u8>(sessions * KVH * kv_stride * HD, "df2 v_glob"))?;
+                    let ks_glob = rt(arena.take::<f32>(sessions * KVH * kv_stride, "df2 ks_glob"))?;
+                    let vs_glob = rt(arena.take::<f32>(sessions * KVH * kv_stride, "df2 vs_glob"))?;
+                    rt(st.memset_zero(&ks_glob))?;
+                    rt(st.memset_zero(&vs_glob))?;
+                    kv.push(LayerKv::GlobalE4m3 {
+                        k_glob,
+                        v_glob,
+                        ks_glob,
+                        vs_glob,
+                    });
+                }
+            }
         }
         let rows = sessions * BLK;
         let drows = sessions * DRAFTS;
+        let part_slots = part_slots_for(sessions, cfg.has_global());
         let s = State {
-            k_ring,
-            v_ring,
+            kv,
             ctx_h: rt(arena.take::<Bf16>(COMMIT_CHUNK * H, "df2 ctx_h"))?,
             ctx_norm: rt(arena.take::<Bf16>(COMMIT_CHUNK * H, "df2 ctx_norm"))?,
             kv_tmp: rt(arena.take::<Bf16>(COMMIT_CHUNK * 2 * KVH * HD, "df2 kv_tmp"))?,
@@ -428,8 +500,8 @@ impl RustDFlash2 {
             q_blk: rt(arena.take::<Bf16>(rows * NH * HD, "df2 q_blk"))?,
             k_blk: rt(arena.take::<Bf16>(rows * KVH * HD, "df2 k_blk"))?,
             v_blk: rt(arena.take::<Bf16>(rows * KVH * HD, "df2 v_blk"))?,
-            part_ml: rt(arena.take::<f32>(sessions * KVH * ATTN_SPLITS * 32 * 2, "df2 part_ml"))?,
-            part_o: rt(arena.take::<f32>(sessions * KVH * ATTN_SPLITS * 32 * HD, "df2 part_o"))?,
+            part_ml: rt(arena.take::<f32>(part_slots * KVH * 32 * 2, "df2 part_ml"))?,
+            part_o: rt(arena.take::<f32>(part_slots * KVH * 32 * HD, "df2 part_o"))?,
             attn_out: rt(arena.take::<Bf16>(rows * NH * HD, "df2 attn_out"))?,
             gate_up: rt(arena.take::<Bf16>(rows * 2 * INTER, "df2 gate_up"))?,
             mlp_act: rt(arena.take::<Bf16>(rows * INTER, "df2 mlp_act"))?,
@@ -467,8 +539,11 @@ impl RustDFlash2 {
         rt(st.memset_zero(&s.prop_w))?;
         rt(st.memset_zero(&s.conf))?;
 
-        // Precompute RoPE table and normalized mask embedding
-        rt(dev.rope_table(&cos_sin, COS_SIN_POS, ROPE_THETA))?;
+        // Precompute RoPE tables and normalized mask embedding
+        rt(dev.rope_table(&cos_sin, COS_SIN_POS, cfg.rope_theta))?;
+        if let Some(ref csg) = cos_sin_global {
+            rt(dev.rope_table(csg, COS_SIN_POS, cfg.global_rope_theta))?;
+        }
         let mask_raw = rt(embed.slice(MASK_TOKEN_ID * H..(MASK_TOKEN_ID + 1) * H))?;
         rt(dev.rms_norm(&mask_raw, &embed_norm, &mask_emb, 1, false))?;
         rt(st.synchronize())?;
@@ -514,8 +589,10 @@ impl RustDFlash2 {
             weights: prop_w_api,
         });
         eprintln!(
-            "[dflash2] arena used {:.2} GiB (sessions {sessions}, max_ctx {max_ctx}, shared_target {is_shared}, head {})",
+            "[dflash2] arena used {:.2} GiB (sessions {sessions}, max_ctx {max_ctx}, layers {} swa + {} global, shared_target {is_shared}, head {})",
             arena.plan().used() as f64 / 1_073_741_824.0,
+            cfg.swa_count(),
+            cfg.global_count(),
             if use_i8_head { "int8" } else { "bf16" },
         );
 
@@ -533,15 +610,18 @@ impl RustDFlash2 {
             head_i8,
             mask_emb,
             cos_sin,
+            cos_sin_global,
         };
         Ok(Self {
             graphs: (0..sessions).map(|_| None).collect(),
             graph_bytes,
             lt: RefCell::new(lt),
+            cfg,
             w,
             s,
             sessions,
             max_ctx,
+            kv_stride,
             drafts_api,
             conf_api,
             prop_api,
@@ -661,28 +741,48 @@ impl RustDFlash2 {
             for (li, ly) in w.layers.iter().enumerate() {
                 let w_kv = ly.qkv_proj.slice(kv_off..kv_off + kv_elems)?;
                 self.gemm_bf16(2 * KVH * HD, H, cls, &cn, &w_kv, &kv, rc)?;
-                dev.kv_norm_rope_store(
-                    &kv,
-                    &ly.k_norm,
-                    &w.cos_sin,
-                    &p,
-                    &q,
-                    &s.k_ring[li],
-                    &s.v_ring[li],
-                    rc,
-                    self.sessions,
-                )?;
+                match &s.kv[li] {
+                    LayerKv::Swa { k_ring, v_ring } => {
+                        dev.kv_norm_rope_store(&kv, &ly.k_norm, &w.cos_sin, &p, &q, k_ring, v_ring, rc, self.sessions)?;
+                    }
+                    LayerKv::GlobalE4m3 {
+                        k_glob,
+                        v_glob,
+                        ks_glob,
+                        vs_glob,
+                    } => {
+                        let csg = w.cos_sin_global.as_ref().expect("global cos_sin table");
+                        dev.kv_norm_rope_store_global_e4m3(
+                            &kv,
+                            &ly.k_norm,
+                            csg,
+                            &p,
+                            &q,
+                            k_glob,
+                            v_glob,
+                            ks_glob,
+                            vs_glob,
+                            rc,
+                            self.sessions,
+                            self.max_ctx,
+                            self.kv_stride,
+                        )?;
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    fn draft_batch(&self, k: usize, prof: bool) -> Result<(), CudaError> {
+    fn draft_batch(&self, k: usize, prof: bool, dump_dir: Option<&Path>) -> Result<(), CudaError> {
+        const PRE_GLOB_MARKS: [&str; NLAYERS] = ["l0_pre", "l1_pre", "l2_pre", "l3_pre", "l4_pre"];
+        const GLOB_MARKS: [&str; NLAYERS] = ["l0_global", "l1_global", "l2_global", "l3_global", "l4_global"];
         let dev = self.dev();
         let (w, s) = (&self.w, &self.s);
         let rows = k * BLK;
         let drows = k * DRAFTS;
         let splits = splits_for(k);
+        let g_splits = global_splits_for(k);
         let mut evs: Vec<(&'static str, ink_cuda::Event)> = Vec::new();
         let mut mark = |name: &'static str| -> Result<(), CudaError> {
             if prof {
@@ -699,8 +799,9 @@ impl RustDFlash2 {
         dev.rms_norm(&s.x, &w.layers[0].in_norm, &s.h, rows, false)?;
         mark("embed")?;
 
-        // 2. Five Qwen3-DFlash2 decoder layers (all Tensor Core MMA SWA-2048 + 2-tap dynamic convs)
+        // 2. Five Qwen3-DFlash2 decoder layers (hybrid SWA-2048 BF16 ring + optional Global E4M3)
         for (li, ly) in w.layers.iter().enumerate() {
+            let is_glob = self.cfg.is_global(li);
             // Attention conv prepare
             self.gemm_bf16(
                 CONV_PROJ_N,
@@ -729,31 +830,76 @@ impl RustDFlash2 {
             if li == 0 {
                 mark("l0_qkv")?;
             }
+            let cos_sin = if is_glob {
+                w.cos_sin_global.as_ref().expect("global cos_sin table")
+            } else {
+                &w.cos_sin
+            };
             dev.qkv_norm_rope_blk(
-                &s.qkv, &ly.q_norm, &ly.k_norm, &w.cos_sin, &s.pos, &s.sel, &s.q_blk, &s.k_blk, &s.v_blk, k,
+                &s.qkv, &ly.q_norm, &ly.k_norm, cos_sin, &s.pos, &s.sel, &s.q_blk, &s.k_blk, &s.v_blk, k,
             )?;
             if li == 0 {
                 mark("l0_rope")?;
+            } else if is_glob {
+                mark(PRE_GLOB_MARKS[li])?;
             }
 
-            // Tensor Core MMA SWA-2048 + bidirectional block attention
-            dev.swa_attn(
-                &s.q_blk,
-                &s.k_blk,
-                &s.v_blk,
-                &s.k_ring[li],
-                &s.v_ring[li],
-                &s.pos,
-                &s.sel,
-                &s.part_ml,
-                &s.part_o,
-                &s.attn_out,
-                k,
-                self.sessions,
-                splits,
-            )?;
+            // Tensor Core MMA attention: SWA-2048 BF16 ring or Global E4M3 + exact BF16 block keys
+            match &s.kv[li] {
+                LayerKv::Swa { k_ring, v_ring } => {
+                    dev.swa_attn(
+                        &s.q_blk,
+                        &s.k_blk,
+                        &s.v_blk,
+                        k_ring,
+                        v_ring,
+                        &s.pos,
+                        &s.sel,
+                        &s.part_ml,
+                        &s.part_o,
+                        &s.attn_out,
+                        k,
+                        self.sessions,
+                        splits,
+                    )?;
+                }
+                LayerKv::GlobalE4m3 {
+                    k_glob,
+                    v_glob,
+                    ks_glob,
+                    vs_glob,
+                } => {
+                    dev.global_attn_e4m3(
+                        &s.q_blk,
+                        &s.k_blk,
+                        &s.v_blk,
+                        k_glob,
+                        v_glob,
+                        ks_glob,
+                        vs_glob,
+                        &s.pos,
+                        &s.sel,
+                        &s.part_ml,
+                        &s.part_o,
+                        &s.attn_out,
+                        k,
+                        self.sessions,
+                        self.max_ctx,
+                        self.kv_stride,
+                        g_splits,
+                    )?;
+                }
+            }
             if li == 0 {
-                mark("l0_attn")?;
+                mark(if is_glob { "l0_global" } else { "l0_attn" })?;
+            } else if is_glob {
+                mark(GLOB_MARKS[li])?;
+            }
+            if let Some(dir) = dump_dir {
+                let slice = s.attn_out.slice(0..rows * NH * HD)?;
+                let mut host = vec![0u8; rows * NH * HD * 2];
+                self.st.dtoh(&mut host, &slice.cast::<u8>()?)?;
+                let _ = fs::write(dir.join(format!("l{li}_attn_out.bin")), &host);
             }
 
             // Output projection + fused conv finish + residual + post_attention_layernorm
@@ -892,6 +1038,20 @@ impl RustDFlash2 {
             self.sessions,
         )?;
         mark("sel_walk")?;
+        if let Some(dir) = dump_dir {
+            let l_sl = s.logits.slice(0..drows * HEAD_N)?;
+            let mut l_host = vec![0u8; drows * HEAD_N * 4];
+            self.st.dtoh(&mut l_host, &l_sl.cast::<u8>()?)?;
+            let _ = fs::write(dir.join("logits.bin"), &l_host);
+            let c_sl = s.cand_ids.slice(0..drows * TOP_K)?;
+            let mut c_host = vec![0u8; drows * TOP_K * 4];
+            self.st.dtoh(&mut c_host, &c_sl.cast::<u8>()?)?;
+            let _ = fs::write(dir.join("cand_ids.bin"), &c_host);
+            let d_sl = s.drafts.slice(0..self.sessions * DRAFTS)?;
+            let mut d_host = vec![0u8; self.sessions * DRAFTS * 4];
+            self.st.dtoh(&mut d_host, &d_sl.cast::<u8>()?)?;
+            let _ = fs::write(dir.join("drafts.bin"), &d_host);
+        }
         if prof {
             self.st.synchronize()?;
             eprint!("[df2 prof k={k}]");
@@ -903,6 +1063,26 @@ impl RustDFlash2 {
             eprintln!(" TOTAL={tot:.3} ms");
         }
         Ok(())
+    }
+
+    /// Runs one eager (non-graphed) draft batch and dumps per-layer `attn_out`, `logits`, `cand_ids`, and `drafts`
+    /// to `dump_dir` for numerical oracle parity checks.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError`] on invalid session indices or CUDA failure.
+    pub fn draft_with_dump(&mut self, sessions: &[usize], dump_dir: &Path) -> Res<()> {
+        let n = self.sessions;
+        let k = sessions.len();
+        if k == 0 || k > n {
+            return Err(RuntimeError::request(format!("draft_with_dump: 1..{n} sessions")));
+        }
+        let sel: Vec<i32> = sessions
+            .iter()
+            .map(|&r| i32::try_from(r).expect("session fits i32"))
+            .collect();
+        rt(self.st.htod(&rt(self.s.sel.slice(0..k))?, &sel))?;
+        rt(self.draft_batch(k, false, Some(dump_dir)))
     }
 
     fn run_batch(&mut self, sessions: &[usize]) -> Res<()> {
@@ -926,14 +1106,14 @@ impl RustDFlash2 {
         if self.graphs[k - 1].is_none() {
             // Eager warmup (populates cuBLASLt plan/checked caches before capture)
             let prof = std::env::var("INK_DF2_PROF").is_ok_and(|v| v != "0");
-            rt(self.draft_batch(k, false))?;
+            rt(self.draft_batch(k, false, None))?;
             if prof {
-                rt(self.draft_batch(k, true))?;
+                rt(self.draft_batch(k, true, None))?;
             }
             rt(self.st.synchronize())?;
             let free0 = rt(self.ctx.mem_info())?.0;
             let cap = rt(self.st.begin_capture())?;
-            let g = rt(self.draft_batch(k, false))
+            let g = rt(self.draft_batch(k, false, None))
                 .and_then(|()| rt(cap.end()))
                 .map_err(RuntimeError::into_device)?;
             rt(g.launch())?;
@@ -997,6 +1177,10 @@ impl Drafter for RustDFlash2 {
     fn default_verify_tau(&self) -> f32 {
         // Calibrated for parallel mask-slot confidence (M1 sweep: tau 0.25 peaks at +15 tok/s over w8).
         0.25
+    }
+
+    fn is_swa_only(&self) -> bool {
+        !self.cfg.has_global()
     }
 
     fn set_sampling(&mut self, temps: &[f32], top_ps: &[f32], seeds: &[u64]) -> Res<()> {

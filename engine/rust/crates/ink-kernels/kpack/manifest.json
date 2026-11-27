@@ -1,6 +1,6 @@
 {
  "format": "ink-kpack-manifest/1",
- "kpack_id": "9af3241f6232e8cf24bae61bae11efeeb563c14f5185deef501db3154145a713",
+ "kpack_id": "6591b3fdcf8e660a021a28444ab15090d1f98d7cca5c74c6bc09409b2c249c45",
  "nvcc": "Cuda compilation tools, release 13.3, V13.3.73",
  "flags": "-O3 -lineinfo -Xptxas -warn-spills -O3 -DNDEBUG -std=c++20 -gencode arch=compute_80,code=sm_80",
  "layout_sha256": "2853716509283f4e8bc545bc5938227f276bf8861b3a1d348872ad856c67708d",
@@ -19,7 +19,7 @@
   },
   {
    "path": "engine/kernels/dflash2/dflash2_kernels.cuh",
-   "sha256": "564c5c7c23a13459cdee978366b4a7a47d11877aeb95ca345c17dbf3e55483f3"
+   "sha256": "cbde561a53cb18bb0336fe7ce2e67731024e650727b64c9dbbd15df98bc0721f"
   },
   {
    "path": "engine/kernels/drafter/draft_conf.cuh",
@@ -63,7 +63,7 @@
   },
   {
    "path": "engine/kernels/pack/keys.toml",
-   "sha256": "f09837a8c42d26ee9ba8e6f2916ee6d2cb06eae5ac53214954fdb31dd20654a3"
+   "sha256": "47ff5244c679550165cff4dfd07584960ce05bd375ef9691ec1e40440b8b682f"
   },
   {
    "path": "engine/kernels/pack/layout_emit.cpp",
@@ -109,9 +109,9 @@
   {
    "tu": "drafter",
    "file": "pack_drafter.cubin",
-   "bytes": 16218704,
-   "sha256": "a467ae74705c4f867e0ed67238c98150323f71d2f6fb71e57598a8d4f9f88a6b",
-   "keys": 205
+   "bytes": 16540496,
+   "sha256": "d1ca7bb0ef31c94535fcb50d231617db30cb882c83b70a91ec95cd9f35508af6",
+   "keys": 207
   }
  ]
 }

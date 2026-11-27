@@ -1,4 +1,4 @@
-{"format":"ink-e0-sass/1","source":"pack","cubins":2,"kernels":386}
+{"format":"ink-e0-sass/1","source":"pack","cubins":2,"kernels":388}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_Z11k_copy_colsPK13__nv_bfloat16iiiPS_i","bytes":2432,"sha256":"4cee105275703c6f438f98f9a016eb5a15c90c107bae9a2b8b4840b42ac684e0"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_Z11k_fill_bf16P13__nv_bfloat16mmf","bytes":2816,"sha256":"cc3ea8562fdf67716996a78a229827ba21e6802e8c793300332a7a2d8ac66e6d"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_Z11k_fill_e4m3Phmm","bytes":3712,"sha256":"e8c55a93b9d56c0846c0f9c5fed8e06d435ea39ee5ffaca5dcd6ab9a93ebc2e5"}
@@ -87,7 +87,9 @@
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df223topk16_chunk_max_kernelEPKfPfS2_PiS1_PKiii","bytes":12544,"sha256":"560f30327bb09c6a316b1f29e1d0e8efdae0613438c1e4a4d2ad07141d1f66c6"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df224qkv_norm_rope_blk_kernelEPK13__nv_bfloat16S2_S2_S2_PKiS4_PS0_S5_S5_i","bytes":2176,"sha256":"b65a7f38b2ed7f2eabf27b9d1b062698844949bc56aa3e0d200fb7a70003ebad"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df225kv_norm_rope_store_kernelEPK13__nv_bfloat16S2_S2_PKiS4_PS0_S5_i","bytes":1792,"sha256":"2fa8af4f39637d71635f32701428864de0f3db85483af77e01faf1537cc22132"}
+{"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df229global_attn_e4m3_split_kernelEPK13__nv_bfloat16S2_S2_PKhS4_PKfS6_PKiS8_PfS9_iiii","bytes":65024,"sha256":"b1a4452531abdcccf544e6900fcdce1539540f69524f663dfea28ca1c50d95a2"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df232grouped_conv_out_res_norm_kernelEPK13__nv_bfloat16S2_S2_PS0_S2_S3_P6__halfii","bytes":15872,"sha256":"b68af4924f40c1b356ff6578435a7bdf3ed05e925b0ae1ada72c1c4485ff9a37"}
+{"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df237kv_norm_rope_store_global_e4m3_kernelEPK13__nv_bfloat16S2_S2_PKiS4_PhS5_PfS6_iii","bytes":6656,"sha256":"8e0ef081566c4739505d7756f7f035314ecd4a51bda14b2f2a1777917c16c491"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN3ink47_GLOBAL__N__0f761cec_14_pack_engine_cu_58abf99813accept_kernelEPKiS2_iiS2_S2_S2_PiS3_S3_S3_S3_S3_S2_i","bytes":3328,"sha256":"f969c1fc5ebc85607851a96a42732f008c6559f71d79853b619a1c522006c6bb"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN3ink47_GLOBAL__N__0f761cec_14_pack_engine_cu_58abf99816last_feat_kernelEPK13__nv_bfloat16PKiS5_S5_PS1_i","bytes":640,"sha256":"625905175586e0cd1aae731fa8776a55d2109bdc66788952dd4eb0e1b3569a9b"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN3ink47_GLOBAL__N__0f761cec_14_pack_engine_cu_58abf99817proj_split_kernelEPK13__nv_bfloat16iiPS1_S4_S4_S4_S4_S4_S4_S4_","bytes":2304,"sha256":"620c414117d2b2fb6e5b36d5467bce53f5986d81021ec868b1d0fe990d878410"}

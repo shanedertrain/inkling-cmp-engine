@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+bytemuck.workspace = true
 clap.workspace = true
 ink-api.workspace = true
 ink-backend.workspace = true
@@ -20,6 +21,7 @@ ink-record.workspace = true
 ink-rt-api.workspace = true
 ink-runtime.workspace = true
 ink-text.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

@@ -372,12 +372,19 @@ fn engine_backend(cli: &Cli) -> Result<(EngineBackend, Source)> {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(cli.lookup_min);
     let draft = if let Some(dflash2_dir) = cli.draft_dflash2.clone() {
+        let df2_cfg = ink_model::dflash2::DFlash2Config::load(&dflash2_dir)
+            .with_context(|| format!("reading DFlash2 config in {}", dflash2_dir.display()))?;
+        let default_ctx = if df2_cfg.has_global() {
+            ink_model::dflash2::GLOBAL_DEFAULT_CTX
+        } else {
+            262_144
+        };
         Some(DraftConfig {
             model_dir: cli.model_dir.clone(),
             fold_bin: PathBuf::new(),
             dflash2_dir: Some(dflash2_dir),
             sessions: cli.slots,
-            max_ctx: cli.draft_ctx.unwrap_or(262_144),
+            max_ctx: cli.draft_ctx.unwrap_or(default_ctx),
             head: HeadPrecision::Int8,
             global_kv: KvPrecision::Bf16,
             verify,

@@ -3,7 +3,7 @@
 <p align="center">
   <sub>Custom pure-Rust + CUDA (<code>sm_80</code>) single-model inference engine for 1–8× CMP 170HX (64 GB, 140 W cap)</sub>
   <br><br>
-  <img src="https://img.shields.io/badge/release-v1.1.0-2ea44f?style=for-the-badge" alt="v1.1.0" height="28" />
+  <img src="https://img.shields.io/badge/release-v1.2.0-2ea44f?style=for-the-badge" alt="v1.2.0" height="28" />
   <img src="https://img.shields.io/badge/engine-Rust%20%2B%20CUDA%20sm__80-1f6feb?style=for-the-badge" alt="Rust + CUDA sm_80" height="28" />
   <img src="https://img.shields.io/badge/model-Inkling--2--Mini-4b32c3?style=for-the-badge" alt="Inkling-2-Mini" height="28" />
   <img src="https://img.shields.io/badge/context-262%2C144%20tokens-181717?style=for-the-badge" alt="262,144 context" height="28" />
@@ -26,7 +26,7 @@ Serve Thinking Machines Lab's **[Inkling-2-Mini](https://huggingface.co/thinking
 
 - **Checkpoint:** `thinkingmachines/Inkling-2-Mini` @ `ed40e7da` (native NVFP4 layers 0–19, MXFP8 layers 20–23, `18.98 GB` on GPU; weights mounted read-only and never modified)
 - **API:** OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/metrics`; model id `inkling-2-mini`; loopback ports `127.0.0.1:8400..8407`
-- **Engine:** Pure-Rust host stack (`ink-server`, `ink-sched`, `ink-runtime`, `ink-kernels`, `ink-tools`) + embedded byte-reproducible CUDA `sm_80` kernel pack (`386` kernels, `0` new spills)
+- **Engine:** Pure-Rust host stack (`ink-server`, `ink-sched`, `ink-runtime`, `ink-kernels`, `ink-tools`) + embedded byte-reproducible CUDA `sm_80` kernel pack (`388` kernels, `0` new spills)
 - **License:** [Apache License 2.0](LICENSE)
 
 ## Contents
@@ -159,10 +159,12 @@ Manage replicas:
 
 ## `--draft-dflash2` (opt-in)
 
-Set `DFLASH2_DIR=/path/to/Inkling-2-Mini-DFlash2` in `scripts/local.sh` (or pass `--draft-dflash2 <dir>` to `ink-server`) to use [Inco AI's Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) 5-layer parallel diffusion-style drafter (Tensor Core MMA SWA-2048 ring buffer, W8A16 head, 16-warp bilinear selector walk, exact Leviathan rejection sampling, and Ptok3 `conf` gating at `tau = 0.25`) instead of DSpark:
+Set `DFLASH2_DIR=/path/to/Inkling-2-Mini-DFlash2` in `scripts/local.sh` (or pass `--draft-dflash2 <dir>` to `ink-server`) to use [Inco AI's Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) (or a custom hybrid global-attention `DFlash2-Global` checkpoint) 5-layer parallel diffusion-style drafter (Tensor Core MMA SWA-2048 ring buffer, W8A16 head, 16-warp bilinear selector walk, exact Leviathan rejection sampling, and Ptok3 `conf` gating at `tau = 0.25`) instead of DSpark:
 
-- Uses **`−3.3 GiB` less VRAM** than DSpark and achieves higher acceptance on short/standalone prompts (`3.898 tok/rd` sampled, `3.988 tok/rd` greedy, `0/8,000` bad argmax).
-- On realistic `N=4` M1 agent replay, DSpark + `--lookup 8` remains faster and is kept as the default; DFlash2 shines at `N=8` when VRAM is tight.
+- **Hybrid `full_attention` E4M3 support (`v1.2.0`):** Reads `layer_types` (`sliding_attention` / `full_attention`) and `global_rope_theta` (`1e6`) directly from `config.json`. Global layers run Design-A `df2::global_attn_e4m3_split_kernel` (`0` spills, `646–715 GB/s` E4M3, `2.65 ms` at `4×45K` with 1 global layer, `3.21 ms` with 2 global layers) while stock `5× SWA` checkpoints stay bit-identical (`0.00 ms` regression).
+- **VRAM savings & `Drafter::is_swa_only()` lookup policy (`v1.2.0`):** Uses **`~8–9 GiB` less VRAM** than DSpark at `8 slots / 504 pages / 100K ctx` (`52.8 GiB` used, `12.1 GiB` free). SWA-only checkpoints automatically enable far-anchor verbatim lookup rescue (`dist > 2048`, `+1.92%` M1 `t0-n4`), while global DFlash2 checkpoints use post-draft lookup only (`+3.16%` over anchor override).
+- **Benchmarks (`140 W`, 100% lossless):** With a Stage-2 frozen-SWA 2-global-layer (`L1+L3`) checkpoint, `DFlash2-Global` reaches **`526.05 tok/s` (`5.738 tok/rd`, `+26.7%` over DSpark, `+12.1%` over Stock DFlash2)** on `4×45K` `tf-agent-120k`, **`3.851 tok/rd` (`+20.8%` over DSpark)** at `75K`, and **`327.8 tok/s`** (`-0.63%` vs DSpark, `+1.33%` over Stock DFlash2) on `6D` `N=4, T=1.0` M1. On 16-session multi-turn M1 overall, DSpark + `--lookup 8` remains fastest and is kept as the default; `--draft-dflash2` excels on long single-turn contexts and VRAM-constrained `N=8` pools.
+- **Target-tap extractor (`ink-taps`, `v1.2.0`):** Included in `ink-tools` to extract native `[5, 23, 41, 48]` BF16 target features at `~6K tok/s` per GPU for distilling custom lossless drafters.
 
 ## Architecture & key optimizations
 
@@ -174,6 +176,7 @@ Set `DFLASH2_DIR=/path/to/Inkling-2-Mini-DFlash2` in `scripts/local.sh` (or pass
 - **Single-pass 1..16-row decode attention + lossless verbatim lookup drafts:** `decode_attn_kernel16<KV>` + 6-warp SWA ring kernel + Ptok3-gated n-gram lookup (`--lookup 8 --lookup-min 8`), adding **`+2.1–2.2%`** at `N=4 T=1.0` and **`+3.5–4.5%`** at `N=4 T=0` on top of the full stack.
 - **Fused decode router & glue:** smem-tiled K-group `router_decode_kernel<1>` / `route_select9`, `mg_down_dec_kernel`, BF16 TC `mg_tail_tc_dec_kernel`, 288-thread vectorized AttnRes + fused short-convs, weight-stationary `rel_logits_decode` (`4×1` `−13.8%`, `1×8` `−16.8%`, graph memory `10.5 → 8.4 MB`).
 - **In-kernel Tensor Core prefill relative bias + virtual messages (`v1.1.0`):** eliminates `10.3 GB/chunk` `relk` HBM traffic in `prefill_attn` (BF16 & `--kv-fp8`) and ~87 GB/32K of `msgs` HBM traffic via `vmsg_weights_kernel` (`msgs` `7.50×`), plus fused multi-query AttnRes (`−25.2%`), fast `__match_any_sync` `moe_build`, and default `--prefill-chunk 3072` (`+43.6%` to `+58.7%` cold prefill over Config B at 140 W).
+- **Longest-back n-gram lookup (`MAX_CHAIN=32`) & hybrid `DFlash2` global E4M3 (`v1.2.0`):** Deep chain walk (`MAX_CHAIN=32`) selects the longest backward verbatim match (`+1.45%` DSpark `self-t1-n4`, `+1.30%` `self-t1-n8`), `Drafter::is_swa_only()` enables far-anchor rescue (`dist > 2048`) strictly for SWA-2048 drafters (`+1.92%` Stock DFlash2 `t0-n4`), and `RustDFlash2` adds config-driven `full_attention` E4M3 layers (`0` spills, `~8–9 GiB` lower VRAM than DSpark) alongside `ink-taps` for drafter distillation.
 - **Zero-stall spec round, fast graph retargeting & single-pass decode `moe_build` (`v1.1.0`):** cached `CUgraphExec` kernel-node retargeting (`verify_us >= 200 µs`: `36.0% → 3.5%`, p90 `−70%`), coalesced 1-sync `verify_widths_and_drafts` + lazy lookup H2D + vectorized `softcap`, single-pass `__match_any_sync` decode `moe_build` (`−41.9%` `4×8`, `−50.1%` `4×16`), and opt-in early-exit Markov drafting (`INK_DSPARK_EARLY_TAU=0.70` for `N=1`/ragged).
 - **Fused DSpark Markov drafter + calibrated proposal `top_p=0.90`:** `68 → 58` graph nodes (`−9.9%` draft latency), fast cuBLASLt prefill `commit_rows` (`12.8×` faster), and exact 128-bit Leviathan rejection/residual sampling.
 - **Prefix-preserving scheduler (`ink-sched`):** exact resume + slot rollback checkpoints + `slot_steal_grace_ms = 150 ms` protecting freshly-parked multi-turn prefixes at `N == slots`.

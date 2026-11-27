@@ -1012,6 +1012,11 @@ pub trait Drafter: std::fmt::Debug {
     fn default_verify_tau(&self) -> f32 {
         VERIFY_TAU
     }
+    /// Whether this drafter has only sliding-window attention (no global attention layers) and therefore benefits from
+    /// far-anchor verbatim lookup rescue beyond its window (`dist > 2048`).
+    fn is_swa_only(&self) -> bool {
+        false
+    }
     /// Sets per-session sampling temperature (`< 1e-5` = greedy), nucleus mass `top_p` (`<= 0` or `>= 1` = off), and
     /// Philox seed for drafters that sample from a proposal distribution (`DSpark`, `DFlash2`).
     ///

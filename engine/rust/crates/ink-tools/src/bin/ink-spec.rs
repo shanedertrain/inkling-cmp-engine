@@ -43,7 +43,7 @@ use ink_rt_api::{
     KvPrecision, LOGIT_ROW, MAX_DRAFTS, Runtime, SampleTestOut, SampleTestRows, SamplerProbe, SegIn, SpecRuntime,
     VERIFY_TAU, VOCAB, VerifyWidth,
 };
-use ink_runtime::lookup::NgramIndex;
+use ink_runtime::lookup::{LookupPolicy, NgramIndex};
 use ink_tools::cases::{Case, read_cases};
 use ink_tools::draftlog::{Header, LogWriter, Op};
 use ink_tools::engine::{EngineArgs, MAX_CHUNK, RecordArgs, identity_fields};
@@ -267,6 +267,10 @@ struct Spec {
     call_rows: CallRows,
     anchor_host: Vec<i32>,
     lookup: Vec<NgramIndex>,
+    lookup_policy: LookupPolicy,
+    prop_drafts_dev: Option<DevBuf>,
+    prop_drafts_host: Vec<i32>,
+    lookup_start: Vec<usize>,
     drafts_host: Vec<i32>,
     all_drafts: Vec<i32>,
     lookup_triggers: u64,
@@ -320,6 +324,11 @@ impl Spec {
         } else {
             drafter.drafts()
         };
+        let prop_drafts_dev = if lookup_len > 0 && drafter.proposal().is_some() {
+            Some(i32s(rt, DRAFTS * n)?)
+        } else {
+            None
+        };
         let bufs = AcceptBufs {
             drafts: drafts_buf,
             anchor: i32s(rt, n)?,
@@ -360,6 +369,10 @@ impl Spec {
             call_rows: CallRows::RAGGED,
             anchor_host: vec![0; n],
             lookup: (0..n).map(|_| NgramIndex::new()).collect(),
+            lookup_policy: LookupPolicy::for_drafter(false),
+            prop_drafts_dev,
+            prop_drafts_host: vec![-1; n * DRAFTS],
+            lookup_start: vec![usize::MAX; n],
             drafts_host: vec![0; n * DRAFTS],
             all_drafts: vec![-1; n * draft_k],
             lookup_triggers: 0,
@@ -555,27 +568,67 @@ impl Spec {
         } else {
             self.w.fill(8);
         }
+        let mut prop_overridden = false;
+        self.lookup_start.fill(usize::MAX);
         if self.lookup_len > 0 {
             spec_of(rt)?.download(dr.drafts(), &mut self.drafts_host)?;
             self.all_drafts.fill(-1);
+            self.prop_drafts_host.fill(-1);
             let mut extra = [0i32; DRAFTS + 1];
+            let mut anchor_prop = [-1i32; MAX_DRAFTS];
             let mut prop = [-1i32; MAX_DRAFTS - DRAFTS];
             for &q in act {
                 let ds = &self.drafts_host[q * DRAFTS..(q + 1) * DRAFTS];
                 self.all_drafts[q * self.draft_k..q * self.draft_k + DRAFTS].copy_from_slice(ds);
-                if self.w[q] == 8 && ds.iter().all(|&d| d >= 0) {
+                self.prop_drafts_host[q * DRAFTS..(q + 1) * DRAFTS].copy_from_slice(ds);
+                let w = self.w[q] as usize;
+                let mut applied_anchor = false;
+                if self.lookup_policy.uses_anchor() {
+                    let (cnt_a, back_a, dist_a) =
+                        self.lookup[q].propose_dist(&[self.anchor_host[q]], &mut anchor_prop[..self.draft_k]);
+                    if cnt_a > 0 && self.lookup_policy.anchor_triggers(back_a, dist_a) {
+                        let use_cnt = cnt_a.min(self.lookup_policy.anchor_cap(back_a, self.lookup_min, self.draft_k));
+                        let lcp = if ds.iter().all(|&d| d >= 0) {
+                            (0..DRAFTS.min(use_cnt))
+                                .take_while(|&j| ds[j] == anchor_prop[j])
+                                .count()
+                        } else {
+                            0
+                        };
+                        if use_cnt > lcp {
+                            self.all_drafts[q * self.draft_k + lcp..q * self.draft_k + use_cnt]
+                                .copy_from_slice(&anchor_prop[lcp..use_cnt]);
+                            if use_cnt < DRAFTS {
+                                self.all_drafts[q * self.draft_k + use_cnt..q * self.draft_k + DRAFTS].fill(-1);
+                            }
+                            for j in lcp..DRAFTS {
+                                self.prop_drafts_host[q * DRAFTS + j] = -1;
+                                prop_overridden = true;
+                            }
+                            self.w[q] = id(1 + use_cnt);
+                            self.lookup_start[q] = lcp;
+                            self.lookup_triggers += 1;
+                            applied_anchor = true;
+                        }
+                    }
+                }
+                if !applied_anchor && w == DRAFTS + 1 && ds.iter().all(|&d| d >= 0) {
                     extra[0] = self.anchor_host[q];
                     extra[1..DRAFTS + 1].copy_from_slice(ds);
                     let (cnt, back) = self.lookup[q].propose(&extra, &mut prop[..self.lookup_len]);
                     if back >= self.lookup_min && cnt > 0 {
                         self.all_drafts[q * self.draft_k + DRAFTS..q * self.draft_k + DRAFTS + cnt]
                             .copy_from_slice(&prop[..cnt]);
-                        self.w[q] = id(self.max_verify_rows);
+                        self.w[q] = id(DRAFTS + 1 + cnt);
+                        self.lookup_start[q] = DRAFTS;
                         self.lookup_triggers += 1;
                     }
                 }
             }
             spec_of(rt)?.upload(self.bufs.drafts, &self.all_drafts)?;
+            if prop_overridden && let Some(pd) = self.prop_drafts_dev {
+                spec_of(rt)?.upload(pd, &self.prop_drafts_host)?;
+            }
         }
         spec_of(rt)?.build_verify_ids(self.bufs.anchor, self.bufs.drafts, self.vids, self.n, self.draft_k)?;
         if split.is_some() {
@@ -622,7 +675,12 @@ impl Spec {
         let mut res = Vec::new();
         if let Some(slot_par) = samp {
             let par: Vec<DeviceSampling> = ord.iter().map(|&k| slot_par[act[k]]).collect();
-            if let Some(prop) = dr.proposal() {
+            if let Some(mut prop) = dr.proposal() {
+                if prop_overridden {
+                    prop.drafts = self
+                        .prop_drafts_dev
+                        .expect("prop_drafts_dev allocated when lookup_len > 0 and drafter has proposal");
+                }
                 sp.spec_accept_leviathan(&self.bufs, &prop, self.draft_k, &par, &mut res)?;
             } else {
                 sp.spec_accept_sampled(&self.bufs, self.draft_k, &par, &mut res)?;
@@ -659,8 +717,9 @@ impl Spec {
                     let old_anchor = self.anchor_host[q];
                     self.lookup[q].push(old_anchor);
                     self.lookup[q].extend_from_slice(&emitted[..a]);
-                    if a > DRAFTS {
-                        self.lookup_accepted += (a - DRAFTS) as u64;
+                    let lk_acc = a.saturating_sub(self.lookup_start[q]);
+                    if lk_acc > 0 {
+                        self.lookup_accepted += lk_acc as u64;
                     }
                 }
                 self.anchor_host[q] = *emitted.last().expect("at least one emitted token");
@@ -1364,6 +1423,7 @@ fn sdist_mode(
         }
         let p_len = prompt.len();
         let anc_tok = c0.tokens[k_off.min(c0.tokens.len() - 1)];
+        sp.anchor_host.fill(anc_tok);
         spec_of(rt)?.upload(sp.bufs.anchor, &vec![anc_tok; n])?;
         probe_of(rt)?.copy_dev(anchor0, sp.bufs.anchor, n * 4)?;
         probe_of(rt)?.copy_dev(p0, sp.bufs.pos, n * 4)?;
@@ -1788,11 +1848,7 @@ fn main() -> Result<()> {
                 .with_context(|| p.display().to_string())
         })
         .transpose()?;
-    let lookup_len = if cli.mode == Mode::Sdist {
-        0
-    } else {
-        cli.lookup as usize
-    };
+    let lookup_len = cli.lookup as usize;
     let mut sp = Spec::new(
         rt,
         dr.as_ref(),
@@ -1802,6 +1858,7 @@ fn main() -> Result<()> {
         cli.lookup_min as usize,
         trace,
     )?;
+    sp.lookup_policy = LookupPolicy::for_drafter(cli.dflash2.is_some());
     sp.tau = gate.then(|| tau.ln());
     sp.call_rows = if gate { call_rows } else { CallRows::RAGGED };
     if let Some(p) = &cli.draft_log {

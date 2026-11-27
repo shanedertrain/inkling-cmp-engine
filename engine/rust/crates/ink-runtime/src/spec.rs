@@ -18,7 +18,7 @@ use ink_rt_api::{
 };
 use ink_sched::Stop;
 
-use crate::lookup::NgramIndex;
+use crate::lookup::{LookupPolicy, NgramIndex};
 
 /// Base rows of a drafter-only verify segment: the anchor and the 7 drafter drafts.
 pub(crate) const VERIFY_ROWS: usize = DRAFTS + 1;
@@ -119,6 +119,14 @@ pub(crate) struct Speculation {
     dirty: bool,
     /// Per-slot incremental n-gram index (populated when `lookup_len > 0`).
     lookup: Vec<NgramIndex>,
+    /// Hybrid anchor-triggered / post-draft lookup policy.
+    lookup_policy: LookupPolicy,
+    /// Optional device copy of `[slots][DRAFTS]` proposal drafts with `-1` masking lookup-overridden slots `j < 7`
+    /// so `sample_leviathan_kernel` falls back to exact plain target draw on overridden positions.
+    prop_drafts_dev: Option<DevBuf>,
+    prop_drafts_host: Vec<i32>,
+    /// Per-slot starting draft index of lookup tokens in the current round (`usize::MAX` if no lookup fired).
+    lookup_start: Vec<usize>,
     /// Scratch host buffers for downloading drafter drafts and uploading `[d0..d6, l0..l7]`.
     drafts_host: Vec<i32>,
     all_drafts: Vec<i32>,
@@ -178,6 +186,11 @@ impl Speculation {
         } else {
             drafter.drafts()
         };
+        let prop_drafts_dev = if lookup_len > 0 && drafter.proposal().is_some() {
+            Some(sp.alloc(DRAFTS * n * 4)?)
+        } else {
+            None
+        };
         let bufs = AcceptBufs {
             drafts: drafts_buf,
             anchor: sp.alloc(n * 4)?,
@@ -197,6 +210,12 @@ impl Speculation {
         let rows: Vec<i32> = (0..t_max).map(to_i32).collect::<Result<_, _>>()?;
         sp.upload(ramp, &rows)?;
         let default_tau = drafter.default_verify_tau();
+        let is_swa_only = drafter.is_swa_only();
+        let lookup_policy = match std::env::var("INK_LOOKUP_ANCHOR").as_deref() {
+            Ok("0") => LookupPolicy::for_drafter(false),
+            Ok("1") => LookupPolicy::for_drafter(true),
+            _ => LookupPolicy::for_drafter(is_swa_only),
+        };
         Ok(Self {
             drafter,
             ctx,
@@ -226,6 +245,10 @@ impl Speculation {
             pos: vec![0; n],
             dirty: false,
             lookup: (0..n).map(|_| NgramIndex::new()).collect(),
+            lookup_policy,
+            prop_drafts_dev,
+            prop_drafts_host: vec![-1; n * DRAFTS],
+            lookup_start: vec![usize::MAX; n],
             drafts_host: vec![0; n * DRAFTS],
             all_drafts: vec![-1; n * draft_k],
             res: Vec::new(),
@@ -320,6 +343,8 @@ impl Speculation {
         self.drafter.draft_sessions(&slots)?;
         let sp = spec_of(rt)?;
         let mut any_lookup = false;
+        let mut prop_overridden = false;
+        self.lookup_start.fill(usize::MAX);
         let round_drafts;
         let round_k;
         if self.lookup_len > 0 {
@@ -334,42 +359,88 @@ impl Speculation {
                 &mut self.drafts_host,
             )?;
             let mut extra = [0i32; VERIFY_ROWS];
+            let mut anchor_prop = [-1i32; MAX_DRAFTS];
             let mut prop = [-1i32; MAX_DRAFTS - DRAFTS];
             // Lazily touch all_drafts + H2D upload ONLY if at least one session triggers lookup (or trace is active).
             let mut filled = false;
-            if self.trace.is_some() {
-                self.all_drafts.fill(-1);
-                for g in segs {
-                    let q = g.slot;
-                    let ds = &self.drafts_host[q * DRAFTS..(q + 1) * DRAFTS];
-                    self.all_drafts[q * self.draft_k..q * self.draft_k + DRAFTS].copy_from_slice(ds);
+            let fill_all = |all_drafts: &mut [i32], drafts_host: &[i32], draft_k: usize| {
+                all_drafts.fill(-1);
+                for g2 in segs {
+                    let q2 = g2.slot;
+                    let ds2 = &drafts_host[q2 * DRAFTS..(q2 + 1) * DRAFTS];
+                    all_drafts[q2 * draft_k..q2 * draft_k + DRAFTS].copy_from_slice(ds2);
                 }
+            };
+            if self.trace.is_some() {
+                fill_all(&mut self.all_drafts, &self.drafts_host, self.draft_k);
                 filled = true;
             }
             for g in segs {
                 let q = g.slot;
                 let ds = &self.drafts_host[q * DRAFTS..(q + 1) * DRAFTS];
-                // Only extend full-width (confident) sessions when all 7 drafts are valid tokens.
-                if self.widths[q] as usize == VERIFY_ROWS
-                    && g.pos0 + self.max_verify_rows <= self.ctx
-                    && ds.iter().all(|&d| d >= 0)
-                {
+                if g.pos0 + self.max_verify_rows > self.ctx {
+                    continue;
+                }
+                let w = self.widths[q] as usize;
+                // 1. Anchor-triggered global lookup rescue (SWA-blind far DFlash2 matches; disabled on DSpark).
+                let mut applied_anchor = false;
+                if self.lookup_policy.uses_anchor() {
+                    let (cnt_a, back_a, dist_a) =
+                        self.lookup[q].propose_dist(&[self.anchor[q]], &mut anchor_prop[..self.draft_k]);
+                    if cnt_a > 0 && self.lookup_policy.anchor_triggers(back_a, dist_a) {
+                        let use_cnt = cnt_a.min(self.lookup_policy.anchor_cap(back_a, self.lookup_min, self.draft_k));
+                        let lcp = if ds.iter().all(|&d| d >= 0) {
+                            (0..DRAFTS.min(use_cnt))
+                                .take_while(|&j| ds[j] == anchor_prop[j])
+                                .count()
+                        } else {
+                            0
+                        };
+                        if use_cnt > lcp {
+                            if !filled {
+                                fill_all(&mut self.all_drafts, &self.drafts_host, self.draft_k);
+                                filled = true;
+                            }
+                            if !prop_overridden {
+                                self.prop_drafts_host.fill(-1);
+                                for g2 in segs {
+                                    let q2 = g2.slot;
+                                    let ds2 = &self.drafts_host[q2 * DRAFTS..(q2 + 1) * DRAFTS];
+                                    self.prop_drafts_host[q2 * DRAFTS..(q2 + 1) * DRAFTS].copy_from_slice(ds2);
+                                }
+                            }
+                            self.all_drafts[q * self.draft_k + lcp..q * self.draft_k + use_cnt]
+                                .copy_from_slice(&anchor_prop[lcp..use_cnt]);
+                            if use_cnt < DRAFTS {
+                                self.all_drafts[q * self.draft_k + use_cnt..q * self.draft_k + DRAFTS].fill(-1);
+                            }
+                            for j in lcp..DRAFTS {
+                                self.prop_drafts_host[q * DRAFTS + j] = -1;
+                                prop_overridden = true;
+                            }
+                            self.widths[q] = to_i32(1 + use_cnt)?;
+                            self.lookup_start[q] = lcp;
+                            t.lookup_triggers += 1;
+                            self.lookup_triggers_total += 1;
+                            any_lookup = true;
+                            applied_anchor = true;
+                        }
+                    }
+                }
+                // 2. Post-draft verbatim extension on full-width (confident) sessions.
+                if !applied_anchor && w == VERIFY_ROWS && ds.iter().all(|&d| d >= 0) {
                     extra[0] = self.anchor[q];
                     extra[1..VERIFY_ROWS].copy_from_slice(ds);
                     let (cnt, back) = self.lookup[q].propose(&extra, &mut prop[..self.lookup_len]);
                     if back >= self.lookup_min && cnt > 0 {
                         if !filled {
-                            self.all_drafts.fill(-1);
-                            for g2 in segs {
-                                let q2 = g2.slot;
-                                let ds2 = &self.drafts_host[q2 * DRAFTS..(q2 + 1) * DRAFTS];
-                                self.all_drafts[q2 * self.draft_k..q2 * self.draft_k + DRAFTS].copy_from_slice(ds2);
-                            }
+                            fill_all(&mut self.all_drafts, &self.drafts_host, self.draft_k);
                             filled = true;
                         }
                         self.all_drafts[q * self.draft_k + DRAFTS..q * self.draft_k + DRAFTS + cnt]
                             .copy_from_slice(&prop[..cnt]);
                         self.widths[q] = to_i32(VERIFY_ROWS + cnt)?;
+                        self.lookup_start[q] = DRAFTS;
                         t.lookup_triggers += 1;
                         self.lookup_triggers_total += 1;
                         any_lookup = true;
@@ -378,6 +449,9 @@ impl Speculation {
             }
             if filled {
                 sp.upload(self.bufs.drafts, &self.all_drafts)?;
+                if prop_overridden && let Some(pd) = self.prop_drafts_dev {
+                    sp.upload(pd, &self.prop_drafts_host)?;
+                }
                 round_drafts = self.bufs.drafts;
                 round_k = self.draft_k;
             } else {
@@ -456,7 +530,12 @@ impl Speculation {
         } else {
             // one per segment of the call, in call order
             let params: Vec<DeviceSampling> = ord.iter().map(|&i| segs[i].sampling).collect();
-            if let Some(prop) = self.drafter.proposal() {
+            if let Some(mut prop) = self.drafter.proposal() {
+                if prop_overridden {
+                    prop.drafts = self
+                        .prop_drafts_dev
+                        .expect("prop_drafts_dev allocated when lookup_len > 0 and drafter has proposal");
+                }
                 sp.spec_accept_leviathan(&round_bufs, &prop, round_k, &params, &mut self.res)?;
             } else {
                 sp.spec_accept_sampled(&round_bufs, round_k, &params, &mut self.res)?;
@@ -483,7 +562,7 @@ impl Speculation {
             let n = emitted.len();
             if self.lookup_len > 0 {
                 old_anchors.push((g.slot, self.anchor[g.slot], i));
-                let lk_acc = n.saturating_sub(VERIFY_ROWS);
+                let lk_acc = (n - 1).saturating_sub(self.lookup_start[g.slot]);
                 if lk_acc > 0 {
                     t.lookup_accepted += lk_acc as u32;
                     self.lookup_accepted_total += lk_acc as u64;

@@ -5,12 +5,14 @@
 //!   final norm, candidate_selector hidden_projection + predecessor/successor codebooks).
 //! - Shared target tensors (from target checkpoint or engine weights): `model.llm.embed.weight`,
 //!   `model.llm.embed_norm.weight`, `model.llm.unembed.weight`.
+use std::fs;
 use std::path::Path;
 
 use safetensors::Dtype;
+use serde::Deserialize;
 
 use crate::checkpoint::{CHECKPOINT_FILE, Checkpoint};
-use crate::error::{Result, invalid};
+use crate::error::{ModelError, Result, invalid};
 
 /// Hidden dimension.
 pub const H: usize = 2304;
@@ -52,16 +54,172 @@ pub const TOP_K: usize = 16;
 pub const SEL_RANK: usize = 256;
 /// Top-k stage-1 chunks over `VALID_VOCAB`.
 pub const TOPK_CHUNKS: usize = 64;
-/// RoPE theta for DFlash2 (`10000.0`, distinct from target/DSpark `1000000.0`).
+/// RoPE theta for DFlash2 SWA layers (`10000.0`, distinct from target/DSpark `1000000.0`).
 pub const ROPE_THETA: f32 = 10_000.0;
+/// Default RoPE theta for DFlash2 global (`full_attention`) layers.
+pub const GLOBAL_ROPE_THETA: f32 = 1_000_000.0;
+/// Default `draft_ctx` when any DFlash2 layer uses `full_attention`.
+pub const GLOBAL_DEFAULT_CTX: u32 = 102_400;
 /// Positions precomputed in the RoPE cos/sin table (`262144 + 64`).
 pub const COS_SIN_POS: usize = 262_208;
 /// Maximum split-KV partitions for SWA-2048 block attention.
 pub const ATTN_SPLITS: usize = 16;
+/// Maximum split-KV partitions for global E4M3 block attention.
+pub const GLOBAL_ATTN_SPLITS: usize = 64;
 /// Dynamic shared memory bytes for `df2::swa_attn_split_kernel`: `(4 * 64 + 32) * (HD + 8) * 2`.
 pub const ATTN_SMEM: usize = (4 * 64 + 32) * (HD + 8) * 2;
+/// Dynamic shared memory bytes for `df2::global_attn_e4m3_split_kernel` (Design A uses 8 KiB static smem).
+pub const GLOBAL_ATTN_SMEM: usize = 0;
 /// Checkpoint filename inside the DFlash2 model directory.
 pub const DFLASH2_FILE: &str = "model.safetensors";
+/// Config filename inside the DFlash2 model directory.
+pub const CONFIG_FILE: &str = "config.json";
+
+/// Attention type of a DFlash2 draft decoder layer (`config.json` `layer_types`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerType {
+    /// Sliding-window attention (`sliding_attention`, SWA-2048, BF16 ring buffer).
+    SlidingAttention,
+    /// Full-context global attention (`full_attention`, E4M3 linear KV cache).
+    FullAttention,
+}
+
+/// Parsed DFlash2 model configuration (`config.json`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DFlash2Config {
+    /// Attention type for each of the 5 draft decoder layers.
+    pub layer_types: [LayerType; NLAYERS],
+    /// RoPE base frequency for `sliding_attention` layers.
+    pub rope_theta: f32,
+    /// RoPE base frequency for `full_attention` layers.
+    pub global_rope_theta: f32,
+}
+
+impl Default for DFlash2Config {
+    fn default() -> Self {
+        Self {
+            layer_types: [LayerType::SlidingAttention; NLAYERS],
+            rope_theta: ROPE_THETA,
+            global_rope_theta: GLOBAL_ROPE_THETA,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawRopeParams {
+    rope_theta: Option<f32>,
+    global_rope_theta: Option<f32>,
+}
+
+#[derive(Deserialize)]
+struct RawDFlash2Config {
+    layer_types: Option<Vec<String>>,
+    rope_theta: Option<f32>,
+    global_rope_theta: Option<f32>,
+    rope_parameters: Option<RawRopeParams>,
+}
+
+impl DFlash2Config {
+    /// Loads `config.json` from `dflash_dir`. If `config.json` does not exist, returns the stock
+    /// 5x `sliding_attention` default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ModelError::Invalid`] on malformed JSON or unsupported `layer_types`.
+    pub fn load(dflash_dir: &Path) -> Result<Self> {
+        let path = dflash_dir.join(CONFIG_FILE);
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let text = fs::read_to_string(&path).map_err(|source| ModelError::Io { path, source })?;
+        Self::from_json(&text)
+    }
+
+    /// Parses a DFlash2 `config.json` payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ModelError::Invalid`] on malformed JSON, invalid `layer_types`, or non-positive RoPE theta.
+    pub fn from_json(text: &str) -> Result<Self> {
+        let raw: RawDFlash2Config =
+            serde_json::from_str(text).map_err(|e| invalid("dflash2 config.json", e.to_string()))?;
+        let mut layer_types = [LayerType::SlidingAttention; NLAYERS];
+        if let Some(types) = raw.layer_types {
+            if types.len() != NLAYERS {
+                return Err(invalid(
+                    "dflash2 config.json",
+                    format!("layer_types has {} entries, expected {NLAYERS}", types.len()),
+                ));
+            }
+            for (i, t) in types.iter().enumerate() {
+                layer_types[i] = match t.as_str() {
+                    "sliding_attention" => LayerType::SlidingAttention,
+                    "full_attention" => LayerType::FullAttention,
+                    other => {
+                        return Err(invalid(
+                            "dflash2 config.json",
+                            format!("layer_types[{i}] unsupported: {other:?}"),
+                        ));
+                    }
+                };
+            }
+        }
+        let rope_theta = raw
+            .rope_parameters
+            .as_ref()
+            .and_then(|p| p.rope_theta)
+            .or(raw.rope_theta)
+            .unwrap_or(ROPE_THETA);
+        let global_rope_theta = raw
+            .global_rope_theta
+            .or_else(|| raw.rope_parameters.as_ref().and_then(|p| p.global_rope_theta))
+            .unwrap_or(GLOBAL_ROPE_THETA);
+        if !(rope_theta > 0.0 && rope_theta.is_finite()) {
+            return Err(invalid(
+                "dflash2 config.json",
+                format!("invalid rope_theta {rope_theta}"),
+            ));
+        }
+        if !(global_rope_theta > 0.0 && global_rope_theta.is_finite()) {
+            return Err(invalid(
+                "dflash2 config.json",
+                format!("invalid global_rope_theta {global_rope_theta}"),
+            ));
+        }
+        Ok(Self {
+            layer_types,
+            rope_theta,
+            global_rope_theta,
+        })
+    }
+
+    /// Returns `true` if layer `li` uses `full_attention`.
+    #[must_use]
+    pub fn is_global(&self, li: usize) -> bool {
+        self.layer_types.get(li) == Some(&LayerType::FullAttention)
+    }
+
+    /// Returns `true` if any layer uses `full_attention`.
+    #[must_use]
+    pub fn has_global(&self) -> bool {
+        self.layer_types.contains(&LayerType::FullAttention)
+    }
+
+    /// Number of `full_attention` layers.
+    #[must_use]
+    pub fn global_count(&self) -> usize {
+        self.layer_types
+            .iter()
+            .filter(|&&t| t == LayerType::FullAttention)
+            .count()
+    }
+
+    /// Number of `sliding_attention` layers.
+    #[must_use]
+    pub fn swa_count(&self) -> usize {
+        NLAYERS - self.global_count()
+    }
+}
 
 /// Mapped checkpoints for DFlash2.
 #[derive(Debug)]
@@ -117,4 +275,66 @@ pub fn cat_bf16(ck: &Checkpoint, parts: &[(&str, usize)]) -> Result<Vec<u8>> {
         out.extend_from_slice(bf16_bytes(ck, name, elems)?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_stock_five_swa() {
+        let j = r#"{
+            "layer_types": ["sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention"],
+            "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
+        }"#;
+        let cfg = DFlash2Config::from_json(j).unwrap();
+        assert!(!cfg.has_global());
+        assert_eq!(cfg.global_count(), 0);
+        assert_eq!(cfg.swa_count(), 5);
+        assert_eq!(cfg.rope_theta, 10_000.0);
+        assert_eq!(cfg.global_rope_theta, 1_000_000.0);
+    }
+
+    #[test]
+    fn config_hybrid_layer2_global() {
+        let j = r#"{
+            "layer_types": ["sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention"],
+            "rope_parameters": {"rope_theta": 10000.0},
+            "global_rope_theta": 1000000.0
+        }"#;
+        let cfg = DFlash2Config::from_json(j).unwrap();
+        assert!(cfg.has_global());
+        assert_eq!(cfg.global_count(), 1);
+        assert_eq!(cfg.swa_count(), 4);
+        assert!(!cfg.is_global(0));
+        assert!(!cfg.is_global(1));
+        assert!(cfg.is_global(2));
+        assert!(!cfg.is_global(3));
+        assert!(!cfg.is_global(4));
+        assert_eq!(cfg.global_rope_theta, 1_000_000.0);
+    }
+
+    #[test]
+    fn config_two_global_layers() {
+        let j = r#"{
+            "layer_types": ["sliding_attention","full_attention","sliding_attention","full_attention","sliding_attention"],
+            "global_rope_theta": 500000.0
+        }"#;
+        let cfg = DFlash2Config::from_json(j).unwrap();
+        assert_eq!(cfg.global_count(), 2);
+        assert!(cfg.is_global(1) && cfg.is_global(3));
+        assert_eq!(cfg.global_rope_theta, 500_000.0);
+    }
+
+    #[test]
+    fn config_missing_fields_defaults_to_swa() {
+        let cfg = DFlash2Config::from_json("{}").unwrap();
+        assert_eq!(cfg, DFlash2Config::default());
+    }
+
+    #[test]
+    fn config_rejects_invalid_layer_type() {
+        let j = r#"{"layer_types": ["sliding_attention","linear_attention","sliding_attention","sliding_attention","sliding_attention"]}"#;
+        assert!(DFlash2Config::from_json(j).is_err());
+    }
 }

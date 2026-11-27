@@ -5,14 +5,15 @@
 use bytemuck::{Pod, Zeroable};
 use ink_cuda::{Bf16, CudaError, DevBuf, LaunchCfg, Result, Stream};
 use ink_kernels::{
-    Df2EmbedBlockKernelArgs, Df2GroupedConvInKernelArgs, Df2GroupedConvOutResNormKernelArgs,
-    Df2KvNormRopeStoreKernelArgs, Df2QkvNormRopeBlkKernelArgs, Df2RmsNormKernelArgs, Df2RopeTableKernelArgs,
-    Df2SelectorWalkKernelArgs, Df2SiluMulKernelArgs, Df2SwaAttnReduceKernelArgs, Df2SwaAttnSplitKernelArgs,
-    Df2Topk16ChunkMaxKernelArgs, Df2Topk16FilterKernelArgs, Df2Topk16Stage2KernelArgs, F16, KernelId, Kernels, Ptr,
-    S2fPermuteFragI8Args, S2fQuantRowsI8Args, s2f,
+    Df2EmbedBlockKernelArgs, Df2GlobalAttnE4m3SplitKernelArgs, Df2GroupedConvInKernelArgs,
+    Df2GroupedConvOutResNormKernelArgs, Df2KvNormRopeStoreGlobalE4m3KernelArgs, Df2KvNormRopeStoreKernelArgs,
+    Df2QkvNormRopeBlkKernelArgs, Df2RmsNormKernelArgs, Df2RopeTableKernelArgs, Df2SelectorWalkKernelArgs,
+    Df2SiluMulKernelArgs, Df2SwaAttnReduceKernelArgs, Df2SwaAttnSplitKernelArgs, Df2Topk16ChunkMaxKernelArgs,
+    Df2Topk16FilterKernelArgs, Df2Topk16Stage2KernelArgs, F16, KernelId, Kernels, Ptr, S2fPermuteFragI8Args,
+    S2fQuantRowsI8Args, s2f,
 };
 use ink_model::dflash2::{
-    ATTN_SMEM, BLK, CONV_PROJ_N, DRAFTS, H, HD, INTER, KVH, NH, RING, SEL_RANK, TOP_K, TOPK_CHUNKS,
+    ATTN_SMEM, BLK, CONV_PROJ_N, DRAFTS, GLOBAL_ATTN_SMEM, H, HD, INTER, KVH, NH, RING, SEL_RANK, TOP_K, TOPK_CHUNKS,
 };
 use ink_model::drafter::XS;
 
@@ -376,6 +377,57 @@ impl Dev<'_> {
     }
 
     #[expect(clippy::too_many_arguments, reason = "kernel arguments")]
+    pub(super) fn kv_norm_rope_store_global_e4m3(
+        &self,
+        kv: &DevBuf<Bf16>,
+        k_norm: &DevBuf<Bf16>,
+        cos_sin: &DevBuf<Bf16>,
+        pos: &DevBuf<i32>,
+        sess: &DevBuf<i32>,
+        k_glob: &DevBuf<u8>,
+        v_glob: &DevBuf<u8>,
+        ks_glob: &DevBuf<f32>,
+        vs_glob: &DevBuf<f32>,
+        n: usize,
+        sessions: usize,
+        max_ctx: usize,
+        kv_stride: usize,
+    ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        need(kv, n * 2 * KVH * HD, "df2 commit global kv")?;
+        need(k_norm, HD, "df2 global k_norm")?;
+        need(pos, n, "df2 commit global pos")?;
+        need(sess, n, "df2 commit global sess")?;
+        need(k_glob, sessions * KVH * kv_stride * HD, "df2 k_glob")?;
+        need(v_glob, sessions * KVH * kv_stride * HD, "df2 v_glob")?;
+        need(ks_glob, sessions * KVH * kv_stride, "df2 ks_glob")?;
+        need(vs_glob, sessions * KVH * kv_stride, "df2 vs_glob")?;
+        // SAFETY: extents verified above; kernel guards 0 <= pos[r] < max_ctx <= kv_stride; sess[r] < sessions.
+        unsafe {
+            self.k.df2_kv_norm_rope_store_global_e4m3_kernel(
+                self.st,
+                cfg([n, KVH, 1], HD),
+                Df2KvNormRopeStoreGlobalE4m3KernelArgs {
+                    kv: Ptr::Buf(kv),
+                    k_norm: Ptr::Buf(k_norm),
+                    cos_sin: Ptr::Buf(cos_sin),
+                    pos: Ptr::Buf(pos),
+                    sess: Ptr::Buf(sess),
+                    k_glob: Ptr::Buf(k_glob),
+                    v_glob: Ptr::Buf(v_glob),
+                    ks_glob: Ptr::Buf(ks_glob),
+                    vs_glob: Ptr::Buf(vs_glob),
+                    n: i(n),
+                    max_ctx: i(max_ctx),
+                    kv_stride: i(kv_stride),
+                },
+            )
+        }
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "kernel arguments")]
     pub(super) fn qkv_norm_rope_blk(
         &self,
         qkv: &DevBuf<Bf16>,
@@ -461,6 +513,78 @@ impl Dev<'_> {
                     part_ml: Ptr::Buf(part_ml),
                     part_o: Ptr::Buf(part_o),
                     k: i(k),
+                    splits: i(splits),
+                },
+            )?;
+            self.k.df2_swa_attn_reduce_kernel(
+                self.st,
+                cfg([k * KVH * 32, 1, 1], HD),
+                Df2SwaAttnReduceKernelArgs {
+                    part_ml: Ptr::Buf(part_ml),
+                    part_o: Ptr::Buf(part_o),
+                    out: Ptr::Buf(out),
+                    k: i(k),
+                    splits: i(splits),
+                },
+            )
+        }
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "global E4M3 attention split + reduce")]
+    pub(super) fn global_attn_e4m3(
+        &self,
+        q_blk: &DevBuf<Bf16>,
+        k_blk: &DevBuf<Bf16>,
+        v_blk: &DevBuf<Bf16>,
+        k_glob: &DevBuf<u8>,
+        v_glob: &DevBuf<u8>,
+        ks_glob: &DevBuf<f32>,
+        vs_glob: &DevBuf<f32>,
+        pos: &DevBuf<i32>,
+        sel: &DevBuf<i32>,
+        part_ml: &DevBuf<f32>,
+        part_o: &DevBuf<f32>,
+        out: &DevBuf<Bf16>,
+        k: usize,
+        sessions: usize,
+        max_ctx: usize,
+        kv_stride: usize,
+        splits: usize,
+    ) -> Result<()> {
+        let rows = k * BLK;
+        need(q_blk, rows * NH * HD, "df2 global attn q_blk")?;
+        need(k_blk, rows * KVH * HD, "df2 global attn k_blk")?;
+        need(v_blk, rows * KVH * HD, "df2 global attn v_blk")?;
+        need(k_glob, sessions * KVH * kv_stride * HD, "df2 global attn k_glob")?;
+        need(v_glob, sessions * KVH * kv_stride * HD, "df2 global attn v_glob")?;
+        need(ks_glob, sessions * KVH * kv_stride, "df2 global attn ks_glob")?;
+        need(vs_glob, sessions * KVH * kv_stride, "df2 global attn vs_glob")?;
+        need(sel, k, "df2 global attn sel")?;
+        need(part_ml, k * KVH * splits * 32 * 2, "df2 global attn part_ml")?;
+        need(part_o, k * KVH * splits * 32 * HD, "df2 global attn part_o")?;
+        need(out, rows * NH * HD, "df2 global attn out")?;
+        let ctas = splits / 2;
+        debug_assert!(ctas > 0 && splits.is_multiple_of(2));
+        // SAFETY: all extents checked above; Design A uses 2 warps/CTA (splits = 2 * ctas), 8 KiB static smem.
+        unsafe {
+            self.k.df2_global_attn_e4m3_split_kernel(
+                self.st,
+                cfg_smem([ctas, KVH, k], 64, GLOBAL_ATTN_SMEM),
+                Df2GlobalAttnE4m3SplitKernelArgs {
+                    q_blk: Ptr::Buf(q_blk),
+                    k_blk: Ptr::Buf(k_blk),
+                    v_blk: Ptr::Buf(v_blk),
+                    k_glob: Ptr::Buf(k_glob),
+                    v_glob: Ptr::Buf(v_glob),
+                    ks_glob: Ptr::Buf(ks_glob),
+                    vs_glob: Ptr::Buf(vs_glob),
+                    pos: Ptr::Buf(pos),
+                    sel: Ptr::Buf(sel),
+                    part_ml: Ptr::Buf(part_ml),
+                    part_o: Ptr::Buf(part_o),
+                    k: i(k),
+                    max_ctx: i(max_ctx),
+                    kv_stride: i(kv_stride),
                     splits: i(splits),
                 },
             )?;

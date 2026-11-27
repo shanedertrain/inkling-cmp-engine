@@ -14,4 +14,6 @@ half.workspace = true
 ink-cuda.workspace = true
 memmap2.workspace = true
 safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true

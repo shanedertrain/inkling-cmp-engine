@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "ink-api"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "axum",
  "futures-core",
@@ -735,14 +735,14 @@ dependencies = [
 
 [[package]]
 name = "ink-backend"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "ink-cuda"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "ink-kernels"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bytemuck",
  "ink-cuda",
@@ -766,19 +766,21 @@ dependencies = [
 
 [[package]]
 name = "ink-model"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bytemuck",
  "half",
  "ink-cuda",
  "memmap2",
  "safetensors",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "ink-parse"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ink-text",
  "serde_json",
@@ -786,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "ink-record"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -796,14 +798,14 @@ dependencies = [
 
 [[package]]
 name = "ink-rt-api"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ink-record",
 ]
 
 [[package]]
 name = "ink-runtime"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bytemuck",
  "ink-backend",
@@ -818,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "ink-sched"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ink-backend",
  "proptest",
@@ -828,13 +830,14 @@ dependencies = [
 
 [[package]]
 name = "ink-server"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
  "ink-api",
  "ink-backend",
+ "ink-model",
  "ink-record",
  "ink-rt-api",
  "ink-runtime",
@@ -848,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "ink-text"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "serde_json",
  "tokenizers",
@@ -856,10 +859,11 @@ dependencies = [
 
 [[package]]
 name = "ink-tools"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytemuck",
  "clap",
  "ink-api",
  "ink-backend",
@@ -869,6 +873,7 @@ dependencies = [
  "ink-rt-api",
  "ink-runtime",
  "ink-text",
+ "serde",
  "serde_json",
  "tokio",
  "tracing-subscriber",
@@ -2141,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "cpp_demangle",
