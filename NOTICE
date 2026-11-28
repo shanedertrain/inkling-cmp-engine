@@ -65,3 +65,6 @@ Benchmark protocol & model checkpoints (not bundled)
 - Inco AI — Inkling-2-Mini-DFlash2
 - Mia's AI Lab (@MiaAI_lab) — MiaAI-Lab decode/prefill benchmark protocol,
   prompts, and recipe presentation
+- snailbrainx — inkling-2-mini-sm80 (Apache-2.0,
+  https://github.com/snailbrainx/inkling-2-mini-sm80), sm_80 vLLM port,
+  CONV_TAIL / BATCH=12288 insights, and 180 W H2H reference
