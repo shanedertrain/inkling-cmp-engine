@@ -12,8 +12,7 @@ use ink_model::dims::{
     BLOCK, DREL, GATE_RANK, H, HD, INTER, KD, KVH, LOOP_END, LOOP_START, NH, NLAYERS, NVISITS, PASSES, QD, REL_EXT,
     TOPK, VOCAB_PAD, Visit,
 };
-use ink_model::plan::FUSED_ROWS;
-use ink_model::plan::PAGE_ELEMS;
+use ink_model::plan::{FUSED_ROWS, PAGE_ELEMS, RING_VISITS};
 use ink_model::{Activations, ExpertFmt, GateTailW, LayerW, MemConfig, Weights};
 use ink_rt_api::{RuntimeError, TapFn, TapType};
 
@@ -483,7 +482,7 @@ impl Fwd<'_> {
             .rt()
     }
 
-    /// The pool (global layers) or ring (sliding layers) of visit `v`: K, V (raw bytes: 1 B/elem for global E4M3, 2 B/elem for bf16).
+    /// The pool (global layers) or ring+scratch (sliding layers) of visit `v`: K, V (raw bytes: 1 B/elem for global E4M3, 2 B/elem for bf16).
     fn kv(&self, v: usize, full: bool) -> Res<(DevBuf<u8>, DevBuf<u8>)> {
         let a = self.a;
         if full {
@@ -493,12 +492,39 @@ impl Fwd<'_> {
             Ok((span(&a.kpool, fi * n, n)?, span(&a.vpool, fi * n, n)?))
         } else {
             let ri = self.ring_index[v].ok_or_else(|| RuntimeError::request("ring index"))?;
-            let n = self.mem.max_slots * self.mem.ring_pages() * PAGE_ELEMS;
+            let visit_elems = self.mem.max_slots * self.mem.ring_pages() * PAGE_ELEMS;
             Ok((
-                span(&a.kring, ri * n, n)?.cast::<u8>().rt()?,
-                span(&a.vring, ri * n, n)?.cast::<u8>().rt()?,
+                at(&a.kring, ri * visit_elems)?.cast::<u8>().rt()?,
+                at(&a.vring, ri * visit_elems)?.cast::<u8>().rt()?,
             ))
         }
+    }
+
+    /// Call-order SWA page table for visit `v`: persistent `pt_r` on decode-only calls, per-visit `pt_r_pf` on
+    /// prefill-carrying calls (mapping prefill pages to shared SWA scratch).
+    fn swa_pt_call(&self, v: usize) -> Res<DevBuf<i32>> {
+        if self.decode_only() {
+            Ok(self.a.pt_r.clone())
+        } else {
+            let ri = self.ring_index[v].ok_or_else(|| RuntimeError::request("ring index"))?;
+            let nseg = self.m.call.len();
+            span(&self.a.pt_r_pf, ri * nseg * KPT, nseg * KPT)
+        }
+    }
+
+    /// Copy segment commit-tail rows from a working conv buffer (`[t, cols]`) into compact `convx` (`[tail_rows, cols]`).
+    fn save_conv_tail(&self, dst: &DevBuf<Bf16>, src: &DevBuf<Bf16>, cols: usize) -> Res<()> {
+        for (s, c) in self.m.call.iter().enumerate() {
+            let (src_row, nrows) = if c.dec() { (c.row0, c.m) } else { (c.row0 + c.m - 3, 3) };
+            let dst_row = s * MAX_DEC_ROWS;
+            self.st
+                .dtod(
+                    &span(dst, dst_row * cols, nrows * cols)?,
+                    &span(src, src_row * cols, nrows * cols)?,
+                )
+                .rt()?;
+        }
+        Ok(())
     }
 
     /// `Engine::attention`: decode segments on decode_attn, prefill segments on prefill_attn.
@@ -508,7 +534,7 @@ impl Fwd<'_> {
         let elem = if fp8 { 1usize } else { 2usize };
         let a = self.a;
         let (kb, vb) = self.kv(v, full)?;
-        let pt_call = if full { &a.pt_g } else { &a.pt_r };
+        let pt_dec = if full { &a.pt_g } else { &a.pt_r };
         let ms = self.mem.max_slots;
         let dec: Vec<_> = self.m.call.iter().filter(|c| c.dec()).collect();
         if !dec.is_empty() {
@@ -521,7 +547,7 @@ impl Fwd<'_> {
             let mut p = da::Params::zeroed();
             p.k = kb.ptr();
             p.v = vb.ptr();
-            p.page_table = at(pt_call, ms * KPT)?.ptr();
+            p.page_table = at(pt_dec, ms * KPT)?.ptr();
             p.pt_stride = KPT as i32;
             p.page_shift = 10;
             p.page_stride = (PAGE_ELEMS * elem) as i64;
@@ -554,6 +580,7 @@ impl Fwd<'_> {
         }
         if self.m.call.iter().any(|c| !c.dec()) {
             let kind = usize::from(!full);
+            let pt_pf = if full { a.pt_g.clone() } else { self.swa_pt_call(v)? };
             let mut p = pfa::Params::zeroed();
             p.q = a.q.ptr();
             p.k = kb.cast::<Bf16>().rt()?.ptr();
@@ -562,7 +589,7 @@ impl Fwd<'_> {
             p.s_slot = HD as i64;
             p.s_head = (1024 * HD) as i64;
             p.page_shift = 10;
-            p.page_table = pt_call.ptr();
+            p.page_table = pt_pf.ptr();
             p.rel = a.rel.ptr();
             p.rel_proj_t = self.rel_proj_t[l.idx].ptr();
             p.gate = a.gate.ptr();
@@ -577,7 +604,48 @@ impl Fwd<'_> {
             // fp32(0.08838834764831845f) * fp32(log2e), as the C++ (the literal 128^-0.5 rounded to f32 is 0x3db504f3)
             let qk_base = f32::from_bits(0x3db5_04f3) * std::f32::consts::LOG2_E;
             p.qk_scale = if fp8 { qk_base * 256.0 } else { qk_base };
-            self.dev.prefill_attn(&p, fp8, self.m.pa_items[kind].len()).rt()?;
+            let total = self.m.pa_items[kind].len();
+            let n_far = if full { self.m.pa_g_far } else { 0 };
+            if n_far > 0 {
+                self.dev.prefill_attn_far(&p, fp8, n_far).rt()?;
+            }
+            if total > n_far {
+                if n_far > 0 {
+                    let base = kind * a.pa_items_cap + n_far;
+                    p.items = at(&a.pa_items.cast::<[i32; 4]>().rt()?, base)?.ptr();
+                    p.items2 = at(&a.pa_items2.cast::<[i32; 4]>().rt()?, base)?.ptr();
+                }
+                self.dev.prefill_attn(&p, fp8, total - n_far).rt()?;
+            }
+            if !full && !self.m.swa_copies.is_empty() {
+                let ri = self.ring_index[v].ok_or_else(|| RuntimeError::request("ring index"))?;
+                let visit_pages = self.mem.max_slots * self.mem.ring_pages();
+                let scratch_base = RING_VISITS * visit_pages;
+                for piece in &self.m.swa_copies {
+                    let k_src = span(&a.kring, (scratch_base + piece.src_scratch) * PAGE_ELEMS, PAGE_ELEMS)?;
+                    let v_src = span(&a.vring, (scratch_base + piece.src_scratch) * PAGE_ELEMS, PAGE_ELEMS)?;
+                    let k_dst = span(
+                        &a.kring,
+                        (ri * visit_pages + piece.dst_ring_page) * PAGE_ELEMS,
+                        PAGE_ELEMS,
+                    )?;
+                    let v_dst = span(
+                        &a.vring,
+                        (ri * visit_pages + piece.dst_ring_page) * PAGE_ELEMS,
+                        PAGE_ELEMS,
+                    )?;
+                    self.dev
+                        .swa_ring_copy(
+                            &k_src,
+                            &v_src,
+                            &k_dst,
+                            &v_dst,
+                            piece.tok_lo,
+                            piece.tok_hi - piece.tok_lo,
+                        )
+                        .rt()?;
+                }
+            }
         }
         Ok(())
     }
@@ -586,9 +654,8 @@ impl Fwd<'_> {
     fn moe(&mut self, v: usize, l: &LayerW, mx: &DevBuf<Bf16>, combine_here: bool) -> Res<()> {
         let t = self.t();
         let a = self.a;
-        let tm = self.mem.t_max;
-        let ridx = span(&a.ridx_all, v * tm * TOPK, tm * TOPK)?;
-        let rw = span(&a.rw_all, v * tm * TOPK, tm * TOPK)?;
+        let ridx = a.ridx.clone();
+        let rw = a.rw.clone();
         if self.reference {
             self.dev
                 .router_ref(t, &a.xm, &l.router, &l.router_bias, &ridx, &rw)
@@ -718,15 +785,33 @@ impl Fwd<'_> {
         let a = self.a;
         let t = self.t();
         let tm = self.mem.t_max;
-        let xs = tm * H;
-        let kx = span(&a.convx, (v * 4) * xs, xs)?;
-        let vx = span(&a.convx, (v * 4 + 1) * xs, xs)?;
-        let ax = span(&a.convx, (v * 4 + 2) * xs, xs)?;
-        let mx = span(&a.convx, (v * 4 + 3) * xs, xs)?;
+        let decode_only = self.decode_only();
+        let tail_rows = self.mem.conv_tail_rows();
+        let v_base = v * tail_rows * SLD;
+        let conv_tail_k = span(&a.convx, v_base, tail_rows * KD)?;
+        let conv_tail_v = span(&a.convx, v_base + tail_rows * 1024, tail_rows * KD)?;
+        let conv_tail_a = span(&a.convx, v_base + tail_rows * 2048, tail_rows * H)?;
+        let conv_tail_m = span(&a.convx, v_base + tail_rows * 4352, tail_rows * H)?;
+        let (kx, vx, ax, mx) = if decode_only {
+            (
+                conv_tail_k.clone(),
+                conv_tail_v.clone(),
+                conv_tail_a.clone(),
+                conv_tail_m.clone(),
+            )
+        } else {
+            (
+                a.kx_work.clone(),
+                a.vx_work.clone(),
+                a.ax_work.clone(),
+                a.mx_work.clone(),
+            )
+        };
         let rws = rows(&a.pos, &a.seg, &a.row0, &a.slot);
         let cst = at(&a.conv, v * 3 * SLD)?;
         let (kb, vb) = self.kv(v, l.full)?;
-        let pt = if l.full { &a.pt_g } else { &a.pt_r };
+        let pt_buf = if l.full { a.pt_g.clone() } else { self.swa_pt_call(v)? };
+        let pt = &pt_buf;
         let reference = self.reference;
         let hin_b = self.hin_buf(hin).clone();
         let hout_b = &a.hid[hout];
@@ -882,6 +967,7 @@ impl Fwd<'_> {
         let any_pre = self.m.call.iter().any(|c| c.m > MAX_DEC_ROWS);
         let any_dec = self.m.call.iter().any(|c| c.m <= MAX_DEC_ROWS);
         let fused_qkv_pf = !reference && !tapping && any_pre;
+        let fused_qkv_dec = !reference && !tapping && !any_pre && self.m.dec_rows <= FUSED_ROWS;
         let nq = 2 * QD + NH * DREL + NH;
         let nk = KD + if l.full { 32 } else { 0 };
         let nt = nq + 2 * nk;
@@ -890,9 +976,9 @@ impl Fwd<'_> {
             if fused_qkv_pf {
                 let c = class(dec);
                 if pk_is_xq && pv_is_xq {
-                    self.run(c, (nt, H, H), px, o * H, H, &l.wqkv, 0, &a.relk, o * nt, nt, n)?;
+                    self.run(c, (nt, H, H), px, o * H, H, &l.wqkv, 0, &a.qkvf_pf, o * nt, nt, n)?;
                 } else {
-                    self.run(c, (nq, H, H), px, o * H, H, &l.wqkv, 0, &a.relk, o * nt, nt, n)?;
+                    self.run(c, (nq, H, H), px, o * H, H, &l.wqkv, 0, &a.qkvf_pf, o * nt, nt, n)?;
                     let shape = GemmShape {
                         n: nk as u32,
                         k: H as u32,
@@ -909,39 +995,43 @@ impl Fwd<'_> {
                             H as u32,
                             (tm * H) as u64,
                             &at(&l.wqkv, nq * H)?,
-                            &at(&a.relk, o * nt + nq)?,
+                            &at(&a.qkvf_pf, o * nt + nq)?,
                             nt as u32,
                             n as u32,
                         )
                         .rt()?;
                 }
-                if dec {
-                    let s = |x: &DevBuf<Bf16>, ld: usize| at(x, o * ld);
-                    let (q, gt, r, sk, k, kd, vv, vd) = (
-                        s(&a.qproj, QD)?,
-                        s(&a.gate, QD)?,
-                        s(&a.rproj, NH * DREL)?,
-                        s(&a.sink, NH)?,
-                        s(&kx, KD)?,
-                        s(&a.kdyn, 32)?,
-                        s(&vx, KD)?,
-                        s(&a.vdyn, 32)?,
-                    );
-                    let out = ProjOut {
-                        q: &q,
-                        g: &gt,
-                        r: &r,
-                        s: &sk,
-                        k: &k,
-                        kd: &kd,
-                        v: &vv,
-                        vd: &vd,
+            } else if fused_qkv_dec {
+                let c = class(dec);
+                if pk_is_xq && pv_is_xq {
+                    self.run(c, (nt, H, H), px, o * H, H, &l.wqkv, 0, &a.qkvf, o * nt, nt, n)?;
+                } else {
+                    self.run(c, (nq, H, H), px, o * H, H, &l.wqkv, 0, &a.qkvf, o * nt, nt, n)?;
+                    let shape = GemmShape {
+                        n: nk as u32,
+                        k: H as u32,
+                        ldw: H as u32,
+                        input: ink_cuda::Dtype::Bf16,
+                        output: ink_cuda::Dtype::Bf16,
+                        class: c,
                     };
-                    self.dev.proj_split(n, &at(&a.relk, o * nt)?, nt, l.full, &out).rt()?;
+                    self.lt
+                        .run2(
+                            self.st,
+                            shape,
+                            &at(self.xkv, o * H)?,
+                            H as u32,
+                            (tm * H) as u64,
+                            &at(&l.wqkv, nq * H)?,
+                            &at(&a.qkvf, o * nt + nq)?,
+                            nt as u32,
+                            n as u32,
+                        )
+                        .rt()?;
                 }
             } else if !tapping && (!dec || self.m.dec_rows <= FUSED_ROWS) {
                 let c = class(dec);
-                let qkvf = if dec { &a.qkvf } else { &a.relk };
+                let qkvf = if dec { &a.qkvf } else { &a.qkvf_pf };
                 if pk_is_xq && pv_is_xq {
                     self.run(c, (nt, H, H), px, o * H, H, &l.wqkv, 0, qkvf, 0, nt, n)?;
                 } else {
@@ -1042,8 +1132,13 @@ impl Fwd<'_> {
         };
         if fused_qkv_pf {
             self.dev
-                .qkv_post_fused_rows(t, &a.relk, nt, &a.gate, &a.sink, &a.len, qp)
+                .qkv_post_fused_rows(t, &a.qkvf_pf, nt, &a.gate, &a.sink, &a.len, qp)
                 .rt()?;
+        } else if fused_qkv_dec {
+            self.dev
+                .qkv_post_fused_rows(t, &a.qkvf, nt, &a.gate, &a.sink, &a.len, qp)
+                .rt()?;
+            self.dev.rel_logits_decode(t, &a.rel, &l.rel_proj, &a.rel_logits).rt()?;
         } else if !reference && any_pre {
             self.dev.qkv_post_rows(t, qp).rt()?;
         } else if !reference {
@@ -1085,6 +1180,10 @@ impl Fwd<'_> {
             self.tap(Some(v), "v", &a.v, TapType::Bf16, &[t, KVH, HD])?;
             self.dev.kv_write_ref(t, &qp, &a.k, &a.v).rt()?;
         }
+        if !decode_only {
+            self.save_conv_tail(&conv_tail_k, &kx, KD)?;
+            self.save_conv_tail(&conv_tail_v, &vx, KD)?;
+        }
         self.fmark("relk")?;
         if any_pre && any_dec && !reference {
             for grp in self.m.rgroups.clone() {
@@ -1108,6 +1207,9 @@ impl Fwd<'_> {
         self.mark("wo")?;
         self.gemm(&a.attn, QD, &l.wo, H, QD, &ax, H)?;
         self.tap(Some(v), "wo", &ax, TapType::Bf16, &[t, H])?;
+        if !decode_only {
+            self.save_conv_tail(&conv_tail_a, &ax, H)?;
+        }
         // ---- attention conv + residual, MLP input (AttnRes, loop message gate, mlp_norm)
         self.mark("glue_mid")?;
         let bstart = vi.layer.is_multiple_of(BLOCK);
@@ -1244,6 +1346,9 @@ impl Fwd<'_> {
             self.dev
                 .hidden_conv(t, &mx, &l.mlp_conv, &cst_mlp, rws, 1, Some(&a.partial), hout_b)
                 .rt()?;
+        }
+        if !decode_only {
+            self.save_conv_tail(&conv_tail_m, &mx, H)?;
         }
         self.tap(Some(v), "out", hout_b, TapType::Bf16, &[t, H])?;
         Ok(())

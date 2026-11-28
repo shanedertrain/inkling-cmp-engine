@@ -1027,7 +1027,8 @@ struct Caches { CacheL l[3]; };
 // any sessions at any positions (prefill chunks, ragged commits, rollback re-commits).
 __global__ void epi_kvctx(const float* part, int SK, int T, Step st, const __nv_bfloat16* kn0,
                           const __nv_bfloat16* kn1, const __nv_bfloat16* kn2, const float* cs, Caches cc,
-                          const int* row_pos = nullptr, const int* row_sess = nullptr) {
+                          const int* row_pos = nullptr, const int* row_sess = nullptr,
+                          const int* bt_swa = nullptr) {
   int row = blockIdx.x, l = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const __nv_bfloat16* kn = l == 0 ? kn0 : l == 1 ? kn1 : kn2;
   int r = row / BLK, j = row % BLK;
@@ -1046,12 +1047,13 @@ __global__ void epi_kvctx(const float* part, int SK, int T, Step st, const __nv_
     for (int k = 0; k < SK; ++k) s += pb[((size_t)k * T + row) * 2048 + col + ds[e]];
     x[e] = rb(s);  // linear output bf16
   }
-  size_t slot = slot_of(st, r, pos);
+  const int* bt = (l != 1 && bt_swa) ? bt_swa : st.block_table;
+  size_t slot = (size_t)bt[r * st.max_blocks + pos / PAGE] * PAGE + pos % PAGE;
   size_t off = kv_off(slot, head);
   if (isv) {
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-      cc.l[l].v[off + ds[e]] = __float2bfloat16_rn(x[e]);
+      if (cc.l[l].v) cc.l[l].v[off + ds[e]] = __float2bfloat16_rn(x[e]);
       if (cc.l[l].v8) cc.l[l].v8[off + ds[e]] = f2e4m3(x[e]);
     }
     return;
@@ -1064,7 +1066,7 @@ __global__ void epi_kvctx(const float* part, int SK, int T, Step st, const __nv_
   rope_pair(x[1], x[3], cs, pos, d0 + 1);
 #pragma unroll
   for (int e = 0; e < 4; ++e) {
-    cc.l[l].k[off + ds[e]] = __float2bfloat16_rn(x[e]);
+    if (cc.l[l].k) cc.l[l].k[off + ds[e]] = __float2bfloat16_rn(x[e]);
     if (cc.l[l].k8) cc.l[l].k8[off + ds[e]] = f2e4m3(rb(x[e]));
   }
 }
@@ -1147,14 +1149,14 @@ __global__ void epi_qkv(const float* part, int SK, int T, Step st, const __nv_bf
     size_t off = kv_off(slot_of(st, r, pos), h);
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-      cache.k[off + ds[e]] = __float2bfloat16_rn(x[e]);
+      if (cache.k) cache.k[off + ds[e]] = __float2bfloat16_rn(x[e]);
       if (cache.k8) cache.k8[off + ds[e]] = f2e4m3(rb(x[e]));
     }
     float v[4];
     get((NH + KVH) * HD + h * HD, v);
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-      cache.v[off + ds[e]] = __float2bfloat16_rn(v[e]);
+      if (cache.v) cache.v[off + ds[e]] = __float2bfloat16_rn(v[e]);
       if (cache.v8) cache.v8[off + ds[e]] = f2e4m3(v[e]);
     }
   }

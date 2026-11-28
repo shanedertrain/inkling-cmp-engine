@@ -29,8 +29,12 @@ pub const fn da_ring_smem(nw: usize) -> u32 {
 }
 /// prefill_attn<4, 2, 1, 1, 2> dynamic shared memory (`Cfg::SMEM` = 2 x (2 x 64 x 128 + 112 x 16 + 128 x 128 + 4 x 16 x 74) + 16).
 pub const PFA_SMEM: u32 = 2 * (2 * 8192 + 112 * 16 + 16384 + 4 * 16 * 74) + 16;
+/// prefill_attn_far<4, 2, 1, 1, 2> dynamic shared memory (`CfgFar::SMEM` = 2 x (2 x 64 x 128 + 128 x 128) + 16).
+pub const PFA_FAR_SMEM: u32 = 2 * (2 * 8192 + 16384) + 16;
 /// prefill_attn_fp8<4, 2, 1, 1, 2> dynamic shared memory (`CfgFp8::SMEM` = 2 x 8192 + 112 x 16 x 2 + 32768 + 4 x 16 x 74 x 2 + 16).
 pub const PFA_FP8_SMEM: u32 = 2 * 8192 + 112 * 16 * 2 + 32768 + 4 * 16 * 74 * 2 + 16;
+/// prefill_attn_fp8_far<4, 2, 2> dynamic shared memory (`CfgFp8Far::SMEM` = 2 x 8192 + 32768 + 16).
+pub const PFA_FP8_FAR_SMEM: u32 = 2 * 8192 + 32768 + 16;
 /// moe_gemm2<NVFP4B, *, 3, 8> shared memory (`Cfg2::SMEM`: 3 x (16384 + 4 x 2048 + 4 x 512) + 128 x 8).
 pub const MOE_SMEM_NVFP4: u32 = 3 * (16384 + 8192 + 2048) + 1024;
 /// moe_gemm2<NVFP4_N1S1, *, 3, 8> shared memory (`Cfg2::SMEM`: 3 x (16384 + 4 x 2048 + 4 x 256) + 128 x 8).
@@ -1821,8 +1825,8 @@ impl Dev<'_> {
         need(a.rel, t * NH * 16, "rel")?;
         need(gate, t * QD, "gate")?;
         need(sink, t * NH, "sink")?;
-        need(a.kx, t * H, "kx")?;
-        need(a.vx, t * H, "vx")?;
+        need(a.kx, t * KD, "kx")?;
+        need(a.vx, t * KD, "vx")?;
         need(a.pos, t, "pos")?;
         let c = cfg([t, 4, 1], 256, 0);
         if a.fp8 {
@@ -2343,6 +2347,26 @@ impl Dev<'_> {
         }
     }
 
+    /// `pfa::prefill_attn_far_kernel<4, 2, 1, 1, 2>` (or `prefill_attn_fp8_far_kernel<4, 2, 2>` when `fp8`):
+    /// pure-FAR global items (`qmin >= it.w * 64 + WINDOW - 1`, `window == 0`, no bias/mask); nothing when 0 items.
+    pub fn prefill_attn_far(&self, p: &pfa::Params, fp8: bool, nitems: usize) -> Result<()> {
+        if nitems == 0 {
+            return Ok(());
+        }
+        // SAFETY: same pfa::Params contract as `prefill_attn`; additionally every item x < nitems is guaranteed by
+        // `meta::pa_items` to have `window == 0` and all key positions at distance >= 1024 from every query row in the
+        // tile (strictly causal, strictly outside the relative-bias window, and strictly inside klen).
+        unsafe {
+            if fp8 {
+                self.k
+                    .pfa_prefill_attn_fp8_far_kernel_4_2_2(self.st, cfg([nitems, 8, 1], 128, PFA_FP8_FAR_SMEM), p)
+            } else {
+                self.k
+                    .pfa_prefill_attn_far_kernel_4_2_1_1_2(self.st, cfg([nitems, 8, 1], 128, PFA_FAR_SMEM), p)
+            }
+        }
+    }
+
     // ------------------------------------------------------------------------------------------------ convs
 
     /// `glue::attn_conv_partial_kernel<<<grid1(T H), 256>>>` (production glue).
@@ -2545,10 +2569,54 @@ impl Dev<'_> {
     /// `glue::conv_commit_kernel<<<(36, NVISITS, S), 256>>>(CommitArgs)`.
     pub fn conv_commit(&self, s: usize, a: &glue::CommitArgs) -> Result<()> {
         // SAFETY: CommitArgs (glue.cuh): segment s < nseg = S (row0 / slot / cnt uploaded for S segments) moves the
-        // last rows of its convx inputs (rows < T <= t_max of each visit's 4 conv inputs) into its slot's conv state.
+        // last rows of its compact convx tail inputs into its slot's conv state.
         unsafe {
             self.k
                 .glue_conv_commit_kernel(self.st, cfg([4 * 9, NVISITS, s], 256, 0), a)
+        }
+    }
+
+    /// `pglue::swa_ring_copy_kernel<<<(ceil(ntok / 8), 8, 2), 128>>>`: copies trailing SWA window tokens
+    /// `[tok_lo, tok_lo + ntok)` across all 8 KV heads for both K and V from a shared scratch page into a slot's
+    /// persistent 2-page SWA ring.
+    pub fn swa_ring_copy(
+        &self,
+        k_src_page: &DevBuf<Bf16>,
+        v_src_page: &DevBuf<Bf16>,
+        k_dst_page: &DevBuf<Bf16>,
+        v_dst_page: &DevBuf<Bf16>,
+        tok_lo: usize,
+        ntok: usize,
+    ) -> Result<()> {
+        if ntok == 0 {
+            return Ok(());
+        }
+        let page_elems = KVH * 1024 * HD;
+        need(k_src_page, page_elems, "swa_ring_copy k_src")?;
+        need(v_src_page, page_elems, "swa_ring_copy v_src")?;
+        need(k_dst_page, page_elems, "swa_ring_copy k_dst")?;
+        need(v_dst_page, page_elems, "swa_ring_copy v_dst")?;
+        if tok_lo + ntok > 1024 {
+            return Err(CudaError::Bounds {
+                what: "swa_ring_copy range",
+                detail: format!("tok_lo {tok_lo} + ntok {ntok} > 1024"),
+            });
+        }
+        // SAFETY: grid (ceil(ntok / 8), 8, 2), block 128 copies [tok_lo, tok_lo + ntok) x 8 heads x 128 bf16 (uint4)
+        // for both K and V; all four 1,024-token page buffers and the token range are checked above.
+        unsafe {
+            self.k.pglue_swa_ring_copy_kernel(
+                self.st,
+                cfg([ntok.div_ceil(8), KVH, 2], 128, 0),
+                PglueSwaRingCopyKernelArgs {
+                    k_src_page: b(k_src_page),
+                    v_src_page: b(v_src_page),
+                    k_dst_page: b(k_dst_page),
+                    v_dst_page: b(v_dst_page),
+                    tok_lo: i(tok_lo),
+                    ntok: i(ntok),
+                },
+            )
         }
     }
 
@@ -3025,8 +3093,8 @@ impl QkvPost<'_> {
         need(self.rproj, t * NH * 16, "rproj")?;
         need(self.q, t * QD, "q")?;
         need(self.rel, t * NH * 16, "rel")?;
-        need(self.kx, t * H, "kx")?;
-        need(self.vx, t * H, "vx")?;
+        need(self.kx, t * KD, "kx")?;
+        need(self.vx, t * KD, "vx")?;
         need(self.pos, t, "pos")?;
         need(self.kdyn, t * 32, "kdyn")?;
         need(self.vdyn, t * 32, "vdyn")?;

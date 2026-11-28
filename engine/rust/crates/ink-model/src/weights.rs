@@ -159,8 +159,8 @@ pub struct WeightRegion {
     pub offset: usize,
 }
 
-/// The arena estimate of the weights (`weights_bytes_estimate`).
-pub const WEIGHTS_BYTES_ESTIMATE: usize = 21_000_000_000;
+/// The arena estimate of the weights (measured Inkling-2-Mini weights: ~18.98 GB + <1 MiB alignment).
+pub const WEIGHTS_BYTES_ESTIMATE: usize = 19_050_000_000;
 
 struct Loader<'a> {
     ar: &'a mut Arena,

@@ -470,6 +470,10 @@ impl SpecRuntime for Engine {
                 self.mem.max_slots
             )));
         }
+        let shared_pages = Some(super::SharedGlobalPages {
+            slots: self.slots.clone(),
+            num_pages: self.mem.num_pages,
+        });
         let d: Box<dyn Drafter> = if config.dflash2_dir.is_some() {
             Box::new(RustDFlash2::on(
                 self.ctx.clone(),
@@ -481,6 +485,7 @@ impl SpecRuntime for Engine {
                     embed: self.w.embed.clone(),
                     unembed: self.w.unembed.clone(),
                 }),
+                shared_pages,
             )?)
         } else {
             Box::new(RustDrafter::on(
@@ -489,6 +494,7 @@ impl SpecRuntime for Engine {
                 self.spec.bufs.clone(),
                 self.spec.draft_graph.clone(),
                 config,
+                shared_pages,
             )?)
         };
         let unheld = self.graph_mem.saturating_sub(self.graphs.held()) as u64;

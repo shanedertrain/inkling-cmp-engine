@@ -58,14 +58,18 @@ pub const TOPK_CHUNKS: usize = 64;
 pub const ROPE_THETA: f32 = 10_000.0;
 /// Default RoPE theta for DFlash2 global (`full_attention`) layers.
 pub const GLOBAL_ROPE_THETA: f32 = 1_000_000.0;
-/// Default `draft_ctx` when any DFlash2 layer uses `full_attention`.
-pub const GLOBAL_DEFAULT_CTX: u32 = 102_400;
+/// Default `draft_ctx` when any DFlash2 layer uses `full_attention` (paged E4M3 global KV supports full 262K).
+pub const GLOBAL_DEFAULT_CTX: u32 = 262_144;
+/// Tokens per paged global E4M3 KV page (matches target engine `PAGE = 1024`).
+pub const GLOBAL_PAGE: usize = 1024;
+/// Global page-table row stride per session (`264 * 1024 = 270,336 >= 262,144 + BLK`).
+pub const GLOBAL_KPT: usize = 264;
 /// Positions precomputed in the RoPE cos/sin table (`262144 + 64`).
 pub const COS_SIN_POS: usize = 262_208;
 /// Maximum split-KV partitions for SWA-2048 block attention.
 pub const ATTN_SPLITS: usize = 16;
-/// Maximum split-KV partitions for global E4M3 block attention.
-pub const GLOBAL_ATTN_SPLITS: usize = 64;
+/// Maximum split-KV partitions for global E4M3 block attention (37 CTAs x 2 warps = 296 CTAs = 4 CTAs/SM on 74 SMs).
+pub const GLOBAL_ATTN_SPLITS: usize = 74;
 /// Dynamic shared memory bytes for `df2::swa_attn_split_kernel`: `(4 * 64 + 32) * (HD + 8) * 2`.
 pub const ATTN_SMEM: usize = (4 * 64 + 32) * (HD + 8) * 2;
 /// Dynamic shared memory bytes for `df2::global_attn_e4m3_split_kernel` (Design A uses 8 KiB static smem).
@@ -80,7 +84,7 @@ pub const CONFIG_FILE: &str = "config.json";
 pub enum LayerType {
     /// Sliding-window attention (`sliding_attention`, SWA-2048, BF16 ring buffer).
     SlidingAttention,
-    /// Full-context global attention (`full_attention`, E4M3 linear KV cache).
+    /// Full-context global attention (`full_attention`, E4M3 paged KV cache).
     FullAttention,
 }
 

@@ -231,6 +231,43 @@ fn common_prefix(a: &[i32], b: &[i32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
+/// Prefill-attention global split partials required by a prefill segment of `m` rows starting at `pos0`
+/// (matches `ink_runtime::engine::meta::pa_items`).
+fn pa_global_partials(pos0: usize, m: usize, max_decode_rows: usize) -> usize {
+    if m <= max_decode_rows {
+        return 0;
+    }
+    const SB: usize = 8192 / 64;
+    let step = |x: usize| {
+        if x < 8 * SB {
+            SB
+        } else if x < 16 * SB {
+            2 * SB
+        } else {
+            4 * SB
+        }
+    };
+    let mut parts = 0;
+    let mut r0 = 0;
+    while r0 < 3 * m {
+        let qmax = pos0 + (r0 + 127).min(3 * m - 1) / 3;
+        let b1 = qmax / 64 + 1;
+        let mut cuts = 1;
+        let mut x = 0;
+        while x < b1 {
+            if x > 0 {
+                cuts += 1;
+            }
+            x += step(x);
+        }
+        if cuts > 1 {
+            parts += cuts;
+        }
+        r0 += 128;
+    }
+    parts
+}
+
 fn release_slot(slot_owner: &mut [Option<u64>], s: &mut Seq) {
     if let Some(slot) = s.slot.take() {
         slot_owner[slot] = None;
@@ -915,7 +952,7 @@ impl Scheduler {
             rows += w;
         }
         plan.decode_rows = to_u32(rows);
-        // 3) one prefill chunk
+        // 3) prefill chunks: pack running prefills up to the step's prefill chunk budget and t_max
         let mut pre: Vec<&Seq> = run
             .iter()
             .map(|id| &self.seqs[id])
@@ -941,28 +978,112 @@ impl Scheduler {
                 cum += s.tokens.len() - self.reuse_estimate(s).best;
                 queue.push((now_ms - s.arrival_ms, cum));
             }
-            let s = pre[0];
-            let (id, nc, rem) = (s.id, s.num_computed, s.remaining());
-            let mut c = self.choose_chunk(rows, nc, &queue).min(rem);
-            // never leave 1..=max_decode_rows prompt tokens for a later segment: a segment that short runs as a
-            // decode segment (decode attention and decode-class plans), so the prompt's K/V would depend on where
-            // the chunks fall, and a resumed prefill would differ in bits from a cold one
+            let pre_ids: Vec<u64> = pre.iter().map(|s| s.id).collect();
             let short = self.cfg.max_decode_rows as usize;
-            if rem > c && rem - c <= short {
-                let room = (self.cfg.max_prefill_rows as usize).min(t_max.saturating_sub(rows));
-                c = if rem <= room {
-                    rem
+            let prefill_row_cap =
+                (self.cfg.max_chunk.min(self.cfg.max_prefill_rows) as usize).min(t_max.saturating_sub(rows));
+            let pa_partials_cap = (3 * t_max / 128 + 2) * 18;
+            let mut prefill_rows = 0usize;
+            let mut prefill_ms = 0.0_f64;
+            let mut ms_budget = f64::INFINITY;
+            let mut pa_partials = 0usize;
+            for id in pre_ids {
+                let Some(s) = self.seqs.get(&id) else { continue };
+                if s.st != St::Running || s.num_computed >= s.tokens.len() - 1 {
+                    continue;
+                }
+                let (nc, rem) = (s.num_computed, s.remaining());
+                let room_rows = prefill_row_cap
+                    .saturating_sub(prefill_rows)
+                    .min(t_max.saturating_sub(rows + prefill_rows));
+                if room_rows == 0 {
+                    break;
+                }
+                let mut c = if prefill_rows == 0 {
+                    let target = self.choose_chunk(rows, nc, &queue);
+                    if rows > 0 && self.cfg.stall_budget_ms < f64::INFINITY {
+                        ms_budget = self.prefill_cost_ms(target, nc).max(self.cfg.stall_budget_ms);
+                    }
+                    target.min(rem).min(room_rows)
+                } else if ms_budget.is_infinite() {
+                    rem.min(room_rows)
                 } else {
-                    c.saturating_sub(short + 1 - (rem - c)).max(1)
+                    let ms_left = ms_budget - prefill_ms;
+                    if ms_left <= 0.0 {
+                        break;
+                    }
+                    let hi_cap = rem.min(room_rows);
+                    if self.prefill_cost_ms(hi_cap, nc) <= ms_left {
+                        hi_cap
+                    } else {
+                        let (mut lo, mut hi, mut best) = (1usize, hi_cap, 0usize);
+                        while lo <= hi {
+                            let mid = (lo + hi) / 2;
+                            if self.prefill_cost_ms(mid, nc) <= ms_left {
+                                best = mid;
+                                lo = mid + 1;
+                            } else {
+                                hi = mid - 1;
+                            }
+                        }
+                        best
+                    }
                 };
-            }
-            if c > 0 && rows + c <= t_max && self.ensure_pages_or_preempt(id, nc + c) {
+                if c == 0 {
+                    break;
+                }
+                // never leave 1..=max_decode_rows prompt tokens for a later segment: a segment that short runs as a
+                // decode segment (decode attention and decode-class plans), so the prompt's K/V would depend on where
+                // the chunks fall, and a resumed prefill would differ in bits from a cold one. For the same reason,
+                // never emit a non-final prefill segment of <= max_decode_rows rows when packing multiple prefills.
+                if rem > c && rem - c <= short {
+                    let seg_room = (self.cfg.max_prefill_rows as usize).min(t_max.saturating_sub(rows + prefill_rows));
+                    let fits_first = prefill_rows == 0 && rem <= seg_room;
+                    let fits_packed = rem <= room_rows
+                        && (ms_budget.is_infinite() || prefill_ms + self.prefill_cost_ms(rem, nc) <= ms_budget);
+                    if fits_first || fits_packed {
+                        c = rem;
+                    } else {
+                        c = c.saturating_sub(short + 1 - (rem - c));
+                        if prefill_rows == 0 {
+                            c = c.max(1);
+                        }
+                    }
+                }
+                if prefill_rows > 0 && c < rem && c <= short {
+                    break;
+                }
+                if c == 0 || rows + prefill_rows + c > t_max {
+                    break;
+                }
+                let seg_parts = pa_global_partials(nc, c, short);
+                if prefill_rows > 0 && pa_partials + seg_parts > pa_partials_cap {
+                    break;
+                }
+                if prefill_rows > 0 {
+                    // Never evict a parked prefix-cache session or preempt a running request just to pack an
+                    // additional prefill segment into the same step.
+                    let need_pages = ceil_div(nc + c, self.page_tokens()).saturating_sub(self.seqs[&id].pages.len());
+                    if need_pages > self.pool.free_count() {
+                        break;
+                    }
+                }
+                if !self.ensure_pages_or_preempt(id, nc + c) {
+                    if prefill_rows > 0 {
+                        break;
+                    }
+                    continue;
+                }
                 let s = &self.seqs[&id];
                 let chunk = s.tokens[nc..nc + c].to_vec();
                 let samples = nc + c == s.tokens.len();
                 plan.segs.push(Self::segment(s, SegKind::Prefill, chunk, c, samples));
-                plan.prefill_rows = to_u32(c);
-                plan.predicted_ms += self.prefill_cost_ms(c, nc);
+                prefill_rows += c;
+                let cost = self.prefill_cost_ms(c, nc);
+                prefill_ms += cost;
+                pa_partials += seg_parts;
+                plan.prefill_rows = to_u32(prefill_rows);
+                plan.predicted_ms += cost;
                 self.in_plan.insert(id);
             }
         }

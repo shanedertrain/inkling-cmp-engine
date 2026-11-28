@@ -29,6 +29,9 @@ constexpr int DRAFTS = 7;
 constexpr int SWA = 2048;
 constexpr int RING = 4096;
 constexpr int RING_MASK = RING - 1;
+constexpr int GLOBAL_PAGE = 1024;
+constexpr int GLOBAL_PAGE_MASK = GLOBAL_PAGE - 1;
+constexpr int GLOBAL_KPT = 264;
 constexpr int CONV_GROUPS = 144;
 constexpr int CONV_GS = 16;
 constexpr int VALID_VOCAB = 200058;
@@ -419,21 +422,22 @@ __global__ void kv_norm_rope_store_kernel(const __nv_bfloat16* __restrict__ kv,
 
 // 6b. Commit context K/V for global ("full_attention") layers:
 // k_norm + NeoX RoPE (cos_sin_global) on K, per-head-token max-abs E4M3 quantization on K & V,
-// stored linearly in head-major [sessions, KVH=8, kv_stride, HD=128] uint8_t with fp32 scales
-// [sessions, KVH=8, kv_stride].
+// stored paged in [num_pages, KVH=8, GLOBAL_PAGE=1024, HD=128] uint8_t with fp32 scales
+// [num_pages, KVH=8, GLOBAL_PAGE=1024], indexed by pt_glob[sessions, GLOBAL_KPT].
 // Grid: (n, KVH=8), Block: 128.
 __global__ void kv_norm_rope_store_global_e4m3_kernel(const __nv_bfloat16* __restrict__ kv,
                                                       const __nv_bfloat16* __restrict__ k_norm,
                                                       const __nv_bfloat16* __restrict__ cos_sin,
                                                       const int* __restrict__ pos,
                                                       const int* __restrict__ sess,
+                                                      const int* __restrict__ pt_glob,
                                                       uint8_t* __restrict__ k_glob,
                                                       uint8_t* __restrict__ v_glob,
                                                       float* __restrict__ ks_glob,
                                                       float* __restrict__ vs_glob,
                                                       int n,
                                                       int max_ctx,
-                                                      int kv_stride) {
+                                                      int num_pages) {
   int r = blockIdx.x;
   int kvh = blockIdx.y;
   int d = threadIdx.x;
@@ -441,6 +445,10 @@ __global__ void kv_norm_rope_store_global_e4m3_kernel(const __nv_bfloat16* __res
   int p = pos[r];
   if (p < 0 || p >= max_ctx) return;
   int s = sess[r];
+  int lp = p >> 10;
+  if (lp >= GLOBAL_KPT) return;
+  int pg = pt_glob[(size_t)s * GLOBAL_KPT + lp];
+  if (pg < 0 || pg >= num_pages) return;
 
   const __nv_bfloat16* ksrc = kv + (size_t)r * 2048 + kvh * HD;
   const __nv_bfloat16* vsrc = kv + (size_t)r * 2048 + 1024 + kvh * HD;
@@ -480,7 +488,7 @@ __global__ void kv_norm_rope_store_global_e4m3_kernel(const __nv_bfloat16* __res
   float scale_v = (amax_v > 0.0f) ? (amax_v * (1.0f / 448.0f)) : 1.0f;
   float inv_sv = (amax_v > 0.0f) ? (448.0f / amax_v) : 0.0f;
 
-  size_t tok_off = ((size_t)s * KVH + (size_t)kvh) * (size_t)kv_stride + (size_t)p;
+  size_t tok_off = ((size_t)pg * KVH + (size_t)kvh) * GLOBAL_PAGE + (size_t)(p & GLOBAL_PAGE_MASK);
   size_t dst_off = tok_off * HD + (size_t)d;
   k_glob[dst_off] = f2e4m3(rot_bf * inv_sk);
   v_glob[dst_off] = f2e4m3(vf * inv_sv);
@@ -773,16 +781,18 @@ __global__ void __launch_bounds__(128) swa_attn_split_kernel(const __nv_bfloat16
   }
 }
 
-// 8c. Design-A warp-independent Tensor Core f16 MMA split-KV Global E4M3 attention over linear context [0..pos) +
+// 8c. Design-A warp-independent Tensor Core f16 MMA split-KV Global E4M3 attention over paged context [0..pos) +
 // exact BF16->F16 8-token block keys [pos..pos+7]:
 // - Zero smem K/V staging, zero __syncthreads() in the hot loop, direct streaming ldg16_stream into registers.
 // - K as A operand (16 keys x 16 dims), Q in 8 KB static smem as B operand (4 x n8 tiles = all 32 Q rows):
 //   every `place2` E4M3 decode is reused across all 4 tiles (4x decode reuse).
+// - Paged layout [num_pages, KVH=8, GLOBAL_PAGE=1024, HD=128]: every 16-key step stays inside one page (1024 % 16 == 0).
 // - 64 threads (2 warps) per CTA, each warp is an independent split `sp = blockIdx.x * 2 + warp` (splits = gridDim.x * 2).
 // - Grid: (splits / 2, KVH=8, k), Block: 64, Dynamic smem: 0. Outputs feed `swa_attn_reduce_kernel` directly.
 __global__ void __launch_bounds__(64, 4) global_attn_e4m3_split_kernel(const __nv_bfloat16* __restrict__ q_blk,
                                                                        const __nv_bfloat16* __restrict__ k_blk,
                                                                        const __nv_bfloat16* __restrict__ v_blk,
+                                                                       const int* __restrict__ pt_glob,
                                                                        const uint8_t* __restrict__ k_glob,
                                                                        const uint8_t* __restrict__ v_glob,
                                                                        const float* __restrict__ ks_glob,
@@ -793,7 +803,6 @@ __global__ void __launch_bounds__(64, 4) global_attn_e4m3_split_kernel(const __n
                                                                        float* __restrict__ part_o,
                                                                        int k,
                                                                        int max_ctx,
-                                                                       int kv_stride,
                                                                        int splits) {
   // 8,192 B static smem: holds qs_n[4][8][32] uint2 during compute, reused as [2 warps][8][128] fp32 at flush.
   __shared__ __align__(16) uint2 qs_n[4 * 8 * 32];
@@ -835,11 +844,7 @@ __global__ void __launch_bounds__(64, 4) global_attn_e4m3_split_kernel(const __n
   const int s0 = (int)((long long)sp * nsteps_total / splits);
   const int s1 = (int)((long long)(sp + 1) * nsteps_total / splits);
 
-  const size_t kv_base = ((size_t)s * KVH + (size_t)kvh) * (size_t)kv_stride;
-  const uint8_t* k_head = k_glob + kv_base * HD;
-  const uint8_t* v_head = v_glob + kv_base * HD;
-  const float* ks_head = ks_glob + kv_base;
-  const float* vs_head = vs_glob + kv_base;
+  const int* pt_row = pt_glob + (size_t)s * GLOBAL_KPT;
 
   float on[4][8][4];
   float ma[4], mb[4], la[4], lb[4];
@@ -861,33 +866,35 @@ __global__ void __launch_bounds__(64, 4) global_attn_e4m3_split_kernel(const __n
 
   auto load_k = [&](int st, auto edge_c) {
     constexpr bool EDGE = decltype(edge_c)::value;
+    const int pg = __ldg(pt_row + (st >> 10));
+    const size_t pg_base = ((size_t)pg * KVH + (size_t)kvh) * GLOBAL_PAGE + (size_t)(st & GLOBAL_PAGE_MASK);
     const int k0 = st + gr;
     const int k1 = k0 + 8;
     if constexpr (!EDGE) {
-      const uint8_t* p0k = k_head + (size_t)k0 * HD + tq * 32;
+      const uint8_t* p0k = k_glob + (pg_base + (size_t)gr) * HD + tq * 32;
       const uint8_t* p1k = p0k + 8 * HD;
       kr[0][0] = ldg16_stream(p0k);
       kr[0][1] = ldg16_stream(p0k + 16);
       kr[1][0] = ldg16_stream(p1k);
       kr[1][1] = ldg16_stream(p1k + 16);
-      ks0_r = __ldg(ks_head + k0) * K_SCALE_LOG2;
-      ks1_r = __ldg(ks_head + k1) * K_SCALE_LOG2;
+      ks0_r = __ldg(ks_glob + pg_base + gr) * K_SCALE_LOG2;
+      ks1_r = __ldg(ks_glob + pg_base + gr + 8) * K_SCALE_LOG2;
     } else {
       const uint4 zz = make_uint4(0u, 0u, 0u, 0u);
       if (k0 < ctx_len) {
-        const uint8_t* p0k = k_head + (size_t)k0 * HD + tq * 32;
+        const uint8_t* p0k = k_glob + (pg_base + (size_t)gr) * HD + tq * 32;
         kr[0][0] = ldg16_stream(p0k);
         kr[0][1] = ldg16_stream(p0k + 16);
-        ks0_r = __ldg(ks_head + k0) * K_SCALE_LOG2;
+        ks0_r = __ldg(ks_glob + pg_base + gr) * K_SCALE_LOG2;
       } else {
         kr[0][0] = kr[0][1] = zz;
         ks0_r = 0.f;
       }
       if (k1 < ctx_len) {
-        const uint8_t* p1k = k_head + (size_t)k1 * HD + tq * 32;
+        const uint8_t* p1k = k_glob + (pg_base + (size_t)(gr + 8)) * HD + tq * 32;
         kr[1][0] = ldg16_stream(p1k);
         kr[1][1] = ldg16_stream(p1k + 16);
-        ks1_r = __ldg(ks_head + k1) * K_SCALE_LOG2;
+        ks1_r = __ldg(ks_glob + pg_base + gr + 8) * K_SCALE_LOG2;
       } else {
         kr[1][0] = kr[1][1] = zz;
         ks1_r = 0.f;
@@ -897,25 +904,28 @@ __global__ void __launch_bounds__(64, 4) global_attn_e4m3_split_kernel(const __n
 
   auto load_v = [&](int st, auto edge_c) {
     constexpr bool EDGE = decltype(edge_c)::value;
+    const int pg = __ldg(pt_row + (st >> 10));
+    const size_t pg_base = ((size_t)pg * KVH + (size_t)kvh) * GLOBAL_PAGE + (size_t)(st & GLOBAL_PAGE_MASK);
     const int kv0 = st + 2 * tq;
     const int k0 = st + gr;
     const int k1 = k0 + 8;
     if constexpr (!EDGE) {
-      const uint8_t* pv = v_head + (size_t)kv0 * HD + gr * 16;
+      const uint8_t* pv = v_glob + (pg_base + (size_t)(2 * tq)) * HD + gr * 16;
       vr[0] = ldg16_stream(pv);
       vr[1] = ldg16_stream(pv + HD);
       vr[2] = ldg16_stream(pv + 8 * HD);
       vr[3] = ldg16_stream(pv + 9 * HD);
-      vs0_r = __ldg(vs_head + k0) * 256.0f;
-      vs1_r = __ldg(vs_head + k1) * 256.0f;
+      vs0_r = __ldg(vs_glob + pg_base + gr) * 256.0f;
+      vs1_r = __ldg(vs_glob + pg_base + gr + 8) * 256.0f;
     } else {
       const uint4 zz = make_uint4(0u, 0u, 0u, 0u);
-      vr[0] = (kv0 < ctx_len) ? ldg16_stream(v_head + (size_t)kv0 * HD + gr * 16) : zz;
-      vr[1] = (kv0 + 1 < ctx_len) ? ldg16_stream(v_head + (size_t)(kv0 + 1) * HD + gr * 16) : zz;
-      vr[2] = (kv0 + 8 < ctx_len) ? ldg16_stream(v_head + (size_t)(kv0 + 8) * HD + gr * 16) : zz;
-      vr[3] = (kv0 + 9 < ctx_len) ? ldg16_stream(v_head + (size_t)(kv0 + 9) * HD + gr * 16) : zz;
-      vs0_r = (k0 < ctx_len) ? (__ldg(vs_head + k0) * 256.0f) : 0.f;
-      vs1_r = (k1 < ctx_len) ? (__ldg(vs_head + k1) * 256.0f) : 0.f;
+      const uint8_t* pv = v_glob + (pg_base + (size_t)(2 * tq)) * HD + gr * 16;
+      vr[0] = (kv0 < ctx_len) ? ldg16_stream(pv) : zz;
+      vr[1] = (kv0 + 1 < ctx_len) ? ldg16_stream(pv + HD) : zz;
+      vr[2] = (kv0 + 8 < ctx_len) ? ldg16_stream(pv + 8 * HD) : zz;
+      vr[3] = (kv0 + 9 < ctx_len) ? ldg16_stream(pv + 9 * HD) : zz;
+      vs0_r = (k0 < ctx_len) ? (__ldg(vs_glob + pg_base + gr) * 256.0f) : 0.f;
+      vs1_r = (k1 < ctx_len) ? (__ldg(vs_glob + pg_base + gr + 8) * 256.0f) : 0.f;
     }
   };
 

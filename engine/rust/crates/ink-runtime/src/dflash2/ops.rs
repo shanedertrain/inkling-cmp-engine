@@ -13,7 +13,8 @@ use ink_kernels::{
     S2fQuantRowsI8Args, s2f,
 };
 use ink_model::dflash2::{
-    ATTN_SMEM, BLK, CONV_PROJ_N, DRAFTS, GLOBAL_ATTN_SMEM, H, HD, INTER, KVH, NH, RING, SEL_RANK, TOP_K, TOPK_CHUNKS,
+    ATTN_SMEM, BLK, CONV_PROJ_N, DRAFTS, GLOBAL_ATTN_SMEM, GLOBAL_KPT, GLOBAL_PAGE, H, HD, INTER, KVH, NH, RING,
+    SEL_RANK, TOP_K, TOPK_CHUNKS,
 };
 use ink_model::drafter::XS;
 
@@ -384,6 +385,7 @@ impl Dev<'_> {
         cos_sin: &DevBuf<Bf16>,
         pos: &DevBuf<i32>,
         sess: &DevBuf<i32>,
+        pt_glob: &DevBuf<i32>,
         k_glob: &DevBuf<u8>,
         v_glob: &DevBuf<u8>,
         ks_glob: &DevBuf<f32>,
@@ -391,7 +393,7 @@ impl Dev<'_> {
         n: usize,
         sessions: usize,
         max_ctx: usize,
-        kv_stride: usize,
+        num_pages: usize,
     ) -> Result<()> {
         if n == 0 {
             return Ok(());
@@ -400,11 +402,12 @@ impl Dev<'_> {
         need(k_norm, HD, "df2 global k_norm")?;
         need(pos, n, "df2 commit global pos")?;
         need(sess, n, "df2 commit global sess")?;
-        need(k_glob, sessions * KVH * kv_stride * HD, "df2 k_glob")?;
-        need(v_glob, sessions * KVH * kv_stride * HD, "df2 v_glob")?;
-        need(ks_glob, sessions * KVH * kv_stride, "df2 ks_glob")?;
-        need(vs_glob, sessions * KVH * kv_stride, "df2 vs_glob")?;
-        // SAFETY: extents verified above; kernel guards 0 <= pos[r] < max_ctx <= kv_stride; sess[r] < sessions.
+        need(pt_glob, sessions * GLOBAL_KPT, "df2 commit pt_glob")?;
+        need(k_glob, num_pages * KVH * GLOBAL_PAGE * HD, "df2 k_glob")?;
+        need(v_glob, num_pages * KVH * GLOBAL_PAGE * HD, "df2 v_glob")?;
+        need(ks_glob, num_pages * KVH * GLOBAL_PAGE, "df2 ks_glob")?;
+        need(vs_glob, num_pages * KVH * GLOBAL_PAGE, "df2 vs_glob")?;
+        // SAFETY: extents verified above; kernel guards 0 <= pos[r] < max_ctx, lp < GLOBAL_KPT, 0 <= pg < num_pages.
         unsafe {
             self.k.df2_kv_norm_rope_store_global_e4m3_kernel(
                 self.st,
@@ -415,13 +418,14 @@ impl Dev<'_> {
                     cos_sin: Ptr::Buf(cos_sin),
                     pos: Ptr::Buf(pos),
                     sess: Ptr::Buf(sess),
+                    pt_glob: Ptr::Buf(pt_glob),
                     k_glob: Ptr::Buf(k_glob),
                     v_glob: Ptr::Buf(v_glob),
                     ks_glob: Ptr::Buf(ks_glob),
                     vs_glob: Ptr::Buf(vs_glob),
                     n: i(n),
                     max_ctx: i(max_ctx),
-                    kv_stride: i(kv_stride),
+                    num_pages: i(num_pages),
                 },
             )
         }
@@ -536,6 +540,7 @@ impl Dev<'_> {
         q_blk: &DevBuf<Bf16>,
         k_blk: &DevBuf<Bf16>,
         v_blk: &DevBuf<Bf16>,
+        pt_glob: &DevBuf<i32>,
         k_glob: &DevBuf<u8>,
         v_glob: &DevBuf<u8>,
         ks_glob: &DevBuf<f32>,
@@ -548,17 +553,18 @@ impl Dev<'_> {
         k: usize,
         sessions: usize,
         max_ctx: usize,
-        kv_stride: usize,
+        num_pages: usize,
         splits: usize,
     ) -> Result<()> {
         let rows = k * BLK;
         need(q_blk, rows * NH * HD, "df2 global attn q_blk")?;
         need(k_blk, rows * KVH * HD, "df2 global attn k_blk")?;
         need(v_blk, rows * KVH * HD, "df2 global attn v_blk")?;
-        need(k_glob, sessions * KVH * kv_stride * HD, "df2 global attn k_glob")?;
-        need(v_glob, sessions * KVH * kv_stride * HD, "df2 global attn v_glob")?;
-        need(ks_glob, sessions * KVH * kv_stride, "df2 global attn ks_glob")?;
-        need(vs_glob, sessions * KVH * kv_stride, "df2 global attn vs_glob")?;
+        need(pt_glob, sessions * GLOBAL_KPT, "df2 global attn pt_glob")?;
+        need(k_glob, num_pages * KVH * GLOBAL_PAGE * HD, "df2 global attn k_glob")?;
+        need(v_glob, num_pages * KVH * GLOBAL_PAGE * HD, "df2 global attn v_glob")?;
+        need(ks_glob, num_pages * KVH * GLOBAL_PAGE, "df2 global attn ks_glob")?;
+        need(vs_glob, num_pages * KVH * GLOBAL_PAGE, "df2 global attn vs_glob")?;
         need(sel, k, "df2 global attn sel")?;
         need(part_ml, k * KVH * splits * 32 * 2, "df2 global attn part_ml")?;
         need(part_o, k * KVH * splits * 32 * HD, "df2 global attn part_o")?;
@@ -574,6 +580,7 @@ impl Dev<'_> {
                     q_blk: Ptr::Buf(q_blk),
                     k_blk: Ptr::Buf(k_blk),
                     v_blk: Ptr::Buf(v_blk),
+                    pt_glob: Ptr::Buf(pt_glob),
                     k_glob: Ptr::Buf(k_glob),
                     v_glob: Ptr::Buf(v_glob),
                     ks_glob: Ptr::Buf(ks_glob),
@@ -584,7 +591,6 @@ impl Dev<'_> {
                     part_o: Ptr::Buf(part_o),
                     k: i(k),
                     max_ctx: i(max_ctx),
-                    kv_stride: i(kv_stride),
                     splits: i(splits),
                 },
             )?;

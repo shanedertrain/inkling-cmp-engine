@@ -23,13 +23,14 @@ use ink_cuda::{AlgoPins, Arena, Bf16, Context, CudaError, DevBuf, Dtype, GemmSha
 use ink_kernels::{F16, KernelId, Kernels};
 use ink_model::dflash2::{
     self as m, ATTN_SMEM, ATTN_SPLITS, BLK, CONV_PROJ_N, COS_SIN_POS, DFlash2Checkpoints, DFlash2Config, DRAFTS,
-    GLOBAL_ATTN_SMEM, GLOBAL_ATTN_SPLITS, H, HD, HEAD_N, INTER, KVH, LayerType, MASK_TOKEN_ID, NH, NLAYERS, RING,
-    SEL_RANK, TOP_K, TOPK_CHUNKS, VOCAB_PAD,
+    GLOBAL_ATTN_SMEM, GLOBAL_ATTN_SPLITS, GLOBAL_KPT, GLOBAL_PAGE, H, HD, HEAD_N, INTER, KVH, LayerType, MASK_TOKEN_ID,
+    NH, NLAYERS, RING, SEL_RANK, TOP_K, TOPK_CHUNKS, VOCAB_PAD,
 };
 use ink_rt_api::{DevBuf as ApiBuf, DraftConfig, Drafter, FEAT_ROW_BYTES, ProposalBufs, RuntimeError, VerifyWidth};
 
 use self::ops::{Dev, head_gemm_ids, head_gemm_smem};
 use crate::devbufs::DevBufs;
+use crate::engine::SharedGlobalPages;
 use crate::error::rt;
 
 type Res<T> = Result<T, RuntimeError>;
@@ -95,6 +96,8 @@ enum LayerKv {
 
 struct State {
     kv: Vec<LayerKv>,
+    /// Per-session global page table `[sessions, GLOBAL_KPT]` (maps logical 1,024-token page -> physical page).
+    pt_glob: DevBuf<i32>,
     // Commit scratch (up to COMMIT_CHUNK rows)
     ctx_h: DevBuf<Bf16>,
     ctx_norm: DevBuf<Bf16>,
@@ -175,7 +178,7 @@ fn df2_shapes() -> Vec<(GemmShape, u32)> {
 fn part_slots_for(sessions: usize, has_global: bool) -> usize {
     let base = sessions * ATTN_SPLITS;
     if has_global {
-        base.max(72).max(sessions * 8)
+        base.max(GLOBAL_ATTN_SPLITS).max(sessions * 8)
     } else {
         base
     }
@@ -183,7 +186,7 @@ fn part_slots_for(sessions: usize, has_global: bool) -> usize {
 
 fn arena_bytes(
     sessions: usize,
-    kv_stride: usize,
+    num_pages: usize,
     cfg: &DFlash2Config,
     shared_target: bool,
     use_i8_head: bool,
@@ -210,7 +213,9 @@ fn arena_bytes(
     };
     let w_head_i8 = if use_i8_head { HEAD_N * H + HEAD_N * 4 } else { 0 };
     let kv_swa = cfg.swa_count() * 2 * sessions * KVH * RING * HD * 2;
-    let kv_global = cfg.global_count() * (2 * sessions * KVH * kv_stride * HD + 2 * sessions * KVH * kv_stride * 4);
+    let kv_global =
+        cfg.global_count() * (2 * num_pages * KVH * GLOBAL_PAGE * HD + 2 * num_pages * KVH * GLOBAL_PAGE * 4);
+    let pt_bytes = sessions * GLOBAL_KPT * 4;
     let commit_s = (COMMIT_CHUNK * (2 * H + 2 * KVH * HD)) * 2;
     let rows = sessions * BLK;
     let drows = sessions * DRAFTS;
@@ -221,7 +226,7 @@ fn arena_bytes(
         + drows * (HEAD_N + SEL_RANK + TOPK_CHUNKS + 1 + 2 * TOPK_CHUNKS * TOP_K + 2 * TOP_K) * 4
         + sessions * (3 + DRAFTS) * 4;
     // Generous alignment slack (64 MiB)
-    w_layers + w_other + w_target + w_head_i8 + kv_swa + kv_global + commit_s + blk_s + (64 << 20)
+    w_layers + w_other + w_target + w_head_i8 + kv_swa + kv_global + pt_bytes + commit_s + blk_s + (64 << 20)
 }
 
 /// Split-KV partitions for `k` active sessions on SWA-2048 layers (targets >= 192 CTAs across 96 SMs).
@@ -245,7 +250,14 @@ pub struct RustDFlash2 {
     s: State,
     sessions: usize,
     max_ctx: usize,
-    kv_stride: usize,
+    num_pages: usize,
+    shared_pages: Option<SharedGlobalPages>,
+    pt_gen: Cell<u64>,
+    pt_host: RefCell<Vec<i32>>,
+    last_sel: Vec<i32>,
+    last_eff_temps: Vec<u32>,
+    last_eff_top_ps: Vec<u32>,
+    last_seeds: Vec<u64>,
     drafts_api: ApiBuf,
     conf_api: Option<ApiBuf>,
     prop_api: Option<ProposalBufs>,
@@ -285,11 +297,12 @@ impl RustDFlash2 {
             Rc::new(Cell::new(0)),
             config,
             None,
+            None,
         )
     }
 
     /// Creates a DFlash2 drafter sharing an engine's context, stream, buffer registry, and (optionally) target
-    /// embedding/unembedding weights.
+    /// embedding/unembedding weights and global KV page allocator.
     ///
     /// # Errors
     ///
@@ -301,6 +314,7 @@ impl RustDFlash2 {
         graph_bytes: Rc<Cell<usize>>,
         config: &DraftConfig,
         shared_target: Option<SharedTargetBufs>,
+        shared_pages: Option<SharedGlobalPages>,
     ) -> Res<Self> {
         let dflash_dir = config
             .dflash2_dir
@@ -317,7 +331,20 @@ impl RustDFlash2 {
                 "dflash2: max_ctx {max_ctx} + {BLK} exceeds RoPE table {COS_SIN_POS}"
             )));
         }
-        let kv_stride = max_ctx.next_multiple_of(16);
+        let pages_per_sess = max_ctx.div_ceil(GLOBAL_PAGE);
+        if pages_per_sess > GLOBAL_KPT {
+            return Err(RuntimeError::request(format!(
+                "dflash2: max_ctx {max_ctx} needs {pages_per_sess} global pages (> {GLOBAL_KPT})"
+            )));
+        }
+        let num_pages = if cfg.has_global() {
+            match &shared_pages {
+                Some(sp) => sp.num_pages,
+                None => sessions * pages_per_sess,
+            }
+        } else {
+            0
+        };
         let k = rt(Kernels::load(&ctx))?;
         rt(k.function(KernelId::Df2SwaAttnSplitKernel)
             .set_max_dynamic_smem(ATTN_SMEM as u32))?;
@@ -331,7 +358,7 @@ impl RustDFlash2 {
 
         let is_shared = shared_target.is_some();
         let use_i8_head = !std::env::var("INK_DF2_BF16_HEAD").is_ok_and(|v| v != "0");
-        let total = arena_bytes(sessions, kv_stride, &cfg, is_shared, use_i8_head);
+        let total = arena_bytes(sessions, num_pages, &cfg, is_shared, use_i8_head);
         let mut arena = rt(Arena::new(&ctx, &st, total))?;
 
         let ck = rt(DFlash2Checkpoints::open(dflash_dir, Some(config.model_dir.as_path())))?;
@@ -458,7 +485,7 @@ impl RustDFlash2 {
             None
         };
 
-        // Allocate per-layer KV cache (SWA-2048 BF16 ring or Global E4M3 linear [sessions, KVH, kv_stride, HD])
+        // Allocate per-layer KV cache (SWA-2048 BF16 ring or paged Global E4M3 [num_pages, KVH, 1024, HD])
         let mut kv = Vec::with_capacity(NLAYERS);
         for &lt in &cfg.layer_types {
             match lt {
@@ -468,10 +495,10 @@ impl RustDFlash2 {
                     kv.push(LayerKv::Swa { k_ring, v_ring });
                 }
                 LayerType::FullAttention => {
-                    let k_glob = rt(arena.take::<u8>(sessions * KVH * kv_stride * HD, "df2 k_glob"))?;
-                    let v_glob = rt(arena.take::<u8>(sessions * KVH * kv_stride * HD, "df2 v_glob"))?;
-                    let ks_glob = rt(arena.take::<f32>(sessions * KVH * kv_stride, "df2 ks_glob"))?;
-                    let vs_glob = rt(arena.take::<f32>(sessions * KVH * kv_stride, "df2 vs_glob"))?;
+                    let k_glob = rt(arena.take::<u8>(num_pages * KVH * GLOBAL_PAGE * HD, "df2 k_glob"))?;
+                    let v_glob = rt(arena.take::<u8>(num_pages * KVH * GLOBAL_PAGE * HD, "df2 v_glob"))?;
+                    let ks_glob = rt(arena.take::<f32>(num_pages * KVH * GLOBAL_PAGE, "df2 ks_glob"))?;
+                    let vs_glob = rt(arena.take::<f32>(num_pages * KVH * GLOBAL_PAGE, "df2 vs_glob"))?;
                     rt(st.memset_zero(&ks_glob))?;
                     rt(st.memset_zero(&vs_glob))?;
                     kv.push(LayerKv::GlobalE4m3 {
@@ -483,11 +510,24 @@ impl RustDFlash2 {
                 }
             }
         }
+        let pt_glob = rt(arena.take::<i32>(sessions * GLOBAL_KPT, "df2 pt_glob"))?;
+        let mut pt_host = vec![0i32; sessions * GLOBAL_KPT];
+        if cfg.has_global() && shared_pages.is_none() {
+            for s_idx in 0..sessions {
+                for lp in 0..pages_per_sess {
+                    pt_host[s_idx * GLOBAL_KPT + lp] = (s_idx * pages_per_sess + lp) as i32;
+                }
+            }
+            rt(st.htod(&pt_glob, &pt_host))?;
+        } else {
+            rt(st.memset_zero(&pt_glob))?;
+        }
         let rows = sessions * BLK;
         let drows = sessions * DRAFTS;
         let part_slots = part_slots_for(sessions, cfg.has_global());
         let s = State {
             kv,
+            pt_glob,
             ctx_h: rt(arena.take::<Bf16>(COMMIT_CHUNK * H, "df2 ctx_h"))?,
             ctx_norm: rt(arena.take::<Bf16>(COMMIT_CHUNK * H, "df2 ctx_norm"))?,
             kv_tmp: rt(arena.take::<Bf16>(COMMIT_CHUNK * 2 * KVH * HD, "df2 kv_tmp"))?,
@@ -589,7 +629,7 @@ impl RustDFlash2 {
             weights: prop_w_api,
         });
         eprintln!(
-            "[dflash2] arena used {:.2} GiB (sessions {sessions}, max_ctx {max_ctx}, layers {} swa + {} global, shared_target {is_shared}, head {})",
+            "[dflash2] arena used {:.2} GiB (sessions {sessions}, max_ctx {max_ctx}, global_pages {num_pages}, layers {} swa + {} global, shared_target {is_shared}, head {})",
             arena.plan().used() as f64 / 1_073_741_824.0,
             cfg.swa_count(),
             cfg.global_count(),
@@ -621,7 +661,14 @@ impl RustDFlash2 {
             s,
             sessions,
             max_ctx,
-            kv_stride,
+            num_pages,
+            shared_pages,
+            pt_gen: Cell::new(u64::MAX),
+            pt_host: RefCell::new(pt_host),
+            last_sel: Vec::new(),
+            last_eff_temps: Vec::new(),
+            last_eff_top_ps: Vec::new(),
+            last_seeds: Vec::new(),
             drafts_api,
             conf_api,
             prop_api,
@@ -714,6 +761,30 @@ impl RustDFlash2 {
         )
     }
 
+    fn sync_page_table(&self) -> Result<(), CudaError> {
+        if !self.cfg.has_global() {
+            return Ok(());
+        }
+        let Some(ref shared) = self.shared_pages else {
+            return Ok(());
+        };
+        let slots = shared.slots.borrow();
+        let page_gen = slots.page_gen();
+        if page_gen == self.pt_gen.get() {
+            return Ok(());
+        }
+        let mut host = self.pt_host.borrow_mut();
+        host.fill(-1);
+        for s in 0..self.sessions {
+            let pages = slots.pages(s);
+            let n = pages.len().min(GLOBAL_KPT);
+            host[s * GLOBAL_KPT..s * GLOBAL_KPT + n].copy_from_slice(&pages[..n]);
+        }
+        self.st.htod(&self.s.pt_glob, &host)?;
+        self.pt_gen.set(page_gen);
+        Ok(())
+    }
+
     fn commit_impl(
         &self,
         feats: &DevBuf<Bf16>,
@@ -721,6 +792,7 @@ impl RustDFlash2 {
         sess: &DevBuf<i32>,
         rows: usize,
     ) -> Result<(), CudaError> {
+        self.sync_page_table()?;
         let dev = self.dev();
         let (w, s) = (&self.w, &self.s);
         for r0 in (0..rows).step_by(COMMIT_CHUNK) {
@@ -758,6 +830,7 @@ impl RustDFlash2 {
                             csg,
                             &p,
                             &q,
+                            &s.pt_glob,
                             k_glob,
                             v_glob,
                             ks_glob,
@@ -765,7 +838,7 @@ impl RustDFlash2 {
                             rc,
                             self.sessions,
                             self.max_ctx,
-                            self.kv_stride,
+                            self.num_pages,
                         )?;
                     }
                 }
@@ -873,6 +946,7 @@ impl RustDFlash2 {
                         &s.q_blk,
                         &s.k_blk,
                         &s.v_blk,
+                        &s.pt_glob,
                         k_glob,
                         v_glob,
                         ks_glob,
@@ -885,7 +959,7 @@ impl RustDFlash2 {
                         k,
                         self.sessions,
                         self.max_ctx,
-                        self.kv_stride,
+                        self.num_pages,
                         g_splits,
                     )?;
                 }
@@ -1077,11 +1151,13 @@ impl RustDFlash2 {
         if k == 0 || k > n {
             return Err(RuntimeError::request(format!("draft_with_dump: 1..{n} sessions")));
         }
+        rt(self.sync_page_table())?;
         let sel: Vec<i32> = sessions
             .iter()
             .map(|&r| i32::try_from(r).expect("session fits i32"))
             .collect();
         rt(self.st.htod(&rt(self.s.sel.slice(0..k))?, &sel))?;
+        self.last_sel = sel;
         rt(self.draft_batch(k, false, Some(dump_dir)))
     }
 
@@ -1102,7 +1178,11 @@ impl RustDFlash2 {
             seen[r] = true;
             sel.push(i32::try_from(r).expect("session fits i32"));
         }
-        rt(self.st.htod(&rt(self.s.sel.slice(0..k))?, &sel))?;
+        rt(self.sync_page_table())?;
+        if self.last_sel != sel {
+            rt(self.st.htod(&rt(self.s.sel.slice(0..k))?, &sel))?;
+            self.last_sel = sel;
+        }
         if self.graphs[k - 1].is_none() {
             // Eager warmup (populates cuBLASLt plan/checked caches before capture)
             let prof = std::env::var("INK_DF2_PROF").is_ok_and(|v| v != "0");
@@ -1197,14 +1277,31 @@ impl Drafter for RustDFlash2 {
             .iter()
             .map(|&t| if t >= 1e-5 { t * self.draft_temp_scale } else { t })
             .collect();
-        rt(self.st.htod(&self.s.samp_temp, &eff_temps))?;
+        let temp_bits: Vec<u32> = eff_temps.iter().map(|&x| x.to_bits()).collect();
+        if self.last_eff_temps != temp_bits {
+            rt(self.st.htod(&self.s.samp_temp, &eff_temps))?;
+            self.last_eff_temps = temp_bits;
+        }
         if let Some(p) = self.draft_top_p {
             let eff_top_ps: Vec<f32> = temps.iter().map(|&t| if t >= 1e-5 { p } else { 1.0 }).collect();
-            rt(self.st.htod(&self.s.samp_top_p, &eff_top_ps))?;
+            let topp_bits: Vec<u32> = eff_top_ps.iter().map(|&x| x.to_bits()).collect();
+            if self.last_eff_top_ps != topp_bits {
+                rt(self.st.htod(&self.s.samp_top_p, &eff_top_ps))?;
+                self.last_eff_top_ps = topp_bits;
+            }
         } else if self.use_top_p {
-            rt(self.st.htod(&self.s.samp_top_p, top_ps))?;
+            let topp_bits: Vec<u32> = top_ps.iter().map(|&x| x.to_bits()).collect();
+            if self.last_eff_top_ps != topp_bits {
+                rt(self.st.htod(&self.s.samp_top_p, top_ps))?;
+                self.last_eff_top_ps = topp_bits;
+            }
         }
-        rt(self.st.htod(&self.s.samp_seed, seeds))
+        if self.last_seeds != seeds {
+            rt(self.st.htod(&self.s.samp_seed, seeds))?;
+            self.last_seeds.clear();
+            self.last_seeds.extend_from_slice(seeds);
+        }
+        Ok(())
     }
 
     fn proposal(&self) -> Option<ProposalBufs> {

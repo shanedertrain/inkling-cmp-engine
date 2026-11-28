@@ -44,8 +44,11 @@ for G in $GPUS; do
     --gemm-algos /cfg/gemm-algos.json
     --slots "$SLOTS"
     --kv-pages "$PAGES"
+    --prefill-chunk "$CHUNK"
     --max-running "$MAX_RUNNING"
     --enable-prompt-tokens-details
+    --draft-ctx "$DCTX"
+    --lookup "$LOOKUP"
   )
   MOUNTS=(
     -v "$MODEL_DIR:/model:ro"
@@ -57,7 +60,7 @@ for G in $GPUS; do
     ARGS+=(--draft-dflash2 /dflash2)
     MOUNTS+=(-v "$DFLASH2_DIR:/dflash2:ro")
   else
-    ARGS+=(--draft-fold /fold/fold.bin --draft-ctx "$DCTX")
+    ARGS+=(--draft-fold /fold/fold.bin)
     MOUNTS+=(-v "$FOLD_DIR:/fold:ro")
   fi
 

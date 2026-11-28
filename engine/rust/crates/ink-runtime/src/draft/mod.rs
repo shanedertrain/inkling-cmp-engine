@@ -70,10 +70,15 @@ fn kvctx_shape() -> GemmShape {
 
 use self::ops::{Batch, Dev, Epi, Gemm, gemm_frag_ids, gemm_smem};
 use crate::devbufs::DevBufs;
+use crate::engine::SharedGlobalPages;
 
 type Res<T> = Result<T, RuntimeError>;
 
 use crate::error::rt;
+
+/// Ring buffer blocks per session for DSpark's SWA-1024 layers (`L0`, `L2`): `64 * 64 = 4,096` tokens per session,
+/// preserving `[P - 1024, P)` across rollbacks up to `3,072` tokens while shrinking `L0/L2` KV to `0.50 GiB` at `n=8`.
+const SWA_RING_BLOCKS: usize = 64;
 
 /// Shape of one drafter: sessions, positions, head and global-layer K/V precision, and what follows from them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,21 +89,45 @@ pub(crate) struct Shape {
     pub max_ctx: usize,
     /// int8 head with the exact bound (else the bf16 head).
     pub int8: bool,
-    /// E4M3 copy of the global layer's draft K/V.
+    /// E4M3 storage for the global layer (`L1`) draft K/V (no duplicate BF16 L1 buffer).
     pub kv8: bool,
     /// The drafter probability of each draft (`conf_on`, draft_conf.cuh) for the gated verify width.
     pub conf: bool,
     /// Pages per session: ceil((L + 8) / 64).
     pub max_blocks: usize,
+    /// SWA ring blocks per session for `L0` and `L2` (`min(max_blocks, SWA_RING_BLOCKS)`).
+    pub swa_blocks_per_sess: usize,
+    /// Total 64-token physical blocks in the global `L1` pool (including block-0 sentinel).
+    pub l1_blocks: usize,
     /// Attention splits of the three layers.
     pub split_attn: [usize; 3],
 }
 
 impl Shape {
-    /// The `Drafter` constructor's sizes (`max_blocks`, `split_attn`).
+    /// Standalone `Drafter` sizes (dedicated per-session `L1` blocks; ring `L0/L2`).
+    #[cfg(test)]
     pub(crate) fn new(n: usize, max_ctx: usize, int8: bool, kv8: bool, conf: bool) -> Shape {
+        Self::new_with_pool(n, max_ctx, int8, kv8, conf, None)
+    }
+
+    /// `Drafter` sizes with optional target-engine global KV pool size (`num_pages` of 1,024 tokens = `16` blocks each).
+    pub(crate) fn new_with_pool(
+        n: usize,
+        max_ctx: usize,
+        int8: bool,
+        kv8: bool,
+        conf: bool,
+        pooled_global_pages: Option<usize>,
+    ) -> Shape {
         let seqlen = max_ctx + BLK;
         let max_blocks = seqlen.div_ceil(PAGE);
+        let swa_blocks_per_sess = max_blocks.min(SWA_RING_BLOCKS);
+        let l1_blocks = match pooled_global_pages {
+            // Each 1,024-token target page maps to 16 contiguous 64-token DSpark blocks, plus 1 scratch block per
+            // session for draft block `[P..P+7]` crossing into an unallocated target page, plus block-0 sentinel.
+            Some(pages) => pages * 16 + n + 1,
+            None => n * max_blocks + 1,
+        };
         let mut split_attn = [0; 3];
         for (l, s) in split_attn.iter_mut().enumerate() {
             let window = if l == 1 { 0 } else { WIN + BLK };
@@ -115,6 +144,8 @@ impl Shape {
             kv8,
             conf,
             max_blocks,
+            swa_blocks_per_sess,
+            l1_blocks,
             split_attn,
         }
     }
@@ -124,9 +155,14 @@ impl Shape {
         self.n * BLK
     }
 
-    /// Elements of one layer's K (or V) cache: (n x max_blocks + 1) pages of 8 heads x 64 x 128.
-    pub(crate) fn cache_elems(&self) -> usize {
-        (self.n * self.max_blocks + 1) * KVH * PAGE * HD
+    /// Elements of one SWA layer's K (or V) ring cache (`L0`, `L2`).
+    pub(crate) fn swa_cache_elems(&self) -> usize {
+        (self.n * self.swa_blocks_per_sess + 1) * KVH * PAGE * HD
+    }
+
+    /// Elements of the global layer's (`L1`) K (or V) cache.
+    pub(crate) fn global_cache_elems(&self) -> usize {
+        self.l1_blocks * KVH * PAGE * HD
     }
 }
 
@@ -246,8 +282,9 @@ pub(crate) struct DraftS<A: Alloc> {
     anchor: A::Buf<i32>,
     p: A::Buf<i32>,
     bt: A::Buf<i32>,
-    kc: [A::Buf<Bf16>; 3],
-    vc: [A::Buf<Bf16>; 3],
+    bt_swa: A::Buf<i32>,
+    kc: [Option<A::Buf<Bf16>>; 3],
+    vc: [Option<A::Buf<Bf16>>; 3],
     k8: Option<A::Buf<u8>>,
     v8: Option<A::Buf<u8>>,
     cmix: A::Buf<Bf16>,
@@ -285,6 +322,7 @@ pub(crate) struct DraftS<A: Alloc> {
     anchor_c: A::Buf<i32>,
     p_c: A::Buf<i32>,
     bt_c: A::Buf<i32>,
+    bt_swa_c: A::Buf<i32>,
     f_rnn_c: A::Buf<Bf16>,
     drafts_c: A::Buf<i32>,
     nsurv_c: A::Buf<i32>,
@@ -306,15 +344,21 @@ pub(crate) struct DraftS<A: Alloc> {
 impl<A: Alloc> DraftS<A> {
     fn take(ar: &mut A, s: &Shape) -> Result<Self, CudaError> {
         let (n, t) = (s.n, s.t());
-        let ce = s.cache_elems();
+        let se = s.swa_cache_elems();
+        let ge = s.global_cache_elems();
         let anchor = ar.take(n, "anchor")?;
         let p = ar.take(n, "P")?;
         let bt = ar.take(n * s.max_blocks, "block_table")?;
-        let (k0, v0) = (ar.take(ce, "Kc0")?, ar.take(ce, "Vc0")?);
-        let (k1, v1) = (ar.take(ce, "Kc1")?, ar.take(ce, "Vc1")?);
-        let (k2, v2) = (ar.take(ce, "Kc2")?, ar.take(ce, "Vc2")?);
+        let bt_swa = ar.take(n * s.max_blocks, "block_table_swa")?;
+        let (k0, v0) = (Some(ar.take(se, "Kc0")?), Some(ar.take(se, "Vc0")?));
+        let (k1, v1) = if s.kv8 {
+            (None, None)
+        } else {
+            (Some(ar.take(ge, "Kc1")?), Some(ar.take(ge, "Vc1")?))
+        };
+        let (k2, v2) = (Some(ar.take(se, "Kc2")?), Some(ar.take(se, "Vc2")?));
         let (k8, v8) = if s.kv8 {
-            (Some(ar.take(ce, "K8")?), Some(ar.take(ce, "V8")?))
+            (Some(ar.take(ge, "K8")?), Some(ar.take(ge, "V8")?))
         } else {
             (None, None)
         };
@@ -323,6 +367,7 @@ impl<A: Alloc> DraftS<A> {
             anchor,
             p,
             bt,
+            bt_swa,
             kc: [k0, k1, k2],
             vc: [v0, v1, v2],
             k8,
@@ -362,6 +407,7 @@ impl<A: Alloc> DraftS<A> {
             anchor_c: ar.take(n, "anchor_c")?,
             p_c: ar.take(n, "P_c")?,
             bt_c: ar.take(n * s.max_blocks, "bt_c")?,
+            bt_swa_c: ar.take(n * s.max_blocks, "bt_swa_c")?,
             f_rnn_c: ar.take(n * H, "f_rnn_c")?,
             drafts_c: ar.take(7 * n, "drafts_c")?,
             nsurv_c: ar.take(7 * n, "nsurv_c")?,
@@ -434,6 +480,10 @@ pub struct RustDrafter {
     last_eff_temps: Vec<u32>,
     last_eff_top_ps: Vec<u32>,
     last_seeds: Vec<u64>,
+    /// Optional shared global page allocator from `Engine` (pooled `L1` paging across all sessions).
+    shared_pages: Option<SharedGlobalPages>,
+    pt_gen: Cell<u64>,
+    bt_host: RefCell<Vec<i32>>,
     st: Rc<Stream>,
     ctx: Rc<Context>,
     shape: Shape,
@@ -481,6 +531,7 @@ impl RustDrafter {
             Rc::new(RefCell::new(DevBufs::default())),
             Rc::new(Cell::new(0)),
             config,
+            None,
         )
     }
 
@@ -497,6 +548,7 @@ impl RustDrafter {
         bufs: Rc<RefCell<DevBufs>>,
         graph_bytes: Rc<Cell<usize>>,
         config: &DraftConfig,
+        shared_pages: Option<SharedGlobalPages>,
     ) -> Res<RustDrafter> {
         let n = config.sessions as usize;
         if n == 0 || n > 8 {
@@ -507,12 +559,13 @@ impl RustDrafter {
         if config.max_ctx == 0 {
             return Err(RuntimeError::request("max_ctx must be positive"));
         }
-        let shape = Shape::new(
+        let shape = Shape::new_with_pool(
             n,
             config.max_ctx as usize,
             config.head == HeadPrecision::Int8,
             config.global_kv == KvPrecision::E4m3,
             config.verify != VerifyWidth::Full,
+            shared_pages.as_ref().map(|sp| sp.num_pages),
         );
         if shape.max_ctx + BLK > COS_SIN_POS {
             return Err(RuntimeError::request(format!(
@@ -523,6 +576,15 @@ impl RustDrafter {
         let mut arena = rt(Arena::new(&ctx, &st, arena_bytes(&shape)))?;
         let w = rt(DraftW::take(&mut arena, &shape))?;
         let s = rt(DraftS::take(&mut arena, &shape))?;
+        eprintln!(
+            "[dspark] arena used {:.2} GiB (sessions {n}, max_ctx {}, kv8 {}, l1_blocks {}, swa_ring_blocks {}, pooled {})",
+            arena.plan().used() as f64 / 1_073_741_824.0,
+            shape.max_ctx,
+            shape.kv8,
+            shape.l1_blocks,
+            shape.swa_blocks_per_sess,
+            shared_pages.is_some(),
+        );
         let k = rt(Kernels::load(&ctx))?;
         // kernel attributes the C++ sets: attn_block / attn_block8 in DraftRT's constructor, each gemm_frag instance
         // at its first launch (gemm_w)
@@ -599,6 +661,9 @@ impl RustDrafter {
             last_eff_temps: Vec::new(),
             last_eff_top_ps: Vec::new(),
             last_seeds: Vec::new(),
+            shared_pages,
+            pt_gen: Cell::new(u64::MAX),
+            bt_host: RefCell::new(vec![0i32; n * shape.max_blocks]),
             s,
             w,
             k,
@@ -729,26 +794,82 @@ impl RustDrafter {
         rt(st.synchronize())
     }
 
-    /// The `Drafter` constructor's initial state: page table `1 + i`, `P = max_ctx`, anchors `1000 + 7919 r`, the
-    /// draft K/V filled with noise (seeds 11 + l, 21 + l; E4M3 copies 41, 42).
+    /// The `Drafter` constructor's initial state: SWA ring block table for `L0`/`L2`, `L1` page table (identity
+    /// standalone, or per-session scratch block when pooled with `Engine`), `P = max_ctx`, anchors `1000 + 7919 r`,
+    /// and the draft K/V filled with noise (seeds 11 + l, 21 + l; E4M3 copies 41, 42).
     fn init_state(&self) -> Res<()> {
         let sh = self.shape;
         let s = &self.s;
-        let bt: Vec<i32> = (0..sh.n * sh.max_blocks).map(|i| i32_of(1 + i)).collect();
+        let mut bt_swa = vec![0i32; sh.n * sh.max_blocks];
+        for r in 0..sh.n {
+            for b in 0..sh.max_blocks {
+                bt_swa[r * sh.max_blocks + b] = i32_of(1 + r * sh.swa_blocks_per_sess + (b % sh.swa_blocks_per_sess));
+            }
+        }
+        let bt: Vec<i32> = if let Some(ref sp) = self.shared_pages {
+            let mut v = vec![0i32; sh.n * sh.max_blocks];
+            for r in 0..sh.n {
+                let scratch = i32_of(1 + sp.num_pages * 16 + r);
+                v[r * sh.max_blocks..(r + 1) * sh.max_blocks].fill(scratch);
+            }
+            v
+        } else {
+            (0..sh.n * sh.max_blocks).map(|i| i32_of(1 + i)).collect()
+        };
         let p = vec![i32_of(sh.max_ctx); sh.n];
         let a: Vec<i32> = (0..sh.n).map(|r| i32_of(1000 + 7919 * r)).collect();
         rt(self.st.htod(&s.anchor, &a))?;
         rt(self.st.htod(&s.p, &p))?;
         rt(self.st.htod(&s.bt, &bt))?;
+        rt(self.st.htod(&s.bt_swa, &bt_swa))?;
         let dev = self.dev();
         for l in 0..3 {
-            rt(dev.fill_bf16(&s.kc[l], 11 + l as u64, 1.0))?;
-            rt(dev.fill_bf16(&s.vc[l], 21 + l as u64, 1.0))?;
+            if let Some(kc) = &s.kc[l] {
+                rt(dev.fill_bf16(kc, 11 + l as u64, 1.0))?;
+            }
+            if let Some(vc) = &s.vc[l] {
+                rt(dev.fill_bf16(vc, 21 + l as u64, 1.0))?;
+            }
         }
         if let (Some(k8), Some(v8)) = (&s.k8, &s.v8) {
             rt(dev.fill_e4m3(k8, 41))?;
             rt(dev.fill_e4m3(v8, 42))?;
         }
+        Ok(())
+    }
+
+    /// Synchronises DSpark's global `L1` block table (`s.bt`) with `Engine`'s `Slots` whenever any slot's page list
+    /// changed (`page_gen`). Each 1,024-token target page maps to 16 contiguous 64-token DSpark blocks, and the next
+    /// logical block past each slot's allocated target pages maps to its dedicated scratch block (so draft block
+    /// `[P..P+7]` can safely cross into an unallocated target page before `Engine::forward_dev` reserves it).
+    fn sync_page_table(&self) -> Result<(), CudaError> {
+        let Some(ref shared) = self.shared_pages else {
+            return Ok(());
+        };
+        let slots = shared.slots.borrow();
+        let page_gen = slots.page_gen();
+        if page_gen == self.pt_gen.get() {
+            return Ok(());
+        }
+        let sh = self.shape;
+        let mut host = self.bt_host.borrow_mut();
+        for r in 0..sh.n {
+            let row = r * sh.max_blocks;
+            let scratch_blk = i32_of(1 + shared.num_pages * 16 + r);
+            host[row..row + sh.max_blocks].fill(scratch_blk);
+            let pages = slots.pages(r);
+            for (lp, &tp) in pages.iter().enumerate() {
+                let b0 = lp * 16;
+                let p0 = 1 + tp * 16;
+                for sub in 0..16 {
+                    if b0 + sub < sh.max_blocks {
+                        host[row + b0 + sub] = p0 + sub as i32;
+                    }
+                }
+            }
+        }
+        self.st.htod(&self.s.bt, &host)?;
+        self.pt_gen.set(page_gen);
         Ok(())
     }
 
@@ -765,7 +886,7 @@ impl RustDrafter {
         }
     }
 
-    /// `Drafter::bstep(k)`: the round batch's k compact rows.
+    /// `Drafter::bstep(k)`: the round batch's k compact rows (global `L1` block table).
     fn bstep(&self, k: usize) -> s2f::Step {
         s2f::Step {
             n: i32_of(k),
@@ -778,11 +899,23 @@ impl RustDrafter {
         }
     }
 
-    /// `Drafter::cache(l)`: the E4M3 copy on the global layer (1) only.
+    /// The round batch's k compact rows with the SWA ring block table (`L0` and `L2`).
+    fn bstep_swa(&self, k: usize) -> s2f::Step {
+        s2f::Step {
+            block_table: self.s.bt_swa_c.ptr(),
+            ..self.bstep(k)
+        }
+    }
+
+    /// `Drafter::cache(l)`: the E4M3 copy on the global layer (1) only (`k`/`v` null on `L1` when `kv8` is enabled).
     fn cache(&self, l: usize) -> s2f::CacheL {
         let mut c = s2f::CacheL::zeroed();
-        c.k = self.s.kc[l].ptr();
-        c.v = self.s.vc[l].ptr();
+        if let Some(kc) = &self.s.kc[l] {
+            c.k = kc.ptr();
+        }
+        if let Some(vc) = &self.s.vc[l] {
+            c.v = vc.ptr();
+        }
         if l == 1
             && let (Some(k8), Some(v8)) = (&self.s.k8, &self.s.v8)
         {
@@ -847,6 +980,7 @@ impl RustDrafter {
         sess: &DevBuf<i32>,
         rows: usize,
     ) -> Result<(), CudaError> {
+        self.sync_page_table()?;
         let (st, dev, w, s) = (self.step(), self.dev(), &self.w, &self.s);
         let mut cc = s2f::Caches::zeroed();
         for (l, c) in cc.l.iter_mut().enumerate() {
@@ -881,7 +1015,7 @@ impl RustDrafter {
                 }
                 let p = pos.slice(r0..r0 + rc)?;
                 let q = sess.slice(r0..r0 + rc)?;
-                dev.epi_kvctx(&s.part, 1, rc, st, k_norm_ctx, &w.cos_sin, cc, &p, &q)?;
+                dev.epi_kvctx(&s.part, 1, rc, st, k_norm_ctx, &w.cos_sin, cc, &p, &q, Some(&s.bt_swa))?;
             }
             return Ok(());
         }
@@ -911,7 +1045,7 @@ impl RustDrafter {
             }
             let p = pos.slice(r0..r0 + rc)?;
             let q = sess.slice(r0..r0 + rc)?;
-            dev.epi_kvctx(&s.part, sk, rc, st, k_norm_ctx, &w.cos_sin, cc, &p, &q)?;
+            dev.epi_kvctx(&s.part, sk, rc, st, k_norm_ctx, &w.cos_sin, cc, &p, &q, Some(&s.bt_swa))?;
         }
         Ok(())
     }
@@ -937,6 +1071,11 @@ impl RustDrafter {
             nsurv: &s.nsurv,
             conf: &s.conf,
         };
+        let b_swa = Batch {
+            bt: &s.bt_swa,
+            bt_c: &s.bt_swa_c,
+            ..b
+        };
         let mut evs: Vec<(&'static str, ink_cuda::Event)> = Vec::new();
         let mark = |evs: &mut Vec<(&'static str, ink_cuda::Event)>, name: &'static str| -> Result<(), CudaError> {
             if prof {
@@ -948,6 +1087,7 @@ impl RustDrafter {
         };
         mark(&mut evs, "start")?;
         self.dev().draft_gather(k, sh.n, sh.max_blocks, &b)?;
+        self.dev().draft_gather(k, sh.n, sh.max_blocks, &b_swa)?;
         mark(&mut evs, "gather")?;
         self.layers(k, prof, &mut evs)?;
         if sampled {
@@ -1014,12 +1154,13 @@ impl RustDrafter {
             )
         };
         for (l, lw) in w.layers.iter().enumerate() {
+            let st_l = if l == 1 { st } else { self.bstep_swa(k) };
             f32_gemm(&lw.qkv_f, &s.xn, H, (NH + 2 * KVH) * HD, H, 4)?;
             dev.epi_qkv(
                 &s.part,
                 4,
                 t,
-                st,
+                st_l,
                 &lw.q_norm,
                 &lw.k_norm,
                 &w.cos_sin,
@@ -1035,7 +1176,7 @@ impl RustDrafter {
                 sh.kv8 && l == 1,
                 k,
                 &s.qbuf,
-                st,
+                st_l,
                 self.cache(l),
                 window,
                 split,
@@ -1432,8 +1573,12 @@ impl RustDrafter {
             tap(name, host_bytes(st, b)?);
         }
         for l in 0..3 {
-            tap(&format!("Kc{l}"), host_bytes(st, &s.kc[l])?);
-            tap(&format!("Vc{l}"), host_bytes(st, &s.vc[l])?);
+            if let Some(kc) = &s.kc[l] {
+                tap(&format!("Kc{l}"), host_bytes(st, kc)?);
+            }
+            if let Some(vc) = &s.vc[l] {
+                tap(&format!("Vc{l}"), host_bytes(st, vc)?);
+            }
         }
         if let (Some(k8), Some(v8)) = (&s.k8, &s.v8) {
             tap("K8", host_bytes(st, k8)?);
@@ -1579,6 +1724,7 @@ impl Drafter for RustDrafter {
                 )));
             }
         }
+        rt(self.sync_page_table())?;
         let list: Vec<i32> = sessions.iter().map(|&r| i32_of(r)).collect();
         if self.last_sel != list {
             rt(self.st.htod(&rt(self.s.sel.slice(0..k))?, &list))?;
@@ -1704,12 +1850,18 @@ mod tests {
         let short = Shape::new(8, 100, true, false, true);
         // 108 keys: 2 tiles, ceil(384 / 64) = 6
         assert_eq!(short.split_attn, [2, 2, 2]);
-        assert_eq!(short.cache_elems(), (8 * 2 + 1) * 8 * 64 * 128);
+        assert_eq!(short.global_cache_elems(), (8 * 2 + 1) * 8 * 64 * 128);
+        assert_eq!(short.swa_cache_elems(), (8 * 2 + 1) * 8 * 64 * 128);
         let long = Shape::new(1, 262_144, true, false, true);
         // 262,152 keys = 4,097 tiles: at least ceil(4,098 / 256) = 17 splits; 48 from the CTA target
         assert_eq!(long.split_attn[1], 48);
         let huge = Shape::new(8, 262_144, true, false, true);
         assert_eq!(huge.split_attn[1], 17);
+        assert_eq!(huge.swa_blocks_per_sess, SWA_RING_BLOCKS);
+        let pooled = Shape::new_with_pool(8, 262_144, true, true, true, Some(504));
+        assert_eq!(pooled.l1_blocks, 504 * 16 + 8 + 1);
+        // Pooled 262K DSpark with kv8=true + ring L0/L2 fits well under 5.5 GiB total (incl. weights + head + KV)
+        assert!(arena_bytes(&pooled) < (5500 << 20));
     }
 
     #[test]
@@ -1723,7 +1875,8 @@ mod tests {
             bf + al(VP * H) + 2 * al(VP * 4) + al(4 * 7 * VP * 4),
             i8 + al(VP * H * 2)
         );
-        let ce = Shape::new(4, 16_384, true, false, true).cache_elems();
-        assert_eq!(kv8, i8 + 2 * al(ce));
+        // kv8 replaces L1 bf16 (2 bytes/elem) with L1 E4M3 (1 byte/elem), saving 2 * ge bytes
+        let ge = Shape::new(4, 16_384, true, false, true).global_cache_elems();
+        assert_eq!(kv8 + 2 * al(ge * 2), i8 + 2 * al(ge));
     }
 }

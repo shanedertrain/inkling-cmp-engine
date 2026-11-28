@@ -438,11 +438,11 @@ __global__ void kv_conv_kernel(const bf16* kx, const bf16* vx, const bf16* kst, 
   vout[(size_t)t * 1024 + c] = r16(__fmul_rn(cv, rstd_of(v[1], HD, eps)));
 }
 // conv state commit: new state = ext[c_s : c_s + 3] of the segment, for every (visit, kind) of the call.
-// x of (visit, kind): convx + (visit * 4 + kind) * convx_vstride, ld C; kind offsets in the state row: 0, 1024, 2048, 4352
+// x of (visit, kind): convx + visit * convx_vstride + off * convx_kstride, ld C; kind offsets: 0, 1024, 2048, 4352.
 struct CommitArgs {
   const bf16* convx;
-  long long convx_kstride;   // elements between kinds of one visit (T_max * 2304)
-  long long convx_vstride;   // elements between visits (4 * kstride)
+  long long convx_kstride;   // rows per visit in convx (each kind stores convx_kstride * C elements)
+  long long convx_vstride;   // elements between visits (convx_kstride * SLD)
   bf16* state;               // conv state base
   long long st_slot_stride, st_visit_stride;
   const int* row0;
@@ -458,7 +458,7 @@ __global__ void conv_commit_kernel(CommitArgs a) {
   if (c >= C) return;
   const int off = kind == 0 ? 0 : kind == 1 ? 1024 : kind == 2 ? 2048 : 4352;
   bf16* st = a.state + (size_t)a.slot[s] * a.st_slot_stride + (size_t)v * a.st_visit_stride + off;
-  const bf16* x = a.convx + (size_t)v * a.convx_vstride + (size_t)kind * a.convx_kstride;
+  const bf16* x = a.convx + (size_t)v * a.convx_vstride + (size_t)off * a.convx_kstride;
   const int cnt = a.cnt[s], r0 = a.row0[s];
   bf16 nv[3];
 #pragma unroll

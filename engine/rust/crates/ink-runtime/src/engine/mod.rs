@@ -22,6 +22,7 @@ mod ops;
 mod resume;
 mod specrt;
 
+use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
@@ -47,7 +48,7 @@ use meta::{CallMeta, Limits, SegReq, Slots, build_call};
 use self::forward::Fwd;
 use self::ops::{
     DA_SMEM, DA_SMEM16, Dev, MOE_DEC_SMEM_MXFP8, MOE_DEC_SMEM_N1S1, MOE_SMEM_MXFP8, MOE_SMEM_NVFP4,
-    MOE_SMEM_NVFP4_N1S1, PFA_FP8_SMEM, PFA_SMEM, SLD, da_ring_smem,
+    MOE_SMEM_NVFP4_N1S1, PFA_FAR_SMEM, PFA_FP8_FAR_SMEM, PFA_FP8_SMEM, PFA_SMEM, SLD, da_ring_smem,
 };
 use crate::error::Classify;
 
@@ -170,6 +171,15 @@ enum TraceSrc {
     Graph { key: String, segs: String },
 }
 
+/// Shared handle to the engine's global KV page allocator (`Slots`) and pool capacity, borrowed by pooled drafters
+/// (`RustDFlash2` global E4M3 layers and `RustDrafter` global L1) so drafter global pages track `Engine`'s exact
+/// physical page indices across `forward`, `reset_slot`, and `rollback`.
+#[derive(Clone)]
+pub(crate) struct SharedGlobalPages {
+    pub slots: Rc<RefCell<Slots>>,
+    pub num_pages: usize,
+}
+
 /// The Rust forward engine; implements [`Runtime`].
 pub struct Engine {
     graphs: GraphCache,
@@ -197,7 +207,7 @@ pub struct Engine {
     full_index: Vec<Option<usize>>,
     ring_index: Vec<Option<usize>>,
     da_ring_slots: [usize; 17],
-    slots: Slots,
+    slots: Rc<RefCell<Slots>>,
     last: Option<CallMeta>,
     committed: bool,
     glue: Glue,
@@ -408,7 +418,9 @@ impl Engine {
             (KernelId::DaDecodeAttnRingKernel053, da_ring_smem(5)),
             (KernelId::DaDecodeAttnRingKernel063, da_ring_smem(6)),
             (KernelId::PfaPrefillAttnKernel42112False, PFA_SMEM),
+            (KernelId::PfaPrefillAttnFarKernel42112, PFA_FAR_SMEM),
             (KernelId::PfaPrefillAttnFp8Kernel42112False, PFA_FP8_SMEM),
+            (KernelId::PfaPrefillAttnFp8FarKernel422, PFA_FP8_FAR_SMEM),
         ] {
             k.function(id).set_max_dynamic_smem(smem).rt()?;
         }
@@ -479,7 +491,7 @@ impl Engine {
             st,
             ctx,
             spec: specrt::SpecState::default(),
-            slots: Slots::new(mem.max_slots, mem.num_pages),
+            slots: Rc::new(RefCell::new(Slots::new(mem.max_slots, mem.num_pages))),
             mem,
             plan,
             full_index,
@@ -520,6 +532,7 @@ impl Engine {
             t_max: m.t_max,
             logit_rows_max: m.logit_rows_max,
             ring: m.ring_pages(),
+            swa_scratch_pages: m.swa_scratch_pages(),
             pa_items_cap: m.pa_items_cap(),
             pa_tiles_cap: m.pa_tiles_cap(),
             pa_partials_cap: self.a.pa_ws_floats / ink_model::plan::PA_WS_FLOATS_PER_PARTIAL,
@@ -543,7 +556,7 @@ impl Engine {
             st.htod(&a.logit_rows.slice(0..m.lrows.len()).rt()?, &m.lrows).rt()?;
         }
         let slot_sig: Vec<(usize, bool)> = m.call.iter().map(|c| (c.slot, c.dec())).collect();
-        let page_gen = self.slots.page_gen();
+        let page_gen = self.slots.borrow().page_gen();
         if self
             .pt_g_sig
             .as_ref()
@@ -555,6 +568,9 @@ impl Engine {
         if self.pt_r_sig.as_ref().is_none_or(|sig| *sig != slot_sig) {
             st.htod(&a.pt_r, &m.pt_r).rt()?;
             self.pt_r_sig = Some(slot_sig);
+        }
+        if !m.pt_r_pf.is_empty() {
+            st.htod(&a.pt_r_pf.slice(0..m.pt_r_pf.len()).rt()?, &m.pt_r_pf).rt()?;
         }
         let nd = m.dctx.len();
         if nd > 0 {
@@ -586,10 +602,11 @@ impl Engine {
     }
 
     fn check_slot(&self, slot: usize) -> Res<()> {
-        if slot < self.slots.count() {
+        let count = self.slots.borrow().count();
+        if slot < count {
             Ok(())
         } else {
-            Err(RuntimeError::request(format!("slot {slot} of {}", self.slots.count())))
+            Err(RuntimeError::request(format!("slot {slot} of {count}")))
         }
     }
 
@@ -614,7 +631,7 @@ impl Runtime for Engine {
                 "reset_slot: slot {slot} is in the uncommitted last forward call (commit it first; 0 rows drops it)"
             )));
         }
-        self.slots.reset(slot);
+        self.slots.borrow_mut().reset(slot);
         self.ckpt.clear(slot);
         let n = NVISITS * 3 * SLD;
         self.st
@@ -624,11 +641,11 @@ impl Runtime for Engine {
 
     fn length(&self, slot: usize) -> Res<usize> {
         self.check_slot(slot)?;
-        Ok(self.slots.length(slot))
+        Ok(self.slots.borrow().length(slot))
     }
 
     fn free_pages(&self) -> Res<usize> {
-        Ok(self.slots.free_pages())
+        Ok(self.slots.borrow().free_pages())
     }
 
     fn forward(&mut self, segs: &[SegIn<'_>]) -> Res<usize> {
@@ -647,7 +664,7 @@ impl Runtime for Engine {
             })
             .collect();
         let lim = self.limits();
-        let mut m = build_call(&mut self.slots, &reqs, &lim).rt()?;
+        let mut m = build_call(&mut self.slots.borrow_mut(), &reqs, &lim).rt()?;
         for (s, c) in segs.iter().zip(&m.call) {
             m.ids[c.row0..c.row0 + c.m].copy_from_slice(s.ids);
         }
@@ -787,20 +804,34 @@ impl Runtime for Engine {
         if kept.len() != s {
             return Err(RuntimeError::request("commit counts"));
         }
+        let decode_only = m.call.iter().all(|c| c.dec());
         let mut cnt = Vec::with_capacity(s);
-        for (k, c) in kept.iter().zip(&m.call) {
-            if *k as usize > c.m {
+        let mut tail_row0 = Vec::with_capacity(s);
+        for (idx, (k, c)) in kept.iter().zip(&m.call).enumerate() {
+            let k_usize = *k as usize;
+            if k_usize > c.m {
                 return Err(RuntimeError::request("commit count range"));
             }
-            cnt.push(*k as i32);
+            if !c.dec() && k_usize != 0 && k_usize != c.m {
+                return Err(RuntimeError::request("prefill segment commit must be 0 or full length"));
+            }
+            if decode_only {
+                cnt.push(*k as i32);
+            } else {
+                tail_row0.push((idx * meta::MAX_DEC_ROWS) as i32);
+                cnt.push(if !c.dec() && k_usize == c.m { 3 } else { *k as i32 });
+            }
         }
         let a = &self.a;
+        if !decode_only {
+            self.st.htod(&a.row0.slice(0..s).rt()?, &tail_row0).rt()?;
+        }
         self.st.htod(&a.cnt.slice(0..s).rt()?, &cnt).rt()?;
-        let tm = self.mem.t_max;
+        let tail_rows = self.mem.conv_tail_rows();
         let args = glue::CommitArgs {
             convx: a.convx.ptr(),
-            convx_kstride: (tm * H) as i64,
-            convx_vstride: (4 * tm * H) as i64,
+            convx_kstride: tail_rows as i64,
+            convx_vstride: (tail_rows * SLD) as i64,
             state: a.conv.ptr(),
             st_slot_stride: (NVISITS * 3 * SLD) as i64,
             st_visit_stride: (3 * SLD) as i64,
@@ -817,8 +848,11 @@ impl Runtime for Engine {
         .conv_commit(s, &args)
         .rt()?;
         let calls: Vec<(usize, usize)> = m.call.iter().zip(kept).map(|(c, &k)| (c.slot, k as usize)).collect();
-        for (slot, k) in calls {
-            self.slots.advance(slot, k);
+        {
+            let mut slots = self.slots.borrow_mut();
+            for (slot, k) in calls {
+                slots.advance(slot, k);
+            }
         }
         self.committed = true;
         Ok(())

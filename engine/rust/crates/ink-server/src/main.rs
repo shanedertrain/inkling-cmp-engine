@@ -158,7 +158,7 @@ struct Cli {
     #[arg(long)]
     draft_dflash2: Option<PathBuf>,
     /// Engine back end: drafter positions per slot (a session speculates while its rows stay below them;
-    /// defaults to 262,144 for `--draft-dflash2` and 65,536 for `--draft-fold`).
+    /// defaults to 262,144 for both `--draft-dflash2` and `--draft-fold`).
     #[arg(long)]
     draft_ctx: Option<u32>,
     /// Engine back end: verify width of a speculating session: `gated` (1 + the leading drafts whose cumulative drafter
@@ -392,14 +392,19 @@ fn engine_backend(cli: &Cli) -> Result<(EngineBackend, Source)> {
             lookup_min,
         })
     } else {
+        let dspark_kv = if std::env::var("INK_DSPARK_KV_BF16").is_ok_and(|v| v != "0") {
+            KvPrecision::Bf16
+        } else {
+            KvPrecision::E4m3
+        };
         cli.draft_fold.clone().map(|fold_bin| DraftConfig {
             model_dir: cli.model_dir.clone(),
             fold_bin,
             dflash2_dir: None,
             sessions: cli.slots,
-            max_ctx: cli.draft_ctx.unwrap_or(65_536),
+            max_ctx: cli.draft_ctx.unwrap_or(262_144),
             head: HeadPrecision::Int8,
-            global_kv: KvPrecision::Bf16,
+            global_kv: dspark_kv,
             verify,
             lookup,
             lookup_min,

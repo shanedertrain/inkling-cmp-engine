@@ -15,13 +15,15 @@ HF_CACHE="${HOME}/.cache/huggingface"
 # Optional: Hugging Face token (only needed if gated or rate-limited).
 # HF_TOKEN=""
 
-# Serving configuration (matches README defaults).
+# Serving configuration (matches README v1.3.0 defaults).
 SLOTS=8
 MAX_RUNNING=8
-# PAGES defaults to 504 (BF16 lossless, 516K tok/card) or 1008 when KV_FP8=1 (1.03M tok/card).
-# PAGES=504
+# PAGES defaults to 960 (BF16 lossless, 983K tok/card; max 1,015 / 1.04M) or 1728 when KV_FP8=1 (1.77M tok/card; max 1,789 / 1.83M).
+# PAGES=960
+CHUNK=8192
+LOOKUP=8
 KV_FP8=0
-DCTX=102400
+DCTX=262144
 CPUS=6
 
 # Opt-in: path to incoai/Inkling-2-Mini-DFlash2 checkpoint directory (replaces DSpark).

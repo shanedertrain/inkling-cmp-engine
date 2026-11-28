@@ -422,8 +422,8 @@ impl Dev<'_> {
         }
     }
 
-    /// `epi_kvctx<<<(R, 3), 512>>>(part, sk, R, st, k_norm_ctx x 3, cos_sin, cc, row_pos, row_sess)`: k_norm_ctx and
-    /// RoPE on the context K, both written to each layer's draft K/V at the rows' positions.
+    /// `epi_kvctx<<<(R, 3), 512>>>(part, sk, R, st, k_norm_ctx x 3, cos_sin, cc, row_pos, row_sess, bt_swa)`:
+    /// k_norm_ctx and RoPE on the context K, both written to each layer's draft K/V at the rows' positions.
     #[allow(clippy::too_many_arguments)]
     pub fn epi_kvctx(
         &self,
@@ -436,14 +436,15 @@ impl Dev<'_> {
         cc: s2f::Caches,
         row_pos: &DevBuf<i32>,
         row_sess: &DevBuf<i32>,
+        bt_swa: Option<&DevBuf<i32>>,
     ) -> Result<()> {
         need(part, 3 * sk * rows * 2048, "kvctx part")?;
         need(row_pos, rows, "row positions")?;
         need(row_sess, rows, "row sessions")?;
         // SAFETY: block (row, l) reads part[l][0..sk][row][:2048] (checked), row_pos[row], row_sess[row] (checked),
         // the RoPE row of the position (positions below the table's 270,336) and writes one token of each KV head of
-        // layer l's K and V (and E4M3 copies when set) at the page `block_table[sess][pos / 64]` of this drafter's
-        // table: positions below max_blocks x 64 and sessions below n are the caller's (module docs).
+        // layer l's K and V (and E4M3 copies when set) at the page `bt[sess][pos / 64]` (bt_swa for layers 0 & 2 when
+        // given, st.block_table for layer 1): positions below max_blocks x 64 and sessions below n are the caller's.
         unsafe {
             self.k.s2f_epi_kvctx(
                 self.st,
@@ -460,6 +461,7 @@ impl Dev<'_> {
                     cc,
                     row_pos: b(row_pos),
                     row_sess: b(row_sess),
+                    bt_swa: opt(bt_swa),
                 },
             )
         }

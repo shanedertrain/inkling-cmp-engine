@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use ink_model::plan::RING_VISITS;
+
 /// Page-table row stride (262,144 + 2,048 tokens = 258 pages of 1,024).
 pub const KPT: usize = 264;
 /// Segments of at most this many rows use decode attention, longer ones prefill attention.
@@ -182,14 +184,29 @@ pub struct Limits {
     pub t_max: usize,
     /// Logit rows per call.
     pub logit_rows_max: usize,
-    /// Pages of a sliding-window ring per slot and visit.
+    /// Persistent pages of a sliding-window ring per slot and visit (2).
     pub ring: usize,
+    /// Shared per-visit sliding-window scratch pages for prefill chunks.
+    pub swa_scratch_pages: usize,
     /// Capacity of the prefill-attention item arrays per kind.
     pub pa_items_cap: usize,
     /// Capacity of the prefill-attention tile counters per kind.
     pub pa_tiles_cap: usize,
     /// Split partials the prefill-attention workspace holds.
     pub pa_partials_cap: usize,
+}
+
+/// One trailing-window slice to copy from shared SWA scratch into a slot's persistent 2-page ring after each SWA visit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwaCopyPiece {
+    /// Source scratch page index (`0..swa_scratch_pages`).
+    pub src_scratch: usize,
+    /// Destination persistent ring page index within a visit (`slot * ring + logical_page % ring`).
+    pub dst_ring_page: usize,
+    /// First token offset within the 1,024-token page (inclusive).
+    pub tok_lo: usize,
+    /// End token offset within the 1,024-token page (exclusive).
+    pub tok_hi: usize,
 }
 
 /// Everything the host builds for one forward call, in the order the C++ copies it to the device.
@@ -221,8 +238,12 @@ pub struct CallMeta {
     pub dec_rows: usize,
     /// Global page table: call-order rows `[0, S)`, decode-order rows `[max_slots, max_slots + n_dec)`, `[2 max_slots][KPT]`.
     pub pt_g: Vec<i32>,
-    /// Ring page table, same rows.
+    /// Ring page table, same rows (used directly for decode-only calls and decode segments in mixed calls).
     pub pt_r: Vec<i32>,
+    /// Per-visit SWA page table for prefill-carrying calls (`[RING_VISITS][nseg][KPT]`), empty on decode-only calls.
+    pub pt_r_pf: Vec<i32>,
+    /// Trailing-window pieces to copy from shared SWA scratch into persistent rings after each SWA visit.
+    pub swa_copies: Vec<SwaCopyPiece>,
     /// Decode segments: context, first row, chunk shift (global, sliding), rows.
     pub dctx: Vec<i32>,
     /// See `dctx`.
@@ -236,9 +257,12 @@ pub struct CallMeta {
     /// `pfa::Seg` per segment: q0, len, past, pt_off.
     pub pa_segs: Vec<[i32; 4]>,
     /// Prefill-attention items per kind (0 global, 1 sliding): `(segment, row, first key block, end key block)`.
+    /// Global items are partitioned with pure-FAR items first (`[0..pa_g_far)`) and NEAR items second.
     pub pa_items: [Vec<[i32; 4]>; 2],
     /// `(split index, splits of the tile, first workspace partial, tile id)`.
     pub pa_items2: [Vec<[i32; 4]>; 2],
+    /// Count of pure-FAR global items (`qmin >= b_end * 64 + WINDOW - 1`) at the front of `pa_items[0]`.
+    pub pa_g_far: usize,
 }
 
 /// Key chunk shift of decode attention: own context only (batch-invariant); sliding window 128 keys.
@@ -385,8 +409,52 @@ pub fn build_call(slots: &mut Slots, segs: &[SegReq], lim: &Limits) -> Result<Ca
         });
         row += s.m;
     }
-    let (pa_g, pa_g2) = pa_items(&call, false, lim)?;
-    let (pa_s, pa_s2) = pa_items(&call, true, lim)?;
+    let (pa_g, pa_g2, pa_g_far) = pa_items(&call, false, lim)?;
+    let (pa_s, pa_s2, _) = pa_items(&call, true, lim)?;
+    // Plan shared SWA scratch pages for any prefill segments before taking global KV pages.
+    let any_pre = call.iter().any(|c| !c.dec());
+    let mut seg_scr: Vec<Option<(usize, usize, usize)>> = Vec::with_capacity(call.len());
+    let mut swa_copies: Vec<SwaCopyPiece> = Vec::new();
+    if any_pre {
+        let mut next_scratch = 0usize;
+        for c in &call {
+            if c.dec() {
+                seg_scr.push(None);
+                continue;
+            }
+            let pos0 = c.pos0;
+            let end = pos0 + c.m;
+            let p_wr_lo = pos0 / PAGE;
+            let p_wr_hi = (end - 1) / PAGE;
+            let p_scr_lo = if pos0.is_multiple_of(PAGE) {
+                p_wr_lo
+            } else {
+                p_wr_lo + 1
+            };
+            if p_scr_lo > p_wr_hi {
+                seg_scr.push(None);
+                continue;
+            }
+            let n_scr = p_wr_hi - p_scr_lo + 1;
+            require(next_scratch + n_scr <= lim.swa_scratch_pages, "SWA scratch pages")?;
+            let base = next_scratch;
+            next_scratch += n_scr;
+            seg_scr.push(Some((p_scr_lo, p_wr_hi, base)));
+            let copy_lo = (p_scr_lo * PAGE).max(end.saturating_sub(WINDOW - 1));
+            let mut q = copy_lo;
+            while q < end {
+                let j = q / PAGE;
+                let q_end = end.min((j + 1) * PAGE);
+                swa_copies.push(SwaCopyPiece {
+                    src_scratch: base + (j - p_scr_lo),
+                    dst_ring_page: c.slot * lim.ring + (j % lim.ring),
+                    tok_lo: q % PAGE,
+                    tok_hi: q_end - j * PAGE,
+                });
+                q = q_end;
+            }
+        }
+    }
 
     let mut m = CallMeta {
         call: Vec::new(),
@@ -403,6 +471,8 @@ pub fn build_call(slots: &mut Slots, segs: &[SegReq], lim: &Limits) -> Result<Ca
         dec_rows: 0,
         pt_g: vec![0; 2 * max_slots * KPT],
         pt_r: vec![0; 2 * max_slots * KPT],
+        pt_r_pf: Vec::new(),
+        swa_copies,
         dctx: Vec::new(),
         drow0: Vec::new(),
         dcs_g: Vec::new(),
@@ -411,6 +481,7 @@ pub fn build_call(slots: &mut Slots, segs: &[SegReq], lim: &Limits) -> Result<Ca
         pa_segs: Vec::new(),
         pa_items: [Vec::new(), Vec::new()],
         pa_items2: [Vec::new(), Vec::new()],
+        pa_g_far,
     };
     for (i, (s, &c)) in segs.iter().zip(&call).enumerate() {
         let (len0, row) = (c.pos0, c.row0);
@@ -475,6 +546,25 @@ pub fn build_call(slots: &mut Slots, segs: &[SegReq], lim: &Limits) -> Result<Ca
         }
     }
     // prefill attention: one Seg per segment; work items per kind
+    if any_pre {
+        let nseg = m.call.len();
+        let visit_pages = max_slots * lim.ring;
+        m.pt_r_pf = vec![0; RING_VISITS * nseg * KPT];
+        for ri in 0..RING_VISITS {
+            let scratch_base = (RING_VISITS - ri) * visit_pages;
+            for (s, c) in m.call.iter().enumerate() {
+                let dst = &mut m.pt_r_pf[(ri * nseg + s) * KPT..(ri * nseg + s + 1) * KPT];
+                for (j, entry) in dst.iter_mut().enumerate() {
+                    *entry = (c.slot * lim.ring + j % lim.ring) as i32;
+                }
+                if let Some((p_scr_lo, p_wr_hi, base)) = seg_scr[s] {
+                    for (off, entry) in dst[p_scr_lo..=p_wr_hi].iter_mut().enumerate() {
+                        *entry = (scratch_base + base + off) as i32;
+                    }
+                }
+            }
+        }
+    }
     for (s, c) in m.call.iter().enumerate() {
         m.pa_segs
             .push([c.row0 as i32, c.m as i32, c.pos0 as i32, (s * KPT) as i32]);
@@ -485,14 +575,16 @@ pub fn build_call(slots: &mut Slots, segs: &[SegReq], lim: &Limits) -> Result<Ca
 }
 
 /// Prefill-attention work items of one kind (`engine/kernels/prefill_attn/bench.cu` build_tiles rule): row tiles of
-/// 128 packed rows; global: key splits at 8,192 below 64K, 16,384 below 128K, 32,768 beyond, biggest ranges first
-/// (stable); sliding window unsplit, heaviest first (stable).
-type Items = (Vec<[i32; 4]>, Vec<[i32; 4]>);
+/// 128 packed rows; global: key splits at 8,192 below 64K, 16,384 below 128K, 32,768 beyond, partitioned with
+/// pure-FAR items (`qmin >= cuts[k + 1] * 64 + WINDOW - 1`, no bias/mask) first and NEAR items second, each sorted by
+/// first key block descending then weight descending (stable); sliding window unsplit, heaviest first (stable).
+type Items = (Vec<[i32; 4]>, Vec<[i32; 4]>, usize);
 fn pa_items(call: &[CallSeg], swa: bool, lim: &Limits) -> Result<Items, MetaError> {
     struct It {
         a: [i32; 4],
         b: [i32; 4],
         w: i64,
+        far: bool,
     }
     let mut it: Vec<It> = Vec::new();
     let (mut tile, mut parts) = (0usize, 0usize);
@@ -529,10 +621,12 @@ fn pa_items(call: &[CallSeg], swa: bool, lim: &Limits) -> Result<Items, MetaErro
             cuts.push(b1);
             let n = cuts.len() - 1;
             for k in 0..n {
+                let far = !swa && qmin >= cuts[k + 1] * 64 + (WINDOW - 1);
                 it.push(It {
                     a: [s as i32, r0 as i32, cuts[k] as i32, cuts[k + 1] as i32],
                     b: [k as i32, n as i32, parts as i32, tile as i32],
                     w: (cuts[k + 1] - cuts[k]) as i64,
+                    far,
                 });
             }
             if n > 1 {
@@ -545,15 +639,24 @@ fn pa_items(call: &[CallSeg], swa: bool, lim: &Limits) -> Result<Items, MetaErro
     if swa {
         it.sort_by_key(|x| std::cmp::Reverse(x.w));
     } else {
-        // a.z descending (first key block), then weight descending; stable
-        it.sort_by(|x, y| y.a[2].cmp(&x.a[2]).then(y.w.cmp(&x.w)));
+        // pure-FAR items first, then a.z descending (first key block), then weight descending; stable
+        it.sort_by(|x, y| y.far.cmp(&x.far).then(y.a[2].cmp(&x.a[2])).then(y.w.cmp(&x.w)));
     }
+    let n_far = if swa {
+        0
+    } else {
+        it.iter().take_while(|x| x.far).count()
+    };
     require(
         it.len() <= lim.pa_items_cap && tile <= lim.pa_tiles_cap,
         "prefill attention items",
     )?;
     require(parts.max(1) <= lim.pa_partials_cap, "prefill ws")?;
-    Ok((it.iter().map(|x| x.a).collect(), it.iter().map(|x| x.b).collect()))
+    Ok((
+        it.iter().map(|x| x.a).collect(),
+        it.iter().map(|x| x.b).collect(),
+        n_far,
+    ))
 }
 
 #[cfg(test)]
@@ -565,10 +668,11 @@ mod tests {
             max_chunk: 2048,
             t_max: 2112,
             logit_rows_max: 64,
-            ring: 3,
+            ring: 2,
+            swa_scratch_pages: 10,
             pa_items_cap: 9792,
             pa_tiles_cap: 408,
-            pa_partials_cap: 51 * 18,
+            pa_partials_cap: 51 * 17,
         }
     }
 
@@ -753,12 +857,12 @@ mod tests {
         assert_eq!(&m.pos[..4], [500, 501, 502, 0]);
         // pages: slot 2 first (1 page: 0), then slot 0 (page 1), slot 1 (page 2)
         assert_eq!((s.pages(2), s.pages(0), s.pages(1)), (&[0][..], &[1][..], &[2][..]));
-        // ring table of segment 0 (slot 2): slot * 3 + j % 3
-        assert_eq!(&m.pt_r[..4], [6, 7, 8, 6]);
+        // ring table of segment 0 (slot 2): slot * 2 + j % 2
+        assert_eq!(&m.pt_r[..4], [4, 5, 4, 5]);
         // decode order rows start at max_slots = 4: segment 0 then segment 2 (slot 1)
         assert_eq!(m.pt_g[4 * KPT], 0);
         assert_eq!(m.pt_g[5 * KPT], 2);
-        assert_eq!(m.pt_r[5 * KPT + 1], 4);
+        assert_eq!(m.pt_r[5 * KPT + 1], 3);
         assert_eq!(
             (m.dctx.clone(), m.drow0.clone(), m.dnr.clone()),
             (vec![500, 70], vec![0, 203], vec![3, 1])
@@ -832,20 +936,143 @@ mod tests {
             pos0: 70_000,
             nlog: 0,
         }];
-        let (a, b) = pa_items(&call, false, &lim()).unwrap();
+        let (a, b, n_far) = pa_items(&call, false, &lim()).unwrap();
         // tile 0: qmax = 70,000 + 127 / 3 = 70,042, b1 = 70,042 / 64 + 1 = 1095; cuts 0,128,..,1024 (step 128 below
-        // 1024), then 1024 + 256 = 1280 > b1 -> pieces: 8 of 128 blocks, then [1024, 1095)
+        // 1024), then 1024 + 256 = 1280 > b1 -> pieces: 8 of 128 blocks (all pure-FAR: 1024*64+1023 = 66559 <= 70000),
+        // then [1024, 1095) (NEAR)
         let t0: Vec<_> = a.iter().zip(&b).filter(|(_, y)| y[3] == 0).collect();
         assert_eq!(t0.len(), 9);
-        // sorted by first key block descending: the [1024, 1095) piece of every tile comes first
-        assert_eq!(a[0][2], 1024);
+        assert_eq!(n_far, 40);
+        // pure-FAR items come first (sorted by first key block descending: [896, 1024) first), NEAR [1024, 1095) after
+        assert_eq!(a[0][2], 896);
+        assert_eq!(a[n_far][2], 1024);
         assert_eq!(b.iter().filter(|y| y[3] == 4).count(), 9);
         // workspace partial bases: every tile has 9 pieces -> tile k starts at 9 k
         assert!(b.iter().all(|y| y[2] == 9 * y[3] && y[1] == 9));
+        // exact FAR/NEAR boundary around first split 8192 (block 128 -> last key 8191, boundary qmin = 8191 + 1024 = 9215)
+        let near_edge = [CallSeg {
+            slot: 0,
+            row0: 0,
+            m: 20,
+            pos0: 9214,
+            nlog: 0,
+        }];
+        let (_, _, nf0) = pa_items(&near_edge, false, &lim()).unwrap();
+        assert_eq!(nf0, 0);
+        let far_edge = [CallSeg {
+            slot: 0,
+            row0: 0,
+            m: 20,
+            pos0: 9215,
+            nlog: 0,
+        }];
+        let (_, _, nf1) = pa_items(&far_edge, false, &lim()).unwrap();
+        assert_eq!(nf1, 1);
         // sliding window: unsplit, one item per tile, heaviest first; b0 = (70,000 - 1023) / 64 = 1077
-        let (a, b) = pa_items(&call, true, &lim()).unwrap();
+        let (a, b, nf_swa) = pa_items(&call, true, &lim()).unwrap();
+        assert_eq!(nf_swa, 0);
         assert_eq!(a.len(), 5);
         assert!(b.iter().all(|y| y[0] == 0 && y[1] == 1));
         assert_eq!(a.iter().find(|x| x[1] == 0).unwrap()[2], 1077);
+    }
+
+    #[test]
+    fn swa_scratch_mapping_and_copy_pieces() {
+        // 1. Page-aligned prefill (pos0 = 0, m = 4096): 4 scratch pages 0..4; trailing window [3073, 4096) spans
+        //    logical pages 3 (tok 1..1024 -> ring page 1) and 4? No: 4096 - 1023 = 3073 -> page 3 offsets 1..1024!
+        let mut s = Slots::new(4, 16);
+        let lim4 = Limits {
+            max_chunk: 4096,
+            t_max: 4224,
+            swa_scratch_pages: 8,
+            ..lim()
+        };
+        let m = build_call(
+            &mut s,
+            &[SegReq {
+                slot: 2,
+                m: 4096,
+                logits: 1,
+            }],
+            &lim4,
+        )
+        .unwrap();
+        assert_eq!(m.pt_r_pf.len(), RING_VISITS * KPT);
+        // Visit 0: visit_pages = 4 * 2 = 8, scratch_base = 40 * 8 = 320; logical pages 0..4 -> 320..324
+        assert_eq!(&m.pt_r_pf[0..5], [320, 321, 322, 323, 4]);
+        // Visit 39: scratch_base = 1 * 8 = 8; logical pages 0..4 -> 8..12
+        let v39 = 39 * KPT;
+        assert_eq!(&m.pt_r_pf[v39..v39 + 5], [8, 9, 10, 11, 4]);
+        // Trailing window [3073, 4096) -> single piece from scratch page 3 into slot 2 ring page 1 (2*2 + 3%2 = 5)
+        assert_eq!(
+            m.swa_copies,
+            [SwaCopyPiece {
+                src_scratch: 3,
+                dst_ring_page: 5,
+                tok_lo: 1,
+                tok_hi: 1024,
+            }]
+        );
+
+        // 2. Unaligned prefill (pos0 = 700, m = 2500 -> end = 3200):
+        //    logical page 0 stays on persistent ring (slot 1 -> page 2), scratch pages cover logical pages 1, 2, 3.
+        //    Trailing window [2177, 3200) spans logical pages 2 (129..1024 -> ring 2) and 3 (0..128 -> ring 3).
+        s.advance(1, 700);
+        let m2 = build_call(
+            &mut s,
+            &[SegReq {
+                slot: 1,
+                m: 2500,
+                logits: 1,
+            }],
+            &lim4,
+        )
+        .unwrap();
+        assert_eq!(&m2.pt_r_pf[0..5], [2, 320, 321, 322, 2]);
+        assert_eq!(
+            m2.swa_copies,
+            [
+                SwaCopyPiece {
+                    src_scratch: 1,
+                    dst_ring_page: 2,
+                    tok_lo: 129,
+                    tok_hi: 1024,
+                },
+                SwaCopyPiece {
+                    src_scratch: 2,
+                    dst_ring_page: 3,
+                    tok_lo: 0,
+                    tok_hi: 128,
+                },
+            ]
+        );
+
+        // 3. Unaligned short prefill inside single page (pos0 = 700, m = 300 -> end = 1000): 0 scratch pages, 0 copies!
+        let m3 = build_call(
+            &mut s,
+            &[SegReq {
+                slot: 1,
+                m: 300,
+                logits: 1,
+            }],
+            &lim4,
+        )
+        .unwrap();
+        assert!(m3.swa_copies.is_empty());
+        assert_eq!(&m3.pt_r_pf[0..3], [2, 3, 2]);
+
+        // 4. Decode-only call: pt_r_pf and swa_copies are both empty.
+        let m4 = build_call(
+            &mut s,
+            &[SegReq {
+                slot: 1,
+                m: 8,
+                logits: 8,
+            }],
+            &lim4,
+        )
+        .unwrap();
+        assert!(m4.pt_r_pf.is_empty());
+        assert!(m4.swa_copies.is_empty());
     }
 }

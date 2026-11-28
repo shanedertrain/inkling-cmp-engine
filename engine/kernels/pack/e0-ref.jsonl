@@ -1,4 +1,4 @@
-{"format":"ink-e0-sass/1","source":"pack","cubins":2,"kernels":390}
+{"format":"ink-e0-sass/1","source":"pack","cubins":2,"kernels":393}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_Z11k_copy_colsPK13__nv_bfloat16iiiPS_i","bytes":2432,"sha256":"4cee105275703c6f438f98f9a016eb5a15c90c107bae9a2b8b4840b42ac684e0"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_Z11k_fill_bf16P13__nv_bfloat16mmf","bytes":2816,"sha256":"cc3ea8562fdf67716996a78a229827ba21e6802e8c793300332a7a2d8ac66e6d"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_Z11k_fill_e4m3Phmm","bytes":3712,"sha256":"e8c55a93b9d56c0846c0f9c5fed8e06d435ea39ee5ffaca5dcd6ab9a93ebc2e5"}
@@ -87,9 +87,9 @@
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df223topk16_chunk_max_kernelEPKfPfS2_PiS1_PKiii","bytes":12544,"sha256":"560f30327bb09c6a316b1f29e1d0e8efdae0613438c1e4a4d2ad07141d1f66c6"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df224qkv_norm_rope_blk_kernelEPK13__nv_bfloat16S2_S2_S2_PKiS4_PS0_S5_S5_i","bytes":2176,"sha256":"b65a7f38b2ed7f2eabf27b9d1b062698844949bc56aa3e0d200fb7a70003ebad"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df225kv_norm_rope_store_kernelEPK13__nv_bfloat16S2_S2_PKiS4_PS0_S5_i","bytes":1792,"sha256":"2fa8af4f39637d71635f32701428864de0f3db85483af77e01faf1537cc22132"}
-{"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df229global_attn_e4m3_split_kernelEPK13__nv_bfloat16S2_S2_PKhS4_PKfS6_PKiS8_PfS9_iiii","bytes":65024,"sha256":"b1a4452531abdcccf544e6900fcdce1539540f69524f663dfea28ca1c50d95a2"}
+{"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df229global_attn_e4m3_split_kernelEPK13__nv_bfloat16S2_S2_PKiPKhS6_PKfS8_S4_S4_PfS9_iii","bytes":64128,"sha256":"f47eb71061a694523930d7f426b5004b10bd18ebd0c4550b860a7f3f472d0c55"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df232grouped_conv_out_res_norm_kernelEPK13__nv_bfloat16S2_S2_PS0_S2_S3_P6__halfii","bytes":15872,"sha256":"b68af4924f40c1b356ff6578435a7bdf3ed05e925b0ae1ada72c1c4485ff9a37"}
-{"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df237kv_norm_rope_store_global_e4m3_kernelEPK13__nv_bfloat16S2_S2_PKiS4_PhS5_PfS6_iii","bytes":6656,"sha256":"8e0ef081566c4739505d7756f7f035314ecd4a51bda14b2f2a1777917c16c491"}
+{"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3df237kv_norm_rope_store_global_e4m3_kernelEPK13__nv_bfloat16S2_S2_PKiS4_S4_PhS5_PfS6_iii","bytes":6784,"sha256":"703e46fa526739e60167ae7e38c781d9c1cf4fdf173ac610c32b95e554614e73"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN3ink47_GLOBAL__N__0f761cec_14_pack_engine_cu_58abf99813accept_kernelEPKiS2_iiS2_S2_S2_PiS3_S3_S3_S3_S3_S2_i","bytes":3328,"sha256":"f969c1fc5ebc85607851a96a42732f008c6559f71d79853b619a1c522006c6bb"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN3ink47_GLOBAL__N__0f761cec_14_pack_engine_cu_58abf99816last_feat_kernelEPK13__nv_bfloat16PKiS5_S5_PS1_i","bytes":640,"sha256":"625905175586e0cd1aae731fa8776a55d2109bdc66788952dd4eb0e1b3569a9b"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN3ink47_GLOBAL__N__0f761cec_14_pack_engine_cu_58abf99817proj_split_kernelEPK13__nv_bfloat16iiPS1_S4_S4_S4_S4_S4_S4_S4_","bytes":2304,"sha256":"620c414117d2b2fb6e5b36d5467bce53f5986d81021ec868b1d0fe990d878410"}
@@ -102,7 +102,9 @@
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN3ink47_GLOBAL__N__0f761cec_14_pack_engine_cu_58abf99823sample_leviathan_kernelENS_13LeviathanArgsE","bytes":148736,"sha256":"eeb93cdcf85c59dfaa9f1f6fb0df8f8612055a1629815b565b5d384be8f3b9ef"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN3ink47_GLOBAL__N__0f761cec_14_pack_engine_cu_58abf99824verify_width_pack_kernelEPKfPKifiPi","bytes":1408,"sha256":"cb973d48cdb633cf68f7ffcaf28c7c837a2eee28648752a1c464ba8ac20187e3"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN3pfa19prefill_attn_kernelILi4ELi2ELi1ELi1ELi2ELb0EEEvNS_6ParamsE","bytes":142720,"sha256":"7bfb336134bca33eb93df34b78e8f5d2b4a9fc6aa7e4ddeda0dcc35365f70d05"}
+{"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN3pfa23prefill_attn_far_kernelILi4ELi2ELi1ELi1ELi2EEEvNS_6ParamsE","bytes":116608,"sha256":"0babb835daffacddaa22b70c754f8f9e675006301b2181afca7aec9c4df47e81"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN3pfa23prefill_attn_fp8_kernelILi4ELi2ELi1ELi1ELi2ELb0EEEvNS_6ParamsE","bytes":153984,"sha256":"753988b153a8f3f08195c959fb5ed0d3a075b53582031530ca039309da246a07"}
+{"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN3pfa27prefill_attn_fp8_far_kernelILi4ELi2ELi2EEEvNS_6ParamsE","bytes":128512,"sha256":"3384f8e0b326a324a6a352da59b1dbce3f7e820bfd9a8437474661302c87a4a4"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f10attn_blockEPK13__nv_bfloat16NS_4StepENS_6CacheLEiiPfS5_","bytes":27392,"sha256":"7b5ef74c37691c57abd5d7656619f83339ea48c3cb5505e6ada7c23b7f5498e6"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f10gemm_frag2ILi1ELb0ELi0ELi8EEEvNS_8GemmArgsE","bytes":13056,"sha256":"781c815fd6cd818d195939324178670363458f6c3bf32b4fabe45694b91583b0"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f10gemm_frag2ILi1ELb0ELi1ELi8EEEvNS_8GemmArgsE","bytes":12928,"sha256":"aad996385257a18fd7e47c8ba1353e0517752c796f6bfd4a627016c3150daa02"}
@@ -225,9 +227,9 @@
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f21markov_lev_scan_fusedILi8EEEvNS_6MarkovEiNS_6LevBufE","bytes":69248,"sha256":"6a97e06faed5991074cfed015f7dcd3b1ded73edf19db681283c73386483f40b"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f6k_frnnEPK13__nv_bfloat16PKfS2_PS0_","bytes":5504,"sha256":"d206c7924f2bf8d5200673d29a6a51c236eb08bb6a2467ec4235aa99bffcc565"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f7epi_ctxEPKfiiS1_Pf","bytes":3456,"sha256":"8f5b3c2d438132452df29eccca4afbe2af975b135ff0f86c67cc7f7f65040e99"}
-{"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f7epi_qkvEPKfiiNS_4StepEPK13__nv_bfloat16S5_S1_NS_6CacheLEPS3_","bytes":40192,"sha256":"1993ed716fbc17238703f0be0432189cd02ded1780755ce78b433a06bd4d1ffa"}
+{"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f7epi_qkvEPKfiiNS_4StepEPK13__nv_bfloat16S5_S1_NS_6CacheLEPS3_","bytes":48512,"sha256":"14bdedec6805dbba6f4d546abde767469fd8bfb0ee52c7cf056b70514b3cef6c"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f8epi_siluEPKfiiP13__nv_bfloat16","bytes":6784,"sha256":"9f891586c121cb4703d69d2c05a7cb3cac2286689cd2b0f37768c9b07c235230"}
-{"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f9epi_kvctxEPKfiiNS_4StepEPK13__nv_bfloat16S5_S5_S1_NS_6CachesEPKiS8_","bytes":27648,"sha256":"70ecb335e29c3074a63e816aa789716216424e5ce4b02e1fbdd6aef78eee1a14"}
+{"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f9epi_kvctxEPKfiiNS_4StepEPK13__nv_bfloat16S5_S5_S1_NS_6CachesEPKiS8_S8_","bytes":26752,"sha256":"3c6743a91f97e58331072c73bd9f750964ceb55fa98d333a623772e01d6d838b"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f9gemm_fragILi1ELb0ELi0ELi16EEEvNS_8GemmArgsE","bytes":10496,"sha256":"61f27f72a0d33e910bfea48ecf853a86292e7569bd023911258587dbf161e964"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f9gemm_fragILi1ELb0ELi0ELi8EEEvNS_8GemmArgsE","bytes":10496,"sha256":"32a70b440fe22acbdda6a38910f1f2cf9f2f5b5554abd08b614a6402c0f3673c"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_ZN3s2f9gemm_fragILi1ELb0ELi1ELi16EEEvNS_8GemmArgsE","bytes":10368,"sha256":"2f1d9fa0bdbdb3f28e8e659ac08b950ad948c9882d8b95cb5132186f9f316419"}
@@ -308,7 +310,7 @@
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN4glue17embed_norm_kernelEPKiPK13__nv_bfloat16PKfPS2_f","bytes":5504,"sha256":"76453f93bbaed5e385195d7c59196c6522a97f1200f4247422d5d2e7e4d475e2"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN4glue17rel_logits_kernelEPK13__nv_bfloat16S2_PS0_","bytes":1920,"sha256":"96274e78536c047556f6dd9bf13dbbc8283a5fe233000e249c9336ed164d9c75"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN4glue18bf16_to_f32_kernelEPK13__nv_bfloat16Pfi","bytes":384,"sha256":"716c129057e9d8a237d58e177d2df74ce10352efdd7064a55e19352c4cf7f4f9"}
-{"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN4glue18conv_commit_kernelENS_10CommitArgsE","bytes":1920,"sha256":"8e06ef1d49aab5b7fa5431bf88e4bf979088b27cad94fa3a98b4904540a99535"}
+{"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN4glue18conv_commit_kernelENS_10CommitArgsE","bytes":2048,"sha256":"a21c9f494724372341e5b4d0d1d76848e05fc1b843139693fbfcb48ba3069e8e"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN4glue18hidden_conv_kernelEPK13__nv_bfloat16PKfS2_xNS_4RowsEiS4_PS0_i","bytes":1664,"sha256":"f6542732581233eb384e99dfdc7856ca67337187247c73b2b7fb239289501278"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN4glue19kv_write_fp8_kernelEPK13__nv_bfloat16S2_PhS3_PKiiNS_4RowsE","bytes":2944,"sha256":"7664c1f0d938a2f959ad548a794336cc81b1ef8a765ccb4219286ab7a29be5f1"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN4glue19qkv_post_fp8_kernelEPK13__nv_bfloat16PKfS2_S4_PKiiS2_PS0_S7_S7_S2_S2_S2_S2_xNS_4RowsES4_S4_S2_S2_S7_S7_fPhS9_S6_i","bytes":17920,"sha256":"315e5ef1e39d1b53286bc306d17f7b1c4216459d1e2365ed9f961cf356a0fa8d"}
@@ -361,6 +363,7 @@
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue20qkv_post_rows_kernelEPK13__nv_bfloat16PKfS2_S4_PKiiPS0_S7_S2_S2_S2_S2_xN4glue4RowsES4_S4_S2_S2_fS7_S7_S6_i","bytes":23680,"sha256":"6fa68b81ed9ac1ce4ec5e792c68e556c2628f038ccbcad6cff3a30aa9ba169c5"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue20route_select9_kernelEPKfiS1_PiPf","bytes":20352,"sha256":"f8438e9e35d380d69101576aad97885998bdfca1b8cf4f86ceb70d7b3bdff349"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue20router_decode_kernelILi1EEEvPK13__nv_bfloat16S3_PKfPfPiiS7_S6_","bytes":49664,"sha256":"bf56bee2b8ba4d731db276033ae3334edd11c3d5974e8b261a7e8c073468ff3b"}
+{"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue20swa_ring_copy_kernelEPK13__nv_bfloat16S2_PS0_S3_ii","bytes":768,"sha256":"dc4d6e6c8f5ed86e518e028ea370c67f432e790f268f73fbc06d14c46fc8fcb8"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue21mg_tail_tc_dec_kernelILi1EEEvNS_4MgTcEiiii","bytes":10240,"sha256":"ba12b722848b8d32daf852964c60c69c95e3cf1d11eeed871161da522234a0e7"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue21mg_tail_tc_dec_kernelILi2EEEvNS_4MgTcEiiii","bytes":16000,"sha256":"a434b105fb90ead4a1906127288889c587eedfd08ada72fc4719f7fc2578c79c"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue21mg_tail_tc_dec_kernelILi4EEEvNS_4MgTcEiiii","bytes":27392,"sha256":"40b188f3bcd0371577853587c2ecdfa897669a5d8d8a00877e8f0e92d46a2d88"}

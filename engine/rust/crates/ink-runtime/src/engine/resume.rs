@@ -195,7 +195,7 @@ impl SlotCheckpoints for Engine {
     fn checkpoint(&mut self, slot: usize) -> Res<()> {
         self.check_slot(slot)?;
         self.between_calls("checkpoint")?;
-        let pos = self.slots.length(slot);
+        let pos = self.slots.borrow().length(slot);
         if pos == 0 {
             return Err(RuntimeError::request(format!("checkpoint of empty slot {slot}")));
         }
@@ -223,7 +223,7 @@ impl SlotCheckpoints for Engine {
         if ck.window == Window::Saved {
             self.copy_window(slot, pos, Dir::Restore)?;
         }
-        self.slots.truncate(slot, pos).rt()
+        self.slots.borrow_mut().truncate(slot, pos).rt()
     }
 }
 
@@ -278,13 +278,21 @@ mod tests {
         // checkpoint 5000: window [3977, 5000); position 3977 + 3072 = 7049 is the first that lands on a window key
         assert!(!overwrites_window(5000, 3, 7049));
         assert!(overwrites_window(5000, 3, 7050));
-        // brute force over positions: a write at w overwrites q iff w = q (mod 3072) and w > q
-        for pos in [1, 700, 1023, 1024, 1025, 2048, 3072, 5000] {
-            let mut hit = false;
-            for w in pos..pos + 8000 {
-                // the write at w lands on q = w - 3072 k, k >= 1
-                hit |= (1..=w / 3072).any(|k| (window_start(pos)..pos).contains(&(w - 3072 * k)));
-                assert_eq!(overwrites_window(pos, 3, w + 1), hit, "pos {pos} end {}", w + 1);
+        // brute force over positions: a write at w overwrites q iff w = q (mod ring * 1024) and w > q
+        for ring in [2usize, 3] {
+            let period = ring * 1024;
+            for pos in [1, 700, 1023, 1024, 1025, 2048, 3072, 5000] {
+                let mut hit = false;
+                for w in pos..pos + 8000 {
+                    // the write at w lands on q = w - period * k, k >= 1
+                    hit |= (1..=w / period).any(|k| (window_start(pos)..pos).contains(&(w - period * k)));
+                    assert_eq!(
+                        overwrites_window(pos, ring, w + 1),
+                        hit,
+                        "ring {ring} pos {pos} end {}",
+                        w + 1
+                    );
+                }
             }
         }
     }

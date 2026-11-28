@@ -100,7 +100,7 @@ impl Stop {
     }
 }
 
-/// One step's work: one decode segment per decoding session and at most one prefill segment.
+/// One step's work: one decode segment per decoding session and packed prefill chunks up to the step budget.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct StepPlan {
     /// Segments in execution order (decode segments first).

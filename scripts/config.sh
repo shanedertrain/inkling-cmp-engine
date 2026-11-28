@@ -12,6 +12,8 @@ _ENV_HF_CACHE="${HF_CACHE-}"
 _ENV_SLOTS="${SLOTS-}"
 _ENV_MAX_RUNNING="${MAX_RUNNING-}"
 _ENV_PAGES="${PAGES-}"
+_ENV_CHUNK="${CHUNK-}"
+_ENV_LOOKUP="${LOOKUP-}"
 _ENV_KV_FP8="${KV_FP8-}"
 _ENV_DCTX="${DCTX-}"
 _ENV_CPUS="${CPUS-}"
@@ -33,6 +35,8 @@ fi
 [ -n "$_ENV_SLOTS" ]       && SLOTS="$_ENV_SLOTS"
 [ -n "$_ENV_MAX_RUNNING" ] && MAX_RUNNING="$_ENV_MAX_RUNNING"
 [ -n "$_ENV_PAGES" ]       && PAGES="$_ENV_PAGES"
+[ -n "$_ENV_CHUNK" ]       && CHUNK="$_ENV_CHUNK"
+[ -n "$_ENV_LOOKUP" ]      && LOOKUP="$_ENV_LOOKUP"
 [ -n "$_ENV_KV_FP8" ]      && KV_FP8="$_ENV_KV_FP8"
 [ -n "$_ENV_DCTX" ]        && DCTX="$_ENV_DCTX"
 [ -n "$_ENV_CPUS" ]        && CPUS="$_ENV_CPUS"
@@ -56,18 +60,20 @@ CFG_DIR="${CFG_DIR:-$BUILD_DIR/cfg}"
 SLOTS="${SLOTS:-8}"
 MAX_RUNNING="${MAX_RUNNING:-8}"
 KV_FP8="${KV_FP8:-0}"
+CHUNK="${CHUNK:-8192}"
+LOOKUP="${LOOKUP:-8}"
 if [ -z "${PAGES:-}" ]; then
   if [ "$KV_FP8" = "1" ]; then
-    PAGES=1008
+    PAGES=1728
   else
-    PAGES=504
+    PAGES=960
   fi
 fi
-DCTX="${DCTX:-102400}"
+DCTX="${DCTX:-262144}"
 CPUS="${CPUS:-6}"
 DFLASH2_DIR="${DFLASH2_DIR:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
-IMAGE="${IMAGE:-inkling-cmp-engine:v1.0.0}"
+IMAGE="${IMAGE:-inkling-cmp-engine:v1.3.0}"
 CUDA_IMAGE="${CUDA_IMAGE:-nvidia/cuda:13.0.0-devel-ubuntu24.04}"
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-ink-engine-g}"

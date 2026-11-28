@@ -73,10 +73,8 @@ struct Cli {
     allow_dirty: bool,
 }
 
-/// Rows of the x scratch: the largest timed M times the largest K (4,608 = 2H).
-const X_ELEMS: usize = 2048 * 2 * H;
-/// Elements of the out scratch (fp32): the C++ `logits_` (64 logit rows x VOCAB_PAD).
-const OUT_F32: usize = 64 * VOCAB_PAD;
+/// Minimum scratch floor for x and out (scaled up dynamically when `--prefill-m > 2048` or `--logit-rows > 64`).
+const _TUNE_SCRATCH_NOTE: () = ();
 
 /// One `--split-k` override.
 struct SplitK {
@@ -239,14 +237,17 @@ fn main() -> Result<()> {
         a.uuid
     );
     let st = ctx.new_stream()?;
+    let max_m = usize::try_from(a.prefill_m.max(a.tune_m))?;
+    let x_elems = max_m.max(2048) * 2 * H;
+    let out_f32 = (usize::try_from(a.logit_rows)?.max(64) * VOCAB_PAD).max(max_m.max(2048) * 3072);
     let mut arena = Arena::new(
         &ctx,
         &st,
-        WEIGHTS_BYTES_ESTIMATE + 2 * X_ELEMS + 4 * OUT_F32 + (64 << 20),
+        WEIGHTS_BYTES_ESTIMATE + 2 * x_elems + 4 * out_f32 + (64 << 20),
     )?;
     let w = Weights::load(&mut arena, &st, &a.model, a.threads)?;
-    let x = arena.take::<u8>(2 * X_ELEMS, "tune x")?;
-    let out = arena.take::<u8>(4 * OUT_F32, "tune out")?;
+    let x = arena.take::<u8>(2 * x_elems, "tune x")?;
+    let out = arena.take::<u8>(4 * out_f32, "tune out")?;
     st.memset_zero(&x)?;
     st.memset_zero(&out)?;
     st.synchronize()?;

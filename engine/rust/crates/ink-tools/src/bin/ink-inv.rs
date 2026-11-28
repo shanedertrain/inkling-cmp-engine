@@ -738,6 +738,70 @@ impl Inv<'_> {
         Ok(())
     }
 
+    /// `multi_prefill_vs_single`: packing 8 concurrent prompts of mixed lengths (including `<= 16`, `17..=128` and
+    /// `> 128` rows) into ONE forward call must match prefilling each prompt alone bit for bit on every prompt's
+    /// last-row logits and on the decode steps that follow.
+    fn multi_prefill_vs_single(&mut self, raw: &[i32]) -> Result<()> {
+        const LENS: [usize; 8] = [12, 37, 64, 65, 130, 210, 48, 96];
+        const OFFS: [usize; 8] = [0, 200, 400, 600, 800, 1100, 1500, 1700];
+        let mut solo_last = Vec::with_capacity(8);
+        let mut solo_dec = Vec::with_capacity(8);
+        for (i, (&off, &len)) in OFFS.iter().zip(&LENS).enumerate() {
+            ensure!(
+                raw.len() >= off + len + 2,
+                "raw stream too short for multi_prefill_vs_single slot {i}"
+            );
+            let ids = &raw[off..off + len + 2];
+            self.rt.reset_slot(0)?;
+            let last = self.extend(0, &ids[..len], 2048)?;
+            let dec = self.decode_rows(0, &ids[len..len + 2])?;
+            solo_last.push(last);
+            solo_dec.push(dec);
+        }
+        // Pack all 8 prompts into a single forward call (slots 0..8).
+        for slot in 0..8 {
+            self.rt.reset_slot(slot)?;
+        }
+        let segs: Vec<SegIn<'_>> = (0..8)
+            .map(|i| SegIn {
+                slot: i,
+                ids: &raw[OFFS[i]..OFFS[i] + LENS[i]],
+                logits: 1,
+            })
+            .collect();
+        let n = self.rt.forward(&segs)?;
+        ensure!(n == 8, "multi_prefill_vs_single returned {n} logit rows, expected 8");
+        let mut lg = Vec::new();
+        self.rt.logits_host(n, &mut lg)?;
+        let kept: Vec<u32> = LENS.iter().map(|&l| u32::try_from(l)).collect::<Result<_, _>>()?;
+        self.rt.commit(&kept)?;
+        for (i, last) in solo_last.iter().enumerate() {
+            self.report(&format!("multi_prefill8_last_s{i}"), 0, last, &row(&lg, i)[..VOCAB])?;
+        }
+        // Follow with 2 batched decode steps across all 8 slots to verify KV/conv state of every packed slot.
+        for step in 0..2 {
+            let dsegs: Vec<SegIn<'_>> = (0..8)
+                .map(|i| SegIn {
+                    slot: i,
+                    ids: &raw[OFFS[i] + LENS[i] + step..OFFS[i] + LENS[i] + step + 1],
+                    logits: 1,
+                })
+                .collect();
+            let dn = self.rt.forward(&dsegs)?;
+            self.rt.logits_host(dn, &mut lg)?;
+            self.rt.commit(&[1; 8])?;
+            for (i, dec) in solo_dec.iter().enumerate() {
+                self.report(
+                    &format!("multi_prefill8_dec_s{i}"),
+                    step,
+                    &dec[step],
+                    &row(&lg, i)[..VOCAB],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Last logit row of `ids` prefilled in `chunk`-row calls in `slot`.
     fn last_row(&mut self, slot: usize, ids: &[i32], chunk: usize) -> Result<Vec<f32>> {
         let p = prefill(self.rt, slot, ids, chunk, true)?;
@@ -833,6 +897,17 @@ fn main() -> Result<()> {
         let a12 = t.last_row(0, &ids12, 2048)?;
         let b12 = t.last_row(3, &ids12, 8192)?;
         t.report("chunk8192_slot3_vs_2048", 0, &a12, &b12)?;
+        if cli.max_chunk >= 12_288 {
+            // 16,000 tokens: chunks 12,288 + 3,712 vs 2,048 x 7 + 1,664
+            let ids16 = by_id
+                .get("tf-agent-120k")
+                .filter(|p| p.len() >= 16_000)
+                .context("tf-agent-120k for the 12,288-chunk test")?[..16_000]
+                .to_vec();
+            let a16 = t.last_row(0, &ids16, 2048)?;
+            let b16 = t.last_row(4, &ids16, 12_288)?;
+            t.report("chunk12288_slot4_vs_2048", 0, &a16, &b16)?;
+        }
     }
     // verify rows == one-row decode rows (F1): page / window / ring boundaries, then the agent prompts
     let raw = by_id
@@ -851,6 +926,7 @@ fn main() -> Result<()> {
     // verify calls of one graph key with other widths and row bounds: replayed == eager
     t.verify_layouts(graphs)?;
     // small prefill calls (row-class invariance): alone and mixed on every runtime, resumed with slot checkpoints
+    t.multi_prefill_vs_single(raw)?;
     let junk: Vec<i32> = raw.iter().chain(raw.iter()).rev().copied().collect();
     let resumable = t.rt.checkpoints().is_some();
     for s in SMALL_CHUNKS {

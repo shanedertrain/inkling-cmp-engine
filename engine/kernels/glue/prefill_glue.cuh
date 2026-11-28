@@ -3415,4 +3415,20 @@ __global__ void __launch_bounds__(kConvThreads) moe_combine_conv_kernel(
   }
 }
 
+// Copy trailing SWA window tokens [tok_lo, tok_lo + ntok) across all 8 KV heads for both K and V from a shared
+// scratch page into a slot's persistent 2-page SWA ring. 16-byte coalesced uint4 copies: 16 threads/row (128 bf16),
+// 8 rows/CTA (block 128), grid (ceil(ntok / 8), 8, 2) where blockIdx.y = kv head, blockIdx.z = 0(K) / 1(V).
+__global__ void __launch_bounds__(128) swa_ring_copy_kernel(
+    const bf16* __restrict__ k_src_page, const bf16* __restrict__ v_src_page,
+    bf16* __restrict__ k_dst_page, bf16* __restrict__ v_dst_page, int tok_lo, int ntok) {
+  const int t_rel = blockIdx.x * 8 + (threadIdx.x >> 4);
+  if (t_rel >= ntok) return;
+  const int h = blockIdx.y;
+  const int c8 = threadIdx.x & 15;
+  const size_t off = (((size_t)h * 1024 + (size_t)(tok_lo + t_rel)) * glue::HD) + (size_t)c8 * 8;
+  const bf16* src = blockIdx.z == 0 ? k_src_page : v_src_page;
+  bf16* dst = blockIdx.z == 0 ? k_dst_page : v_dst_page;
+  *reinterpret_cast<uint4*>(dst + off) = *reinterpret_cast<const uint4*>(src + off);
+}
+
 }  // namespace pglue
