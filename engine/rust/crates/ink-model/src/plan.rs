@@ -350,7 +350,7 @@ impl<A: Alloc> Activations<A> {
         let da_nrows = ar.take::<i32>(s, "da nrows")?;
         let hrows = ar.take::<Bf16>(c.logit_rows_max * H, "hrows")?;
         let feats = ar.take::<Bf16>(t * 4 * H, "dspark feats")?;
-        let rlog = ar.take::<f32>(3 * t * NEXP, "router group logits")?;
+        let rlog = ar.take::<f32>((3 * t * NEXP).max(9 * 128 * NEXP), "router group logits")?;
         let amax = ar.take::<i32>(c.logit_rows_max, "argmax rows")?;
         let logits = ar.take::<f32>(c.logit_rows_max * VOCAB_PAD, "logits")?;
         Ok(Activations {

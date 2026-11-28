@@ -55,7 +55,7 @@ pub(super) struct Fwd<'e> {
 /// Calls above this many rows take the bit-identical prefill glue kernels (`pglue`: warp-per-row AttnRes and norms,
 /// row-tiled convs), as the C++ `T > 64` (same bits either way: ink-inv `small_chunk_*`). The bit-changing tensor-core
 /// gate tail is chosen by row class instead (`message_gates`).
-const PGLUE_ROWS: usize = 64;
+const PGLUE_ROWS: usize = 128;
 
 fn class(dec: bool) -> PlanClass {
     if dec { PlanClass::Decode } else { PlanClass::Mixed }
@@ -344,7 +344,7 @@ impl Fwd<'_> {
             if grp.dec {
                 let mut off = 0;
                 while off < grp.n {
-                    let chunk = (grp.n - off).min(64);
+                    let chunk = (grp.n - off).min(128);
                     let r0 = grp.r0 + off;
                     let bufs: Vec<(DevBuf<Bf16>, DevBuf<Bf16>)> = (0..g)
                         .map(|y| Ok((at(&a.gin, y * gi + r0 * 2 * H)?, at(&a.gd, y * go + r0 * GATE_RANK)?)))
@@ -599,7 +599,7 @@ impl Fwd<'_> {
                 if grp.dec {
                     let mut off = 0;
                     while off < grp.n {
-                        let chunk = (grp.n - off).min(64);
+                        let chunk = (grp.n - off).min(128);
                         let r0 = grp.r0 + off;
                         self.dev
                             .router_decode(
@@ -1263,7 +1263,7 @@ impl Fwd<'_> {
         self.tap(None, "emb", &a.hid[0], TapType::Bf16, &[t, H])?;
         let (mut cur, mut nb, mut v) = (0usize, 0usize, 0usize);
         let mut hin = Hin::Hid(0);
-        let use_vmsgs = !self.reference && self.tap.is_none() && t > PGLUE_ROWS;
+        let use_vmsgs = !self.reference && self.tap.is_none() && t > 64;
         let run_visit = |f: &mut Self,
                          msgs: bool,
                          vmsg_i: Option<usize>,

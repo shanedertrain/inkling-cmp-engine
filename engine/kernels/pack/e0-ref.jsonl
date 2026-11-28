@@ -1,4 +1,4 @@
-{"format":"ink-e0-sass/1","source":"pack","cubins":2,"kernels":388}
+{"format":"ink-e0-sass/1","source":"pack","cubins":2,"kernels":390}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_Z11k_copy_colsPK13__nv_bfloat16iiiPS_i","bytes":2432,"sha256":"4cee105275703c6f438f98f9a016eb5a15c90c107bae9a2b8b4840b42ac684e0"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_Z11k_fill_bf16P13__nv_bfloat16mmf","bytes":2816,"sha256":"cc3ea8562fdf67716996a78a229827ba21e6802e8c793300332a7a2d8ac66e6d"}
 {"cubin":"pack_drafter.cubin","arch":"?","kernel":"_Z11k_fill_e4m3Phmm","bytes":3712,"sha256":"e8c55a93b9d56c0846c0f9c5fed8e06d435ea39ee5ffaca5dcd6ab9a93ebc2e5"}
@@ -348,6 +348,7 @@
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue18mg_down_dec_kernelILi1EEEvNS_6MgDownEi","bytes":17408,"sha256":"0c1a4c27f7a17260c79e62e90271d6a0c0eb968fe8051860783064dd64f1054a"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue18mg_down_dec_kernelILi2EEEvNS_6MgDownEi","bytes":17536,"sha256":"c58864ab7e664184fc46dddbfcc938e51482acb682e1bcccf102323b33037217"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue18mg_down_dec_kernelILi4EEEvNS_6MgDownEi","bytes":18304,"sha256":"c634e7ec5c929df84fab28c4deded78e410441785f97e6faafbfecf9628706e9"}
+{"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue18mg_down_dec_kernelILi8EEEvNS_6MgDownEi","bytes":20096,"sha256":"5fdc59f082be55866735938c2faf44a0b825c90fd31bb40bc64313df181da881"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue18moe_scatter_kernelEPKiPKfiS1_PiS4_S4_Pf","bytes":2688,"sha256":"db346ac476c2e3d83c092b8a4b1f956e795ba1dc055c317ac91813c6852662f3"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue18relk_direct_kernelEPK13__nv_bfloat16S2_PKiiPS0_S5_","bytes":6912,"sha256":"396b67a8035df620924bd420d70b73681cf4aa9e9e95991d760428c083255469"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue19ar_norm_rows_kernelILi1EEEvN4glue6ResSrcEPKfS4_S4_S4_P13__nv_bfloat16S6_S6_fi","bytes":98304,"sha256":"d52eeb9e64914d633aa76246a2e94473405e7fe2d86edcd8321cedacd7924a76"}
@@ -374,6 +375,7 @@
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue22router_gemm_dec_kernelILi1EEEvPK13__nv_bfloat16S3_Pfi","bytes":14080,"sha256":"55e9c16b1345f2beb5f1d3ea58b060d0b67c20bdf897e1252a1f5f0471b34d15"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue22router_gemm_dec_kernelILi2EEEvPK13__nv_bfloat16S3_Pfi","bytes":14592,"sha256":"ada6343780d1a4de981134a7136e9923c0e065810c3f4beff82420074da9c535"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue22router_gemm_dec_kernelILi4EEEvPK13__nv_bfloat16S3_Pfi","bytes":15360,"sha256":"5c7f60f04ddcb3ae089a9fc731657c92f2810a6e0aa98fd6802a8dd948b7dd41"}
+{"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue22router_gemm_dec_kernelILi8EEEvPK13__nv_bfloat16S3_Pfi","bytes":17024,"sha256":"0d3a608360fa75fcd9d1ef550396cec756e43bf22d9e426defce95edf90414d9"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue23moe_combine_conv_kernelEPK13__nv_bfloat16PKfS2_xN4glue4RowsEPKiiS4_PS0_S9_","bytes":8960,"sha256":"0567c3817436d5f0251872aa845507ad870cb0da34784b2e72ce780f0726481f"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue23moe_scatter_fast_kernelEPKiPKfiS1_PiS4_S4_Pf","bytes":3200,"sha256":"562305a92213bc7099ab0c293ff63da91fb6afbea5e3b46faa1e0eaec7f96708"}
 {"cubin":"pack_engine.cubin","arch":"?","kernel":"_ZN5pglue24qkv_post_rows_fp8_kernelEPK13__nv_bfloat16PKfS2_S4_PKiiPS0_S7_S2_S2_S2_S2_xN4glue4RowsES4_S4_S2_S2_fPhSA_S6_i","bytes":31872,"sha256":"fc93bac6d5d8d46841d579fc8688ee80b984b8285237321cf6512add0ce33cad"}

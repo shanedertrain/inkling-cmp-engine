@@ -351,7 +351,7 @@ fn engine_backend(cli: &Cli) -> Result<(EngineBackend, Source)> {
         gemm_algos,
         max_slots: cli.slots,
         num_pages: cli.kv_pages,
-        t_max: max_chunk + 64,
+        t_max: max_chunk + 128,
         max_chunk,
         graphs: Graphs::On,
         graph_mem: cli.graph_mem_mib << 20,

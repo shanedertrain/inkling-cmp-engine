@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "ink-api"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "axum",
  "futures-core",
@@ -735,14 +735,14 @@ dependencies = [
 
 [[package]]
 name = "ink-backend"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "ink-cuda"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "ink-kernels"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "bytemuck",
  "ink-cuda",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "ink-model"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "bytemuck",
  "half",
@@ -780,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "ink-parse"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "ink-text",
  "serde_json",
@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "ink-record"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -798,14 +798,14 @@ dependencies = [
 
 [[package]]
 name = "ink-rt-api"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "ink-record",
 ]
 
 [[package]]
 name = "ink-runtime"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "bytemuck",
  "ink-backend",
@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "ink-sched"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "ink-backend",
  "proptest",
@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "ink-server"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "ink-text"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "serde_json",
  "tokenizers",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "ink-tools"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2146,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "cpp_demangle",

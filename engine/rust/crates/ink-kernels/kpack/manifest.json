@@ -1,6 +1,6 @@
 {
  "format": "ink-kpack-manifest/1",
- "kpack_id": "6591b3fdcf8e660a021a28444ab15090d1f98d7cca5c74c6bc09409b2c249c45",
+ "kpack_id": "8c5c60dd42eeb1fc6ba7b1aa26efab1941022039b8910f5ec575b7155717355e",
  "nvcc": "Cuda compilation tools, release 13.3, V13.3.73",
  "flags": "-O3 -lineinfo -Xptxas -warn-spills -O3 -DNDEBUG -std=c++20 -gencode arch=compute_80,code=sm_80",
  "layout_sha256": "2853716509283f4e8bc545bc5938227f276bf8861b3a1d348872ad856c67708d",
@@ -63,7 +63,7 @@
   },
   {
    "path": "engine/kernels/pack/keys.toml",
-   "sha256": "47ff5244c679550165cff4dfd07584960ce05bd375ef9691ec1e40440b8b682f"
+   "sha256": "37871bc3007255196c99b23de2f73b34c3dea469579fa13abd55fbeb108041fc"
   },
   {
    "path": "engine/kernels/pack/layout_emit.cpp",
@@ -102,9 +102,9 @@
   {
    "tu": "engine",
    "file": "pack_engine.cubin",
-   "bytes": 25172768,
-   "sha256": "9528aa194273151a49f266f5a2f72f1aa94d263980305459598f1977a747544f",
-   "keys": 181
+   "bytes": 25290528,
+   "sha256": "91fb4eb3f132d2f78c70a10fc07599b4b91934e4f01596b69fba1cb7ef448d4c",
+   "keys": 183
   },
   {
    "tu": "drafter",

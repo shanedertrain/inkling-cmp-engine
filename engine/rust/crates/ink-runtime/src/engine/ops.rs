@@ -525,7 +525,7 @@ impl Dev<'_> {
         // SAFETY: block (t, y) runs 288 threads (8 consecutive elems/thread) over row(s) with 16-byte ld8/st8; extents checked by gate_in.
         unsafe {
             let has_last16 = bytemuck::bytes_of(&s.last16).iter().any(|&x| x != 0);
-            if t > 64 && q == 4 && g == 0 && s.nb == 1 && has_last16 {
+            if t > 128 && q == 4 && g == 0 && s.nb == 1 && has_last16 {
                 self.k.pglue_ar288_msgs_rows_kernel(
                     self.st,
                     cfg([t, 1, 1], 288, 0),
@@ -537,7 +537,7 @@ impl Dev<'_> {
                         T: i(t),
                     },
                 )
-            } else if t > 64 && q == 1 && g == 3 && !qsel {
+            } else if t > 128 && q == 1 && g == 3 && !qsel {
                 self.k.pglue_ar288_g3_shared_rows_kernel(
                     self.st,
                     cfg([t, 1, 1], 288, 0),
@@ -550,7 +550,7 @@ impl Dev<'_> {
                         T: i(t),
                     },
                 )
-            } else if t > 64 && q == 3 && g == 3 && qsel {
+            } else if t > 128 && q == 3 && g == 3 && qsel {
                 self.k.pglue_ar288_q3g3_rows_kernel(
                     self.st,
                     cfg([t, 1, 1], 288, 0),
@@ -708,7 +708,7 @@ impl Dev<'_> {
         }
         // SAFETY: block runs 288 threads over row(s), writes RMSNorm output o[q][t] (all extents checked).
         unsafe {
-            if t > 64 && q == 3 {
+            if t > 128 && q == 3 {
                 self.k.pglue_ar_norm288_rows_kernel_3(
                     self.st,
                     cfg([t, 1, 1], 288, 0),
@@ -776,7 +776,7 @@ impl Dev<'_> {
         // SAFETY: block runs 288 threads (8 channels/thread), computes conv(ax) + partial (+ blk_out if bstart),
         // runs AttnRes over s.blk[0..nb_prev] + hin(if bstart) + partial, and writes RMSNorm to xm_out[t] (all checked).
         unsafe {
-            if t > 64 {
+            if t > 128 {
                 self.k.pglue_conv_ar_norm288_rows_kernel(
                     self.st,
                     cfg([t.div_ceil(CONV_AR_ROWS), 1, 1], 288, 0),
@@ -851,7 +851,7 @@ impl Dev<'_> {
         let gi = gate_in(1, 1, t, query, ar_out, Some(gates))?;
         // SAFETY: block runs 288 threads, writes partial (+ blk_out if bstart), ar_out[t], and gate 0's gin[t] (all checked).
         unsafe {
-            if t > 64 {
+            if t > 128 {
                 self.k.pglue_conv_ar_gate288_rows_kernel(
                     self.st,
                     cfg([t.div_ceil(CONV_AR_ROWS), 1, 1], 288, 0),
@@ -1605,13 +1605,13 @@ impl Dev<'_> {
         }
     }
 
-    /// `pglue::mg_down_dec_kernel<MT><<<(4, 18, G), 256>>>`: fused decode gate-down projection for all G gates (n <= 64).
+    /// `pglue::mg_down_dec_kernel<MT><<<(4, 18, G), 256>>>`: fused decode gate-down projection for all G gates (n <= 128).
     pub fn mg_down_dec(&self, n: usize, gates: &[MgDownGate<'_>], ws: &DevBuf<f32>, cnt: &DevBuf<i32>) -> Result<()> {
         let g = gates.len();
-        if n == 0 || n > 64 || g == 0 || g > 4 {
+        if n == 0 || n > 128 || g == 0 || g > 4 {
             return Err(CudaError::Bounds {
                 what: "mg_down_dec",
-                detail: format!("{n} rows (1..=64), G = {g}"),
+                detail: format!("{n} rows (1..=128), G = {g}"),
             });
         }
         need(ws, g * 18 * n * MG_RANK, "mg_down_dec ws")?;
@@ -1636,9 +1636,12 @@ impl Dev<'_> {
             } else if n <= 32 {
                 self.k
                     .pglue_mg_down_dec_kernel_2(self.st, c, PglueMgDownDecKernel2Args { m, M: i(n) })
-            } else {
+            } else if n <= 64 {
                 self.k
                     .pglue_mg_down_dec_kernel_4(self.st, c, PglueMgDownDecKernel4Args { m, M: i(n) })
+            } else {
+                self.k
+                    .pglue_mg_down_dec_kernel_8(self.st, c, PglueMgDownDecKernel8Args { m, M: i(n) })
             }
         }
     }
@@ -2594,10 +2597,10 @@ impl Dev<'_> {
         idx: &DevBuf<i32>,
         wts: &DevBuf<f32>,
     ) -> Result<()> {
-        if m == 0 || m > 64 {
+        if m == 0 || m > 128 {
             return Err(CudaError::Bounds {
                 what: "router_decode",
-                detail: format!("{m} rows (1..=64)"),
+                detail: format!("{m} rows (1..=128)"),
             });
         }
         need(x, m * H, "router_decode x")?;
@@ -2650,11 +2653,22 @@ impl Dev<'_> {
                             M: i(m),
                         },
                     )?;
-                } else {
+                } else if m <= 64 {
                     self.k.pglue_router_gemm_dec_kernel_4(
                         self.st,
                         c,
                         PglueRouterGemmDecKernel4Args {
+                            x: b(x),
+                            wr: b(wr),
+                            rlog: b(rlog),
+                            M: i(m),
+                        },
+                    )?;
+                } else {
+                    self.k.pglue_router_gemm_dec_kernel_8(
+                        self.st,
+                        c,
+                        PglueRouterGemmDecKernel8Args {
                             x: b(x),
                             wr: b(wr),
                             rlog: b(rlog),
@@ -2692,7 +2706,7 @@ impl Dev<'_> {
         need(wts, t * TOPK, "rw")?;
         // SAFETY: sums the three K-group logits of row t ([3][T][128]), writes TOPK entries (checked).
         unsafe {
-            if t > 64 {
+            if t > 128 {
                 self.k.pglue_route_select_rows_kernel(
                     self.st,
                     cfg([t.div_ceil(4), 1, 1], 128, 0),

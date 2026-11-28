@@ -8,7 +8,7 @@ use ink_cuda::{Bf16, DevPtr, KernelArgs, LaunchCfg, Result, Stream};
 use crate::{CubinInfo, F16, KernelInfo, Kernels, Ptr, push_ptr};
 
 /// Id of the kernel pack this file was generated from (`manifest.json` `kpack_id`).
-pub const KPACK_ID: &str = "6591b3fdcf8e660a021a28444ab15090d1f98d7cca5c74c6bc09409b2c249c45";
+pub const KPACK_ID: &str = "8c5c60dd42eeb1fc6ba7b1aa26efab1941022039b8910f5ec575b7155717355e";
 
 /// FNV-1a 64 of the generator's sources (`xtask/src/kernels/`), checked by `check_fresh.py`: a gen.rs written
 /// by another generator version is stale even when the pack is not.
@@ -19,9 +19,9 @@ pub const CUBINS: [CubinInfo; 2] = [
     CubinInfo {
         tu: "engine",
         file: "pack_engine.cubin",
-        bytes: 25172768,
-        sha256: "9528aa194273151a49f266f5a2f72f1aa94d263980305459598f1977a747544f",
-        fnv1a64: 0x057b7f263473fb07,
+        bytes: 25290528,
+        sha256: "91fb4eb3f132d2f78c70a10fc07599b4b91934e4f01596b69fba1cb7ef448d4c",
+        fnv1a64: 0x306a2d05d8d4e151,
     },
     CubinInfo {
         tu: "drafter",
@@ -315,6 +315,8 @@ pub enum KernelId {
     PglueMgDownDecKernel2,
     /// `void pglue::mg_down_dec_kernel<4>(pglue::MgDown, int)`
     PglueMgDownDecKernel4,
+    /// `void pglue::mg_down_dec_kernel<8>(pglue::MgDown, int)`
+    PglueMgDownDecKernel8,
     /// `pglue::mg_tail_rows_kernel(glue::MgTail, int, int, int, int)`
     PglueMgTailRowsKernel,
     /// `void pglue::mg_tail_tc_dec_kernel<1>(pglue::MgTc, int, int, int, int)`
@@ -373,6 +375,8 @@ pub enum KernelId {
     PglueRouterGemmDecKernel2,
     /// `void pglue::router_gemm_dec_kernel<4>(__nv_bfloat16 const*, __nv_bfloat16 const*, float*, int)`
     PglueRouterGemmDecKernel4,
+    /// `void pglue::router_gemm_dec_kernel<8>(__nv_bfloat16 const*, __nv_bfloat16 const*, float*, int)`
+    PglueRouterGemmDecKernel8,
     /// `pmoe::moe_combine(__nv_bfloat16 const*, __nv_bfloat16*, int)`
     PmoeMoeCombine,
     /// `void pmoe::moe_gemm2<1, 0, 3, 8, 0>(pmoe::Params)`
@@ -814,7 +818,7 @@ pub enum KernelId {
 }
 
 /// Kernel table, in [`KernelId`] order.
-pub static KERNELS: [KernelInfo; 388] = [
+pub static KERNELS: [KernelInfo; 390] = [
     KernelInfo {
         key: "da_combine_kernel",
         tu: 0,
@@ -2345,6 +2349,14 @@ pub static KERNELS: [KernelInfo; 388] = [
         coop: false,
     },
     KernelInfo {
+        key: "pglue_mg_down_dec_kernel_8",
+        tu: 0,
+        symbol: "_ZN5pglue18mg_down_dec_kernelILi8EEEvNS_6MgDownEi",
+        params: &["pglue::MgDown", "int"],
+        param_bytes: 116,
+        coop: false,
+    },
+    KernelInfo {
         key: "pglue_mg_tail_rows_kernel",
         tu: 0,
         symbol: "_ZN5pglue19mg_tail_rows_kernelEN4glue6MgTailEiiii",
@@ -2724,6 +2736,14 @@ pub static KERNELS: [KernelInfo; 388] = [
         key: "pglue_router_gemm_dec_kernel_4",
         tu: 0,
         symbol: "_ZN5pglue22router_gemm_dec_kernelILi4EEEvPK13__nv_bfloat16S3_Pfi",
+        params: &["__nv_bfloat16 const*", "__nv_bfloat16 const*", "float*", "int"],
+        param_bytes: 28,
+        coop: false,
+    },
+    KernelInfo {
+        key: "pglue_router_gemm_dec_kernel_8",
+        tu: 0,
+        symbol: "_ZN5pglue22router_gemm_dec_kernelILi8EEEvPK13__nv_bfloat16S3_Pfi",
         params: &["__nv_bfloat16 const*", "__nv_bfloat16 const*", "float*", "int"],
         param_bytes: 28,
         coop: false,
@@ -8591,6 +8611,14 @@ pub struct PglueMgDownDecKernel4Args {
     pub M: i32,
 }
 
+/// Arguments of [`Kernels::pglue_mg_down_dec_kernel_8`] by C++ parameter name (`void pglue::mg_down_dec_kernel<8>(pglue::MgDown, int)`).
+pub struct PglueMgDownDecKernel8Args {
+    /// `pglue::MgDown`
+    pub m: pglue::MgDown,
+    /// `int`
+    pub M: i32,
+}
+
 /// Arguments of [`Kernels::pglue_mg_tail_rows_kernel`] by C++ parameter name (`pglue::mg_tail_rows_kernel(glue::MgTail, int, int, int, int)`).
 pub struct PglueMgTailRowsKernelArgs {
     /// `glue::MgTail`
@@ -9145,6 +9173,18 @@ pub struct PglueRouterGemmDecKernel2Args<'a> {
 
 /// Arguments of [`Kernels::pglue_router_gemm_dec_kernel_4`] by C++ parameter name (`void pglue::router_gemm_dec_kernel<4>(__nv_bfloat16 const*, __nv_bfloat16 const*, float*, int)`).
 pub struct PglueRouterGemmDecKernel4Args<'a> {
+    /// `__nv_bfloat16 const*`
+    pub x: Ptr<'a, Bf16>,
+    /// `__nv_bfloat16 const*`
+    pub wr: Ptr<'a, Bf16>,
+    /// `float*`
+    pub rlog: Ptr<'a, f32>,
+    /// `int`
+    pub M: i32,
+}
+
+/// Arguments of [`Kernels::pglue_router_gemm_dec_kernel_8`] by C++ parameter name (`void pglue::router_gemm_dec_kernel<8>(__nv_bfloat16 const*, __nv_bfloat16 const*, float*, int)`).
+pub struct PglueRouterGemmDecKernel8Args<'a> {
     /// `__nv_bfloat16 const*`
     pub x: Ptr<'a, Bf16>,
     /// `__nv_bfloat16 const*`
@@ -13842,6 +13882,30 @@ impl Kernels {
         unsafe { stream.launch(self.function(KernelId::PglueMgDownDecKernel4), cfg, &mut args) }
     }
 
+    /// `void pglue::mg_down_dec_kernel<8>(pglue::MgDown, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_mg_down_dec_kernel_8(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueMgDownDecKernel8Args,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        args.value(&a.m);
+        args.value(&a.M);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueMgDownDecKernel8), cfg, &mut args) }
+    }
+
     /// `pglue::mg_tail_rows_kernel(glue::MgTail, int, int, int, int)` in `pack_engine.cubin`.
     ///
     /// # Safety
@@ -14702,6 +14766,32 @@ impl Kernels {
         // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
         // the kernel's memory contract is the caller's (# Safety).
         unsafe { stream.launch(self.function(KernelId::PglueRouterGemmDecKernel4), cfg, &mut args) }
+    }
+
+    /// `void pglue::router_gemm_dec_kernel<8>(__nv_bfloat16 const*, __nv_bfloat16 const*, float*, int)` in `pack_engine.cubin`.
+    ///
+    /// # Safety
+    ///
+    /// The kernel's memory contract holds for these arguments and `cfg` (crate docs, "Safety of the launchers").
+    ///
+    /// # Errors
+    ///
+    /// The driver error of the launch.
+    pub unsafe fn pglue_router_gemm_dec_kernel_8(
+        &self,
+        stream: &Stream,
+        cfg: LaunchCfg,
+        a: PglueRouterGemmDecKernel8Args<'_>,
+    ) -> Result<()> {
+        let mut args = KernelArgs::new();
+        push_ptr(&mut args, a.x);
+        push_ptr(&mut args, a.wr);
+        push_ptr(&mut args, a.rlog);
+        args.value(&a.M);
+        // SAFETY: the arguments match the kernel's parameter list in count, order, size and type (generated
+        // from its C++ signature; offsets and sizes checked against nvcc's KPARAM_INFO by xtask gen-kernels);
+        // the kernel's memory contract is the caller's (# Safety).
+        unsafe { stream.launch(self.function(KernelId::PglueRouterGemmDecKernel8), cfg, &mut args) }
     }
 
     /// `pmoe::moe_combine(__nv_bfloat16 const*, __nv_bfloat16*, int)` in `pack_engine.cubin`.
