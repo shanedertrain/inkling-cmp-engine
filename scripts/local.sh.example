@@ -26,7 +26,8 @@ KV_FP8=0
 DCTX=262144
 CPUS=6
 
-# Opt-in: path to incoai/Inkling-2-Mini-DFlash2 checkpoint directory (replaces DSpark).
+# Opt-in: path to Inkling-2-Mini-DFlash2-Global-L13 (https://huggingface.co/cambash23/Inkling-2-Mini-DFlash2-Global-L13)
+# or incoai/Inkling-2-Mini-DFlash2 checkpoint directory (replaces DSpark).
 # DFLASH2_DIR=""
 
 # Extra flags passed verbatim to ink-server (e.g. "--lookup 0").

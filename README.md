@@ -49,7 +49,7 @@ Serve Thinking Machines Lab's **[Inkling-2-Mini](https://huggingface.co/thinking
 ## Performance
 
 Measured on **1× NVIDIA CMP 170HX** (`6D` vBIOS: 1,728 MHz HBM, and `67` vBIOS: 1,458 MHz HBM) across three reference regimes:
-1. **`180 W` apples-to-apples head-to-head (`v1.3.0`)** on the exact same `6D` and `67` cards back-to-back against [`snailbrainx/inkling-2-mini-sm80 v3`](https://github.com/snailbrainx/inkling-2-mini-sm80) (`vLLM` + Humming + `CONV_TAIL=1`, `BATCH=12288`, `DSpark K=4`), showing both **out-of-the-box `DSpark 262K`** (`944` BF16 pages = `967K` tok) and **Stage-3 `DFlash2-Global (s3_l13)`** (`928` BF16 pages = `950K` tok).
+1. **`180 W` apples-to-apples head-to-head (`v1.3.0`)** on the exact same `6D` and `67` cards back-to-back against [`snailbrainx/inkling-2-mini-sm80 v3`](https://github.com/snailbrainx/inkling-2-mini-sm80) (`vLLM` + Humming + `CONV_TAIL=1`, `BATCH=12288`, `DSpark K=4`), showing both **out-of-the-box `DSpark 262K`** (`944` BF16 pages = `967K` tok) and **Stage-3 [`DFlash2-Global (s3_l13)`](https://huggingface.co/cambash23/Inkling-2-Mini-DFlash2-Global-L13)** (`928` BF16 pages = `950K` tok).
 2. **`140 W` production cap** (`v1.3.0` canonical M1 multi-turn agent replay at `960` BF16 pages = `983K` tok, `CHUNK=8192`, `262K` speculation, and `v1.0–v1.1` vs vLLM Config B).
 3. **Stock `250 W`** (`v1.0.0` reference numbers).
 
@@ -178,7 +178,12 @@ Manage replicas:
 
 ## `--draft-dflash2` (opt-in)
 
-Set `DFLASH2_DIR=/path/to/Inkling-2-Mini-DFlash2` in `scripts/local.sh` (or pass `--draft-dflash2 <dir>` to `ink-server`) to use [Inco AI's Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) or a custom hybrid global-attention `DFlash2-Global` checkpoint (5-layer parallel diffusion-style drafter, Tensor Core MMA SWA-2048 ring buffer, W8A16 head, 16-warp bilinear selector walk, exact Leviathan rejection sampling, and Ptok3 `conf` gating at `tau = 0.25`) instead of DSpark:
+Set `DFLASH2_DIR=/path/to/Inkling-2-Mini-DFlash2-Global-L13` in `scripts/local.sh` (or pass `--draft-dflash2 <dir>` to `ink-server`) to use our published hybrid global-attention **[`Inkling-2-Mini-DFlash2-Global-L13`](https://huggingface.co/cambash23/Inkling-2-Mini-DFlash2-Global-L13)** (`s3_l13`, Apache-2.0, 945 MB, lossless) or [Inco AI's `Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) (5-layer parallel diffusion-style drafter, Tensor Core MMA SWA-2048 ring buffer, W8A16 head, 16-warp bilinear selector walk, exact Leviathan rejection sampling, and Ptok3 `conf` gating at `tau = 0.25`) instead of DSpark:
+
+```bash
+hf download cambash23/Inkling-2-Mini-DFlash2-Global-L13 --local-dir ./Inkling-2-Mini-DFlash2-Global-L13
+DFLASH2_DIR="$PWD/Inkling-2-Mini-DFlash2-Global-L13" ./start.sh restart
+```
 
 - **Paged `262K` E4M3 global KV (`v1.3.0`):** `RustDFlash2` shares the engine's `1,024`-token global page table lazily via `page_gen()` (`COS_SIN_POS = 262,208`), shrinking `s3_l13` (`2` global layers) from `8.86 GiB` linear to **`3.97 GiB` total arena** (`504` pages) and unlocking **`996` BF16 KV pages (`1.02M` tokens)** or **`1,789` FP8 pages (`1.83M` tokens)** with zero `>102.4K` speculation cliff (`3.35 ms` draft step at `k=1, 246K`).
 - **Benchmarks (`180 W` & `140 W`, 100% lossless):** With Stage-3 selector-calibrated + stock-anchored `DFlash2-Global (s3_l13)`, `v1.3.0` reaches **`396.0 / 250.0 / 214.7 tok/s`** (`1u`), **`1,081.8 / 608.2 / 577.6 tok/s`** (`4u`), **`1,575.3 / 852.9 / 835.7 tok/s`** (`8u`), and **`135.5 tok/s`** at `246K` (`180 W`), plus **`532.89 tok/s`** (`5.592 tok/rd`, `+28.3%` vs DSpark) on `4×45K` `tf-agent-120k` at `140 W`.
